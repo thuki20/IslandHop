@@ -6,12 +6,16 @@
 //! 所以键鼠共享 / 剪贴板同步以「后台引擎 + 独立 viewport 控制台」接入：
 //! 引擎在 `Shell::new` 里启动，`update()` 每帧只做一次状态读取。
 //!
-//! 配置沿用 `openhop_core::Config::default_path()`，在 macOS 上是
-//! `~/Library/Application Support/openhop/config.toml`，与旧 OpenHop
-//! 同路径，因此已有的配对关系 / 屏幕排列 / 共享口令会自动继承。
+//! 配置改用 `openhop_core::Config::default_path()` 的 IslandHop 独立目录
+//! （macOS：`~/Library/Application Support/IslandHop/config.toml`），端口组也是
+//! 独立的 TCP 24950 / UDP 24951：不与用户仍在运行的旧版 OpenHop
+//! （`~/Library/Application Support/openhop/config.toml`，24850/24851）互相
+//! 抢端口、抢组播发现组，也不会回写污染旧版配置。代价是旧版配对关系不继承，
+//! 双端都装 IslandHop 后重新配对一次即可。
 
 use eframe::egui::{self, Color32, RichText};
 use openhop_core::{Config, Engine, Role, Status};
+use openhop_core::protocol::{DEFAULT_PORT, DISCOVERY_PORT};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -103,7 +107,7 @@ impl CrossScreen {
             self.name = self.cfg.name.clone();
         }
         self.cfg.passphrase = self.pass.clone();
-        self.cfg.port = self.port.trim().parse().unwrap_or(24850);
+        self.cfg.port = self.port.trim().parse().unwrap_or(DEFAULT_PORT);
         self.port = self.cfg.port.to_string();
         self.cfg.enabled = true;
         if let Err(e) = self.cfg.save(&self.path) {
@@ -275,7 +279,7 @@ impl CrossScreen {
         ui.label(RichText::new("配对 / 发现的设备").size(13.0).strong());
         if let Some(s) = status {
             if s.discovered.is_empty() {
-                ui.label(RichText::new("尚未发现同网段设备。请确认对端已启动、口令一致、防火墙放行 TCP 24850 / UDP 24851。").size(11.0).color(Color32::from_gray(160)));
+                ui.label(RichText::new(format!("尚未发现同网段设备。请确认对端已启动、口令一致、防火墙放行 TCP {} / UDP {}。", DEFAULT_PORT, DISCOVERY_PORT)).size(11.0).color(Color32::from_gray(160)));
             }
             for d in &s.discovered {
                 ui.horizontal(|ui| {
@@ -382,7 +386,7 @@ impl CrossScreen {
         if cfg!(target_os = "macos") {
             ui.label(RichText::new("macOS：需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop，并彻底退出重开后才生效。TCC 按应用路径授权，换成 /Applications 下的包要重新勾。").size(10.5).color(Color32::from_rgb(220, 195, 130)));
         } else {
-            ui.label(RichText::new("Windows：若与旧版 OpenHop 同时运行会抢占 24850/24851 端口与输入钩子，请先退出旧版。").size(10.5).color(Color32::from_rgb(220, 195, 130)));
+            ui.label(RichText::new("IslandHop 使用独立端口 24950/24951 与独立配置目录，可与旧版 OpenHop 并存；但两者都会注入键鼠事件，实际跨屏时请只启用其中一个。").size(10.5).color(Color32::from_rgb(220, 195, 130)));
         }
         ui.label(RichText::new("提示：岛仔自带的剪贴板历史会把 OpenHop 从对端写入的内容也记一条，属正常现象，不会形成同步循环（OpenHop 引擎内部已做回声抑制）。").size(10.0).color(Color32::from_gray(140)));
         ui.label(RichText::new(format!("配置文件：{}", self.path.display())).size(9.5).color(Color32::from_gray(120)));

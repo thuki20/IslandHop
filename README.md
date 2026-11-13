@@ -18,12 +18,15 @@
 | 新仓库 `thuki20/IslandHop` | ✅ | 已创建，公开，`main` |
 | 上游在 macOS 编译 | ✅ | 修掉上游 2 处漏 `cfg` 守卫后 `cargo check` RC=0 |
 | 挂入 `openhop-core` 并双 crate 共存 | ✅ | 补 `web/phone/` 内嵌资源后 RC=0，egui 零冲突 |
-| **OpenHop 引擎真正跑起来** | ✅ | 实机冒烟：TCP 24850 LISTEN / UDP 24851 绑定 |
+| **OpenHop 引擎接入** | ✅ | 旧端口组曾实机冒烟（TCP 24850 LISTEN / UDP 24851 绑定）；本轮隔离到 24950/24951 后 `cargo check` + **54 项单测通过**；引擎监听未重跑实测（见下） |
+| **`.app` 启动冒烟（Mac）** | ✅ | 10 s 存活、stderr 空、窗口 `layer=25 / y=0`、旧 OpenHop 配置哈希未变、24850 仍归 OpenHop 且 24950 空闲 |
 | **跨屏控制台窗口** | ✅ | 独立 viewport，620×688，可配对/改角色/排屏幕 |
 | **Mac 主岛窗口贴顶** | ✅ | `y=38 / layer=3` → **`y=0 / layer=25`**（CGWindowList 实测） |
+| **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
+| **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + 8.7 MB dmg（ad-hoc 签名 / arm64 / 图标 / Info.plist 校验通过） |
 | Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
-| Windows 端编译 | ⏳ | 本机无 MSVC/mingw，交 GitHub Actions，尚未出结果 |
-| 双端安装包 / 双机端到端实测 | ⏳ | **本轮未出包、未建 Release；跨屏切换与剪贴板同步从未实测，不报通过** |
+| Windows 端编译 / 出包 | ⏳ | 本机无 MSVC/mingw，交 GitHub Actions；本轮 CI 运行中 |
+| 双机端到端实测 | ⏳ | **跨屏切换与剪贴板同步从未实测，不报通过** |
 
 > ⚠️ **最关键的一句**：`cargo check` 通过 ≠ 岛仔功能在 Mac 上可用。上游非 Windows 分支基本是**空实现**
 > （`smtc::query → None`、`clipboard::watch → 空 Watcher`、`display_layout::connected → Vec::new()`）。
@@ -84,9 +87,27 @@ cargo build --release
 
 控制台里可以：切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、启停引擎、查看引擎错误与最近事件。
 
-- 两端角色必须**相反**、共享口令一致、TCP 24850 / UDP 24851 放行
+- 两端角色必须**相反**、共享口令一致、TCP **24950** / UDP **24951** 放行，**两端都要装 IslandHop**（端口与旧版 OpenHop 不通）
 - macOS 需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop 并**彻底退出重开**（TCC 按应用路径授权）
-- 不要与旧版 OpenHop 同时运行（抢端口与输入钩子）
+- 端口与配置已与旧版 OpenHop 隔离（24950/24951 vs 24850/24851），不会抢端口；但两者都会注入键鼠事件，**实际跨屏时请只启用其中一个**
+- 配置落在 `~/Library/Application Support/IslandHop/config.toml`，岛仔自身数据落 `~/Library/Application Support/IslandHop/`；旧版 `openhop/config.toml`（含共享口令与屏幕排列）**不会被读取或回写**
+
+---
+
+## 打包
+
+```bash
+# macOS（本机，arm64）
+python3 packaging/make-icon.py          # 生成 AppIcon.{png,ico,icns}，纯标准库 + sips/iconutil
+cargo build --release --bin IslandHop
+bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-macOS-arm64.dmg
+```
+
+`.app` 为 ad-hoc 签名、带 Dock 图标（`LSUIElement` 故意不设，否则菜单栏与 Dock 图标一起消失）；
+岛窗口本身由 `mac_window.rs` 抬到 `NSStatusWindowLevel = 25`。Windows 端 `app.rc` 已换成 IslandHop
+图标与产品名，`build.rs` 调 `rc.exe` 编进 exe；zip 由 `.github/workflows/islandhop-build.yml` 产出。
+
+> 未做开发者签名 / 公证，也未创建 GitHub Release、未上传任何资产。
 
 ---
 
@@ -106,7 +127,7 @@ cargo build --release
 | 外壳 | 1 | 82 | `main.rs` | 已补窗口层级与定位；其余系统采样仍走 Windows |
 | 图标 / 主题 | 2 | 12 | `icons.rs`、`theme.rs` | 部分资源路径 Windows 专属 |
 
-**已实修的 Mac 项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、OpenHop 引擎接入、刘海尺寸读取接口（`openhop_core::extras::system::notch()`，本机 185×32 pt）。
+**已实修的 Mac 项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、OpenHop 引擎接入（含独立端口 / 独立配置目录）、`config_dir()` 补 macOS / Linux 标准路径（原来退化成相对路径 `./Daozai`）、刘海尺寸读取接口（`openhop_core::extras::system::notch()`，本机 185×32 pt）。
 
 **尚未适配的视觉项**：岛体形状仍按上游 Windows 顶部居中胶囊自绘，**没有按刘海做「两侧分列 + 从刘海弹出」**。这是 `app.rs` / `shape.rs` 的绘制逻辑，属于 Mac 平台层工单，不是窗口坐标问题。
 
@@ -114,12 +135,14 @@ cargo build --release
 
 ## 未实现 / 未验证（不拿占位冒充）
 
-- Windows 端编译与安装包：CI 已配但未跑出结果
-- macOS `.app` / dmg：上游只有 Windows NSIS 脚本，**Mac 打包脚本还没写**
+- Windows 端编译与安装包：CI 已配，本轮运行中
+- macOS `.app` / dmg：本机包已产出，见上「打包」；**未做开发者签名 / 公证**
 - 双机跨屏切换、剪贴板同步端到端：**至今未实测**
+- 改端口后的**引擎监听实测**：未重跑。本轮 `.app` 冒烟把 `enabled` 设为 false，避免与用户正在使用的 OpenHop 抢键鼠、也避免 ad-hoc 签名触发 TCC 授权弹窗；因此 24950/24951 是否真正 LISTEN 尚未验证
+- 窗口内部标题仍是上游「岛仔」文案，未做品牌文案替换（保持全量派生）
 - 刘海外形、桌面伙伴在 Mac 的资源加载、托盘、开机自启、自动更新、DWM 毛玻璃
 - 微信/QQ 未读提醒：Mac 无解，将明确标注「仅 Windows」
-- 本轮**未出包、未创建 Release、未上传任何资产**
+- 本轮已出本机 macOS 包，但**未创建 GitHub Release、未上传任何资产**
 
 ---
 

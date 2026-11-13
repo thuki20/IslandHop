@@ -227,7 +227,7 @@ struct PairState {
     locked_until: Option<Instant>,
 }
 
-/// "192.168.1.20", "192.168.1.20:24852", "[fe80::1%3]:24850", "fe80::1", "desk.local".
+/// "192.168.1.20", "192.168.1.20:24852", "[fe80::1%3]:24950", "fe80::1", "desk.local".
 fn parse_addr(a: &str) -> Option<SocketAddr> {
     let a = a.trim();
     if a.is_empty() {
@@ -3316,9 +3316,9 @@ mod tests {
 
     #[test]
     fn addresses_parse() {
-        assert_eq!(parse_addr("192.168.1.20"), Some("192.168.1.20:24850".parse().unwrap()));
+        assert_eq!(parse_addr("192.168.1.20"), Some("192.168.1.20:24950".parse().unwrap()));
         assert_eq!(parse_addr(" 10.0.0.2:24852 "), Some("10.0.0.2:24852".parse().unwrap()));
-        assert_eq!(parse_addr("fe80::1"), Some("[fe80::1]:24850".parse().unwrap()));
+        assert_eq!(parse_addr("fe80::1"), Some("[fe80::1]:24950".parse().unwrap()));
         assert!(parse_addr("").is_none());
         assert!(parse_addr("not an address !").is_none());
     }

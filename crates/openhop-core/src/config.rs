@@ -207,7 +207,10 @@ pub fn default_name() -> String {
 
 impl Config {
     pub fn default_path() -> PathBuf {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("openhop").join("config.toml")
+        // IslandHop 独立配置目录：不读写旧版 OpenHop 的 config.toml。
+        // 旧版配置里有用户的共享口令、屏幕排列与 enabled=true，共用会导致
+        // 自动启动抢端口、以及 load() 的 normalize 回写污染旧版配置。
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("IslandHop").join("config.toml")
     }
 
     pub fn load(path: &PathBuf) -> Result<Config> {

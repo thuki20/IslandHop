@@ -5,8 +5,10 @@ use crate::layout::{Layout, Side};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 15;
-pub const DEFAULT_PORT: u16 = 24850;
-pub const DISCOVERY_PORT: u16 = 24851;
+// IslandHop 使用独立的端口组，避免与仍在运行的旧版 OpenHop
+// （TCP 24850 / UDP 24851）抢占端口和组播发现组。双端都用 IslandHop 即可互联。
+pub const DEFAULT_PORT: u16 = 24950;
+pub const DISCOVERY_PORT: u16 = 24951;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Os {

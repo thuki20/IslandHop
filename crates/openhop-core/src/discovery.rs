@@ -259,15 +259,15 @@ mod tests {
     fn prefers_routable_v4_then_link_local_v6() {
         let peers: Mutex<HashMap<u64, Discovered>> = Default::default();
         let b =
-            Beacon { magic: MAGIC, version: PROTOCOL_VERSION, id: 7, device: "d".into(), name: "mac".into(), os: Os::MacOs, role: Role::Server, port: 24850 };
+            Beacon { magic: MAGIC, version: PROTOCOL_VERSION, id: 7, device: "d".into(), name: "mac".into(), os: Os::MacOs, role: Role::Server, port: 24950 };
         let v6: SocketAddr = "[fe80::1%3]:5000".parse().unwrap();
         record(&peers, b.clone(), v6);
         let p = peers.lock()[&7].clone();
         assert_eq!(p.link, "direct");
-        assert_eq!(p.addr.port(), 24850);
+        assert_eq!(p.addr.port(), 24950);
         record(&peers, b, "192.168.1.9:5000".parse().unwrap());
         let p = peers.lock()[&7].clone();
-        assert_eq!(p.addr, "192.168.1.9:24850".parse::<SocketAddr>().unwrap());
+        assert_eq!(p.addr, "192.168.1.9:24950".parse::<SocketAddr>().unwrap());
         assert_eq!(p.link, "network");
     }
 }

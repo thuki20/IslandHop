@@ -9,6 +9,10 @@
 //!
 //! 设置环境变量 `DAOZAI_DATA_DIR` 可把以上目录整体改到别处（用于与已安装的
 //! 原工具并存、或跑测试时不碰真实数据）。
+//!
+//! IslandHop 补齐：macOS 用 `~/Library/Application Support/IslandHop`、
+//! Linux 用 `$XDG_CONFIG_HOME/IslandHop`（或 `~/.config/IslandHop`），
+//! Windows 仍为 `%APPDATA%\Daozai`。原实现在非 Windows 上会退化成相对路径。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +24,22 @@ fn env_dir(key: &str) -> PathBuf {
 pub fn config_dir() -> PathBuf {
     if let Ok(root) = std::env::var("DAOZAI_DATA_DIR") {
         return PathBuf::from(root);
+    }
+    // 上游只实现了 Windows（%APPDATA%\Daozai）。在 macOS 上 APPDATA 不存在，
+    // 原来会退化成相对路径 "./Daozai"，从 .app 启动时写到不可预期的目录。
+    // 这里补齐 macOS / Linux 的标准位置，Windows 行为保持原样。
+    if cfg!(target_os = "macos") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join("Library").join("Application Support").join("IslandHop");
+        }
+    }
+    if cfg!(target_os = "linux") {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg).join("IslandHop");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".config").join("IslandHop");
+        }
     }
     env_dir("APPDATA").join("Daozai")
 }
