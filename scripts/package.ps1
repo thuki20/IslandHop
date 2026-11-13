@@ -10,12 +10,12 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = @('-C', 'target-feature=+crt-static', "--remap-path-prefix=$cargoHome=cargo", "--remap-path-prefix=$projectRoot=daozai", '-C', 'link-arg=/PDBALTPATH:%_PDB%') -join [char]0x1f
     if (-not $SkipBuild) {
         $env:CARGO_BUILD_JOBS = '1'
-        cargo +stable-x86_64-pc-windows-msvc build --locked --release --bin daozai --target x86_64-pc-windows-msvc
+        cargo +stable-x86_64-pc-windows-msvc build --locked --release --bin IslandHop --target x86_64-pc-windows-msvc
         if ($LASTEXITCODE -ne 0) { throw 'Release build failed' }
     }
     if (-not $Executable) {
         $targetDirectory = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $projectRoot 'target' }
-        $Executable = Join-Path $targetDirectory 'x86_64-pc-windows-msvc\release\daozai.exe'
+        $Executable = Join-Path $targetDirectory 'x86_64-pc-windows-msvc\release\IslandHop.exe'
     }
     $binary = Get-Item -LiteralPath $Executable
     & (Join-Path $PSScriptRoot 'check-runtime.ps1') -Executable $binary.FullName
@@ -37,6 +37,7 @@ try {
     $stagingDirectory = Join-Path $outputDirectory $packageName
     if (Test-Path -LiteralPath $stagingDirectory) { throw 'Package directory already exists' }
     New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+    # 压缩包内仍叫 daozai.exe：NSIS 安装器、update.ps1 与应用内更新器 (updates.rs) 都按这个名字找文件。
     Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $stagingDirectory 'daozai.exe')
     # ZIP 保留给免安装使用和应用内更新；普通用户只需下载安装 EXE。
     @('LICENSE','THIRD_PARTY_NOTICES.txt') | ForEach-Object {
