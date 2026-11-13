@@ -25,7 +25,7 @@
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
 | **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + 8.7 MB dmg（ad-hoc 签名 / arm64 / 图标 / Info.plist 校验通过） |
 | Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
-| Windows 端编译 / 出包 | ⏳ | 本机无 MSVC/mingw，交 GitHub Actions；本轮 CI 运行中 |
+| Windows 端编译 / 出包 | ✅ | **双 workflow 全绿**：`IslandHop Build` 出 x64 zip；`Windows 检查`（上游全量测试 + NSIS 打包 + 安装器测试）通过 |
 | 双机端到端实测 | ⏳ | **跨屏切换与剪贴板同步从未实测，不报通过** |
 
 > ⚠️ **最关键的一句**：`cargo check` 通过 ≠ 岛仔功能在 Mac 上可用。上游非 Windows 分支基本是**空实现**
@@ -135,7 +135,8 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 
 ## 未实现 / 未验证（不拿占位冒充）
 
-- Windows 端编译与安装包：CI 已配，本轮运行中
+- Windows 端编译与安装包：**CI 双 workflow 已全绿**（848e4eb）；zip 见 Actions artifact，exe 已验证含 IslandHop 图标资源（.rsrc 23 KB）与版本信息 0.6.64。**未在真机 Windows 上运行过**
+- Windows 应用内更新器仍指向上游 `Renly1994/xiaotang-daozai` 的 Release（`updates.rs`），装了会提示/拉取上游更新——**重新绑定前不要用它更新**
 - macOS `.app` / dmg：本机包已产出，见上「打包」；**未做开发者签名 / 公证**
 - 双机跨屏切换、剪贴板同步端到端：**至今未实测**
 - 改端口后的**引擎监听实测**：未重跑。本轮 `.app` 冒烟把 `enabled` 设为 false，避免与用户正在使用的 OpenHop 抢键鼠、也避免 ad-hoc 签名触发 TCC 授权弹窗；因此 24950/24951 是否真正 LISTEN 尚未验证
