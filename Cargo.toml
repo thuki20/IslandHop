@@ -6,7 +6,8 @@ members = ["crates/openhop-core"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.0"
+# 与 [package] version 保持一致：scripts/package.ps1 用「第一个 ^version =」正则取版本号。
+version = "0.6.64"
 edition = "2021"
 license = "MIT"
 
