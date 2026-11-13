@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["crates/openhop-core"]
+# vendor/* 通过 [patch.crates-io] 挂载，不是 workspace 成员；
+# 显式排除后 `cargo --manifest-path vendor/<crate>/Cargo.toml` 才能独立运行（上游 ci.yml 依赖此行为）。
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
