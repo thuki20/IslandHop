@@ -106,6 +106,15 @@ fn font_dirs() -> Vec<PathBuf> {
     ] {
         v.push(PathBuf::from(d));
     }
+    // macOS 系统字体目录：上游只列了 Windows / Linux 路径，Mac 上 CJK 候选
+    // 全部落空，界面中文会渲染成豆腐块。这些目录在其它平台不存在，find() 会跳过。
+    for d in [
+        "/System/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+        "/Library/Fonts",
+    ] {
+        v.push(PathBuf::from(d));
+    }
     v
 }
 
@@ -153,9 +162,9 @@ fn build_fonts()->FontDefinitions {
         find(&[("segoeuib.ttf", 0), ("selawkb.ttf", 0)], &dirs),
     ];
     let cjk = [
-        find(&[("msyh.ttc", 1), ("NotoSansSC-Regular.otf", 0), ("NotoSansCJK-Regular.ttc", 2)], &dirs),
-        find(&[("msyhbd.ttc", 1), ("NotoSansSC-Medium.otf", 0), ("NotoSansCJK-Medium.ttc", 2)], &dirs),
-        find(&[("msyhbd.ttc", 1), ("NotoSansSC-Bold.otf", 0), ("NotoSansCJK-Bold.ttc", 2)], &dirs),
+        find(&[("msyh.ttc", 1), ("NotoSansSC-Regular.otf", 0), ("NotoSansCJK-Regular.ttc", 2), ("Hiragino Sans GB.ttc", 0), ("Arial Unicode.ttf", 0)], &dirs),
+        find(&[("msyhbd.ttc", 1), ("NotoSansSC-Medium.otf", 0), ("NotoSansCJK-Medium.ttc", 2), ("Hiragino Sans GB.ttc", 0), ("Arial Unicode.ttf", 0)], &dirs),
+        find(&[("msyhbd.ttc", 1), ("NotoSansSC-Bold.otf", 0), ("NotoSansCJK-Bold.ttc", 2), ("Hiragino Sans GB.ttc", 0), ("Arial Unicode.ttf", 0)], &dirs),
     ];
 
     let korean = [

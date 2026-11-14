@@ -52,8 +52,9 @@ pub fn check_permissions(prompt: bool) -> Option<String> {
         None
     } else {
         Some(
-            "OpenHop needs Accessibility permission. Open System Settings > Privacy & Security > \
-             Accessibility, enable OpenHop, then restart it."
+            "IslandHop 的辅助功能授权未生效。请在「系统设置 → 隐私与安全性 → 辅助功能」\
+             把 IslandHop 的开关关掉再打开（更新 app 后签名变化会让旧授权失效），\
+             并在「输入监控」里添加并勾选 IslandHop，然后彻底退出 IslandHop 再重开。"
                 .into(),
         )
     }

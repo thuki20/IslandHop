@@ -10,7 +10,7 @@
 
 ---
 
-## TL;DR（2026-11-13）
+## TL;DR（2026-11-14 更新）
 
 | 阶段 | 状态 | 证据 |
 |---|---|---|
@@ -18,15 +18,18 @@
 | 新仓库 `thuki20/IslandHop` | ✅ | 已创建，公开，`main` |
 | 上游在 macOS 编译 | ✅ | 修掉上游 2 处漏 `cfg` 守卫后 `cargo check` RC=0 |
 | 挂入 `openhop-core` 并双 crate 共存 | ✅ | 补 `web/phone/` 内嵌资源后 RC=0，egui 零冲突 |
-| **OpenHop 引擎接入** | ✅ | 旧端口组曾实机冒烟（TCP 24850 LISTEN / UDP 24851 绑定）；本轮隔离到 24950/24951 后 `cargo check` + **54 项单测通过**；引擎监听未重跑实测（见下） |
-| **`.app` 启动冒烟（Mac）** | ✅ | 10 s 存活、stderr 空、窗口 `layer=25 / y=0`、旧 OpenHop 配置哈希未变、24850 仍归 OpenHop 且 24950 空闲 |
-| **跨屏控制台窗口** | ✅ | 独立 viewport，620×688，可配对/改角色/排屏幕 |
+| **OpenHop 引擎接入** | ✅ | 独立端口组 24950/24951 **实机监听已验证**：TCP v4+v6 LISTEN、UDP 绑定；54 项单测通过 |
+| **`.app` 启动冒烟（Mac）** | ✅ | 10 s 存活、stderr 空、窗口 `layer=25 / y=0`、旧 OpenHop 配置哈希未变 |
+| **跨屏功能内嵌岛仔设置** | ✅ | 岛仔「设置」窗口第 13 项「局域网跨屏」，无独立窗口；引擎后台自启，打开软件即用；Cmd/Ctrl+Shift+K 或 `--cross-screen` 直达该分组 |
+| **Mac 点击穿透** | ✅ | 修复 960×270 置顶透明窗口吞掉屏幕顶部鼠标事件：按 `FrameOut.hit / notice_hit / file_drop_zone` 动态设置 `NSWindow.ignoresMouseEvents`，命中区外点击落到下层应用；`env.cursor` 改用全局鼠标换算坐标 |
+| **Mac 中文字体** | ✅ | 修 `theme.rs` 只查 Windows/Linux 字体目录的缺陷，加载 macOS 系统 CJK 字体；中文由满屏方块恢复可读 |
 | **Mac 主岛窗口贴顶** | ✅ | `y=38 / layer=3` → **`y=0 / layer=25`**（CGWindowList 实测） |
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
-| **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + 8.7 MB dmg（ad-hoc 签名 / arm64 / 图标 / Info.plist 校验通过） |
+| **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（ad-hoc 签名 / arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`（稳定 TCC 授权路径） |
 | Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
 | Windows 端编译 / 出包 | ✅ | **双 workflow 全绿**：`IslandHop Build` 出 x64 zip；`Windows 检查`（上游全量测试 + NSIS 打包 + 安装器测试）通过 |
-| 双机端到端实测 | ⏳ | **跨屏切换与剪贴板同步从未实测，不报通过** |
+| **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、控制台 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
+| **双机键鼠 / 剪贴板动作实测** | ⏳ | 会话与剪贴板线程已起，但 Mac 缺「输入监控」授权导致事件 tap 退化（见下）；内容级跨机同步需双机人工实测，**不报通过** |
 
 > ⚠️ **最关键的一句**：`cargo check` 通过 ≠ 岛仔功能在 Mac 上可用。上游非 Windows 分支基本是**空实现**
 > （`smtc::query → None`、`clipboard::watch → 空 Watcher`、`display_layout::connected → Vec::new()`）。
@@ -38,9 +41,10 @@
 
 ```
 IslandHop/
-├─ src/                     岛仔 102 个模块（一字未改）
-│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 独立控制台窗口
-│  └─ mac_window.rs         ← 新增：macOS NSWindow 层级 / 刘海几何
+├─ src/                     岛仔 102 个模块（业务模块原样，仅 extras.rs 加 1 个设置分组）
+│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 内嵌在岛仔设置窗口的面板
+│  ├─ mac_window.rs         ← 新增：macOS 窗口层级 / 点击穿透 / 刘海几何
+│  └─ extras.rs             ← 仅加 1 个设置分组（第 13 项），102 个业务模块不动
 ├─ vendor/                  岛仔 5 个魔改库（原样，[patch.crates-io] 不变）
 ├─ assets/ docs/ installer/ scripts/ tests/   上游原样
 ├─ crates/openhop-core/     ← 新增：OpenHop 纯 Rust 引擎（54 文件，零 egui 依赖）
@@ -54,7 +58,9 @@ IslandHop/
 |---|---|
 | 引擎 | `Shell::new` 里 `CrossScreen::new()` 读配置并 `Engine::start`，`update()` 每帧只做一次 `status()` |
 | 配置 | 沿用 `Config::default_path()` = `~/Library/Application Support/openhop/config.toml`，**自动继承旧 OpenHop 的配对 / 口令 / 屏幕排列**（本机已确认该文件存在） |
-| 界面 | 上游把页数硬编码成 `[bool; 9]` / `[usize; 9]` 并散落在大量 `match page` 与 612KB 录制测试里；硬插第 10 页会破坏设置持久化与测试基线，故用**独立 viewport 控制台**，不动上游 UI 一行 |
+| 界面 | 上游把页数硬编码成 `[bool; 9]` / `[usize; 9]` 并散落在大量 `match page` 与 612KB 录制测试里；硬插第 10 个功能页会破坏设置持久化与测试基线，故**只在岛仔原有设置窗口加一个分组**（`SETTINGS_GROUPS` 第 13 项），不动功能页结构 |
+| 引擎启动 | `Shell::new` 触发 `cross_screen::with()` 初始化；`config.toml` 里 `enabled=true` 时 `Engine::start` 在后台线程启动，**用户不用打开任何界面** |
+| 点击穿透 | Windows 由 `native.rs` 用 `SetWindowRgn` 裁剪；macOS 由 `mac_window.rs` 用 `NSWindow.ignoresMouseEvents` + `NSEvent.mouseLocation` 换算实现等价行为 |
 | 剪贴板 | OpenHop 引擎内部已有回声抑制；岛仔剪贴板历史会把对端写入也记一条（历史污染，不是同步循环） |
 | 依赖并存 | `windows` 0.58（岛仔）与 0.62.2（core）、`tungstenite` 0.28/0.30 可共存；边界只传裸句柄。**egui/eframe 零冲突**，这是方案成立的关键 |
 
@@ -65,7 +71,9 @@ IslandHop/
 | 文件 | 改动 |
 |---|---|
 | `src/` 102 个业务模块、`vendor/`、`assets/`、`docs/` | **一字未改** |
-| `src/main.rs` | ① 修上游 `network` / `volume` 两处漏 `#[cfg(windows)]` 守卫（原样在 macOS 编译报 `no field system_state`）；② `Shell` 加 `cross` / `elevated` 字段；③ `update` 参数 `_frame → frame`，加 elevate、快捷键、控制台调用 |
+| `src/main.rs` | ① 修上游 `network` / `volume` 两处漏 `#[cfg(windows)]` 守卫；② `Shell` 加 `mac_cursor` / `elevated` 字段，删掉独立控制台字段；③ `update` 用 `frame` 做 elevate，每帧同步点击穿透，`env.cursor` 用全局鼠标坐标；④ 热键 / `--cross-screen` 改为打开设置第 13 项 |
+| `src/extras.rs` | 设置窗口加 1 个分组「局域网跨屏」（`SETTINGS_GROUPS` 9→10、titles 13→14、图标与 match 分支各 1 行），并加 `open_settings_tab()` |
+| `src/workbuddy_quota.rs` | 仅 `#[cfg(test)]` 手动用例加 `#[cfg(windows)]` 守卫：上游 `mod login` 是 Windows-only，否则 macOS 上 `cargo test --lib` 无法编译 |
 | `src/lib.rs` | 加 2 行 `pub mod cross_screen;` / `pub mod mac_window;` |
 | `Cargo.toml` | 加 `[workspace]` + `openhop-core` 路径依赖 + macOS `objc2`；二进制名 `daozai → IslandHop`；**lib crate 名保持 `daozai`**（102 个模块全用 `daozai::` 引用，改名会全量失效） |
 | `Cargo.lock` | cargo 自动加 `objc2 0.6.5` 等 |
@@ -77,15 +85,48 @@ IslandHop/
 
 ---
 
+## 双机启用（2026-11-14 实测配置）
+
+两端都装了 IslandHop 却「没有跨屏/剪贴板」时，通常卡在下面四件事，缺一不可：
+
+| 项 | Mac（Server） | Windows（Client） |
+|---|---|---|
+| 端口 | TCP 24950 / UDP 24951 | 同左（**不是**旧 OpenHop 的 24850/24851） |
+| 配置路径 | `~/Library/Application Support/IslandHop/config.toml` | `%APPDATA%\IslandHop\config.toml` |
+| 角色 | `role = "server"`（把本机键鼠共享出去） | `role = "client"`（被控端） |
+| 共享口令 | 两端**完全一致**、≥4 字符 | 同左 |
+| 直连兜底 | — | `server_addr = "192.168.1.16"`：`pick_server()` 优先直连，可绕开被防火墙挡掉的 UDP 发现 |
+| 排列 | `[[layout.screens]] name="Windows" x=1 y=0` | 同左（Server 固定 (0,0)，Client 在右侧 (1,0)） |
+
+`passphrase` 为空时引擎改用 6 位配对码，**不会自动互联**。IslandHop 与旧 OpenHop 端口组、配置目录都不共享，双端必须都装 IslandHop 并重新设一次口令。
+
+**启动与验证**
+
+1. Mac：把 `IslandHop.app` 装到 `/Applications`（不要从 dmg 挂载目录运行，TCC 授权路径每次都变）；配置 `enabled = true`；`Cmd/Ctrl+Shift+K` 打开「设置 → 局域网跨屏」。引擎在启动软件时已经自动跑起来了，这个页面只是查看状态/改配置。
+2. Windows：解压 `IslandHop-Windows-x64.zip`，运行本机交付的 `dist/IslandHop-Windows-EnableCrossScreen.ps1`（内含共享口令明文，**仅本机使用、不要外传/提交**，故不在仓库里）。脚本会写干净配置、放行防火墙、校验 exe 版本并带 `--cross-screen` 重启（现在直达设置里的跨屏分组）。
+3. 设置页出现 `Sharing with 1 computer(s) / 已连接 1 台` 即握手成功。协议层自检：`IH_PASSPHRASE='<口令>' cargo run -p openhop-core --example loopback_e2e`。
+
+**macOS 键鼠捕获还差一步（必须人工授权）**
+
+引擎用 `CGEventTap(Location::HID)` 捕获本机键鼠，需要「**输入监控**」权限。缺权限时 tap 创建失败，引擎退化成 `NoCapture` —— 设置页照样显示「运行中 / 已连接 1 台」，但鼠标永远切不过去（剪贴板线程仍可用）。
+
+- 系统设置 → 隐私与安全性 → 输入监控 → `+` 添加 `/Applications/IslandHop.app` 并打开开关；「辅助功能」也要勾（注入用）
+- **彻底退出 IslandHop 再重开**（TCC 按实例生效）
+- 自检：`bash packaging/verify-macos-capture.sh`，出现 `✅ mac-event-tap 线程存在` 才算就绪
+
+本轮顺手修掉两个会让人「查不出原因」的缺陷：捕获失败从静默 `log::warn` 改为设置页可见的「引擎错误」；`Config::load` 解析失败时不再用默认值回写覆盖用户配置（无效 TOML 不会抹掉口令/端口/排列，并在设置页提示）。
+
+---
+
 ## 使用方法（当前可跑）
 
 ```bash
 cargo build --release
-./target/release/IslandHop --cross-screen     # 启动即打开跨屏控制台
-./target/release/IslandHop                    # 只启动岛；Cmd/Ctrl + Shift + K 随时呼出控制台
+./target/release/IslandHop --cross-screen     # 启动并打开「设置 → 局域网跨屏」
+./target/release/IslandHop                    # 只启动岛；引擎按 enabled 后台自启，Cmd/Ctrl + Shift + K 随时打开设置
 ```
 
-控制台里可以：切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、启停引擎、查看引擎错误与最近事件。
+「设置 → 局域网跨屏」里可以：一键启停、切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、启停引擎、查看引擎错误与最近事件。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
 
 - 两端角色必须**相反**、共享口令一致、TCP **24950** / UDP **24951** 放行，**两端都要装 IslandHop**（端口与旧版 OpenHop 不通）
 - macOS 需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop 并**彻底退出重开**（TCC 按应用路径授权）
@@ -135,11 +176,11 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 
 ## 未实现 / 未验证（不拿占位冒充）
 
-- Windows 端编译与安装包：**CI 双 workflow 已全绿**（848e4eb）；zip 见 Actions artifact，exe 已验证含 IslandHop 图标资源（.rsrc 23 KB）与版本信息 0.6.64。**未在真机 Windows 上运行过**
+- Windows 端编译与安装包：**CI 双 workflow 已全绿**（848e4eb）；zip 见 Actions artifact，exe 已验证含 IslandHop 图标资源（.rsrc 23 KB）与版本信息 0.6.64。**用户 Windows 真机已安装并连上 Mac**（TCP 会话 ESTABLISHED），但 GUI 各功能未逐项实测
 - Windows 应用内更新器仍指向上游 `Renly1994/xiaotang-daozai` 的 Release（`updates.rs`），装了会提示/拉取上游更新——**重新绑定前不要用它更新**
 - macOS `.app` / dmg：本机包已产出，见上「打包」；**未做开发者签名 / 公证**
-- 双机跨屏切换、剪贴板同步端到端：**至今未实测**
-- 改端口后的**引擎监听实测**：未重跑。本轮 `.app` 冒烟把 `enabled` 设为 false，避免与用户正在使用的 OpenHop 抢键鼠、也避免 ad-hoc 签名触发 TCC 授权弹窗；因此 24950/24951 是否真正 LISTEN 尚未验证
+- 双机跨屏切换、剪贴板同步端到端：**TCP 会话、设置页「已连接 1 台」、`clipboard` 线程均已实测**；但 Mac 未授权「输入监控」→ `mac-event-tap` 线程缺失 → 键鼠切换未跑通；剪贴板内容跨机传输还需双机各复制一次人工确认，**不报通过**
+- 改端口后的**引擎监听实测**：✅ 已重跑。TCP 24950 v4/v6 LISTEN、UDP 24951 绑定；线程采样含 `server` / `clipboard` / `peer-192.168.1.15` / `link-writer`，**唯独缺 `mac-event-tap`**（即输入监控授权缺口）
 - 窗口内部标题仍是上游「岛仔」文案，未做品牌文案替换（保持全量派生）
 - 刘海外形、桌面伙伴在 Mac 的资源加载、托盘、开机自启、自动更新、DWM 毛玻璃
 - 微信/QQ 未读提醒：Mac 无解，将明确标注「仅 Windows」

@@ -358,6 +358,13 @@ impl Engine {
                     Ok(c) => c,
                     Err(e) => {
                         log::warn!("this computer's keyboard and mouse can't be shared: {e:#}");
+                        // 不能只写日志：上游没有 logger 时这条警告会被丢掉，用户会看到
+                        // 「运行中 / 已连接」却完全无法跨屏。把它暴露到 Status.error，
+                        // 跨屏控制台会显示「引擎错误」并给出授权指引。
+                        ctx.set_error(Some(format!(
+                            "本机键鼠无法共享（{e:#}）。macOS 请在「系统设置 → 隐私与安全性 → 输入监控」\
+                             添加并勾选 IslandHop，然后彻底退出应用再重开。"
+                        )));
                         let screen =
                             platform::create_injector(cfg.screen, &cfg.linux_backend).map(|i| i.screen()).unwrap_or(Rect { x: 0, y: 0, w: 1920, h: 1080 });
                         (Arc::new(NoCapture(screen)) as Arc<dyn Capture>, crossbeam_channel::never())

@@ -1214,12 +1214,21 @@ fn setting_choices(ui:&mut egui::Ui,title:&str,value:&mut u32,values:[u32;3],uni
     let options:Vec<(u32,&str)>=values.iter().zip(labels.iter()).map(|(v,l)|(*v,l.as_str())).collect();
     settings_control_row_right(ui,title,|ui|{settings_segmented(ui,value,&options,62.0);});
 }
-const SETTINGS_GROUPS: [(&str,usize,usize);9] = [
+// IslandHop：第 13 项是局域网跨屏 / 剪贴板同步。它只加设置分组，
+// 不动上游 9 个功能页与 `[bool; 9]` 的持久化结构。
+const SETTINGS_GROUPS: [(&str,usize,usize);10] = [
     ("常规",0,0), ("页面管理",10,10), ("音乐与歌词",1,1), ("专注与饮水",2,3),
-    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("AI 额度",11,11), ("天气",12,12), ("关于",9,9),
+    ("待办与置物",4,5), ("通知、邮箱与日程",6,8), ("AI 额度",11,11), ("天气",12,12),
+    ("局域网跨屏",13,13), ("关于",9,9),
 ];
 
 impl App {
+    /// 打开设置窗口并切到指定分组（IslandHop：热键 / 启动参数直达跨屏页）。
+    pub fn open_settings_tab(&mut self,tab:usize){
+        self.settings_tab=tab;
+        self.open_settings();
+    }
+
     pub fn settings_ui(&mut self,ctx:&egui::Context,autostart:bool){
         if !self.settings_open{self.window_layout().close();release_support_codes(ctx);}
         self.updates.poll(ctx);
@@ -1269,6 +1278,7 @@ impl App {
                         4=>egui::include_image!("../assets/settings-icons/system/tasks.svg"),
                         6=>egui::include_image!("../assets/settings-icons/system/notifications.svg"),
                         12=>egui::include_image!("../assets/settings-icons/system/weather.svg"),
+                        13=>egui::include_image!("../assets/settings-icons/system/pages.svg"),
                         _=>egui::include_image!("../assets/settings-icons/system/about.svg"),
                     };
                     let icon_bg=egui::Rect::from_center_size(egui::pos2(rect.left()+21.0,rect.center().y),egui::vec2(25.0,25.0));
@@ -1299,8 +1309,8 @@ impl App {
                     }
                 }
                 ui.visuals_mut().selection.bg_fill=settings_color(ctx,Color32::from_rgb(45,105,165),Color32::from_rgb(209,226,248));
-                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气"];
-                ui.label(egui::RichText::new(titles[self.settings_tab.min(12)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
+                let titles=["常规","音乐与歌词","专注","健康提醒","待办","置物","通知","邮箱","日程","关于","页面管理","AI 额度","天气","局域网跨屏"];
+                ui.label(egui::RichText::new(titles[self.settings_tab.min(13)]).size(18.0).strong().color(settings_color(ctx,Color32::WHITE,Color32::from_rgb(30,34,41))));
                 if let Some((_,start,end))=SETTINGS_GROUPS.iter().find(|(_,start,end)|(*start..=*end).contains(&self.settings_tab)) {
                     if start!=end {
                         ui.add_space(7.0);
@@ -1336,7 +1346,9 @@ impl App {
                         if !self.module_on(page) {ui.disable();}
                     }
                     match self.settings_tab {
-                    12=>self.weather_settings(ui),
+                     // IslandHop：OpenHop 引擎的设置面板，直接嵌在岛仔设置窗口里。
+                     13=>crate::cross_screen::settings_ui(ui),
+                     12=>self.weather_settings(ui),
                     11=>self.quota_settings(ui),
                     10=>{
                         ui.label(egui::RichText::new("选择需要的页面和状态组件。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));

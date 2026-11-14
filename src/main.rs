@@ -85,8 +85,11 @@ struct Shell {
     quota: daozai::quota::Service,
     quota_sig: Option<(bool,Vec<daozai::quota::Account>)>,
     quota_at: PollClock,
-    /// IslandHop 新增：OpenHop 跨屏引擎与独立控制台窗口。
-    cross: daozai::cross_screen::CrossScreen,
+    /// IslandHop：OpenHop 引擎在 `cross_screen` 的线程局部状态里后台常驻，
+    /// 面板直接嵌在岛仔设置窗口第 13 项，不再持有独立控制台窗口。
+    /// 非 Windows 分支：每帧由全局鼠标坐标换算出的 ROOT 窗口本地光标位置。
+    #[cfg(not(windows))]
+    mac_cursor: Option<Pos2>,
     /// 非 Windows 分支：NSWindow 是否已抬到菜单栏之上。
     #[cfg(not(windows))]
     elevated: bool,
@@ -132,6 +135,8 @@ impl Shell {
         if !quota_demo{app.quota_initialize();}
         diagnostics::startup("启动剪贴板记录");
         if std::env::args().any(|arg|arg=="--settings"){app.open_settings();}
+        // IslandHop：`--cross-screen` 不再开独立窗口，直接落到岛仔设置里的跨屏分组。
+        if std::env::args().any(|arg|arg=="--cross-screen"){app.open_settings_tab(13);}
         if std::env::args().any(|arg|arg=="--calendar"){app.open_calendar(None);}
         #[cfg(feature="record")]
         if std::env::var("DAOZAI_MAIL_DEMO").is_ok(){app.mail_demo();}
@@ -159,6 +164,9 @@ impl Shell {
         let initial_input=None;
         #[cfg(windows)] let system_state=daozai::system::Snapshot::default();
         #[cfg(windows)] let system_rx=daozai::system::observe(cc.egui_ctx.clone(),system_state.clone(),initial_input);
+        // IslandHop：打开软件即按 config.toml 的 enabled 启动跨屏 / 剪贴板引擎，
+        // 不需要用户打开任何设置页面。
+        daozai::cross_screen::with(|_| ());
         // 岛体大小只作用于主窗口，在首帧之前生效，避免启动时先按 100% 闪一下。
         #[cfg(windows)] eframe::set_root_viewport_scale(app.settings.island_scale());
         Self {
@@ -212,13 +220,8 @@ impl Shell {
             cal_sig: None,
             clipboard_watch: None,
             quota: daozai::quota::Service::start(), quota_sig: None, quota_at: PollClock::default(),
-            cross: {
-                let mut cross = daozai::cross_screen::CrossScreen::new();
-                if std::env::args().any(|arg| arg == "--cross-screen") {
-                    cross.open = true;
-                }
-                cross
-            },
+            #[cfg(not(windows))]
+            mac_cursor: None,
             #[cfg(not(windows))]
             elevated: false,
         }
@@ -280,11 +283,10 @@ impl Shell {
         let origin=self.native.as_ref().and_then(|w|w.logical_origin(ppp)).unwrap_or(origin);
         #[cfg(windows)]
         let cursor = cursor_logical(ppp).map(|(x, y)| Pos2::new(x - origin.x, y - origin.y));
-        // macOS：egui 的指针坐标本身就是窗口本地逻辑坐标（已实测与 Windows 路径一致），
-        // 直接取用。上游 `cursor_logical` 只有 Windows 实现，Mac 上恒 None 会导致
-        // `inside` 永远为 false，岛完全无法悬停展开/交互。
+        // macOS：窗口在命中区外会 ignoresMouseEvents，egui 收不到 mousemove，
+        // 必须用全局鼠标坐标换算出的窗口本地位置，否则岛不会悬停展开、也不会响应点击。
         #[cfg(not(windows))]
-        let cursor = ctx.input(|i| i.pointer.latest_pos());
+        let cursor = self.mac_cursor;
         // 所在屏幕换算到窗口逻辑坐标，供通知详情等浮层避开屏幕边缘。
         #[cfg(windows)]
         let screen=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|{
@@ -545,6 +547,11 @@ impl eframe::App for Shell {
                 if !success{self.app.say(message);}
             }
         }
+        // macOS：先取全局鼠标位置（窗口穿透时 egui 自己拿不到），供 env() 判定悬停。
+        #[cfg(not(windows))]
+        {
+            self.mac_cursor = daozai::mac_window::cursor_local(ctx.pixels_per_point());
+        }
         let env = self.env(ctx);
         self.reconcile_modules(ctx);
         // v0.5.5 邮件：开关 / 间隔 / 账号清单变了就重新对齐收信线程，再把事件交给界面。
@@ -605,6 +612,15 @@ impl eframe::App for Shell {
             let hit=if self.hidden {(0.0,0.0,0.0,0.0)} else {r(out.hit)};
             native.update(region, hit, if self.hidden{None}else{out.notice_hit.map(r)},if self.hidden{None}else{out.file_drop_zone.map(r)},if self.hidden{None}else{out.glass.as_deref()},ctx.pixels_per_point(), out.editing, !self.hidden && out.expanded);
         }
+        // macOS：Windows 用 SetWindowRgn 把透明画布裁成岛体命中区，这里用
+        // NSWindow.ignoresMouseEvents 实现等价的「区域外点击穿透」。
+        #[cfg(not(windows))]
+        let passthrough = {
+            let mut hits = vec![out.hit];
+            hits.extend(out.notice_hit);
+            hits.extend(out.file_drop_zone);
+            daozai::mac_window::sync_passthrough(self.mac_cursor, &hits)
+        };
         for cmd in out.cmds {
             match cmd {
                 Cmd::Media(t) => {
@@ -736,13 +752,13 @@ impl eframe::App for Shell {
         #[cfg(not(windows))] let autostart = false;
         self.app.settings_ui(ctx, autostart);
         self.app.mail_reader_ui(ctx);
-        // IslandHop：Cmd/Ctrl + Shift + K 打开跨屏控制台；也可用 --cross-screen 启动参数。
+        // IslandHop：Cmd/Ctrl + Shift + K 直达岛仔设置里的「局域网跨屏」分组。
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::K)) {
-            self.cross.open = !self.cross.open;
+            self.app.open_settings_tab(13);
         }
-        self.cross.ui(ctx);
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
-        #[cfg(not(windows))] let repaint_after=out.repaint_after;
+        // 穿透时主窗口收不到 mousemove，用 20fps 轮询全局坐标以保证移回岛上立即恢复。
+        #[cfg(not(windows))] let repaint_after=if passthrough{Duration::from_millis(50)}else{out.repaint_after};
         schedule_repaint(ctx,repaint_after);
     }
 }
@@ -994,7 +1010,7 @@ fn run() -> eframe::Result<()> {
     std::thread::spawn(daozai::record_install_size);
     diagnostics::startup("初始化图形窗口");
     let viewport = egui::ViewportBuilder::default()
-        .with_title("岛仔").with_icon(daozai::theme::app_icon())
+        .with_title("IslandHop").with_icon(daozai::theme::app_icon())
         .with_inner_size([app::CANVAS_W, app::WIN_H])
         .with_decorations(false)
         .with_transparent(true)
@@ -1004,5 +1020,5 @@ fn run() -> eframe::Result<()> {
         .with_always_on_top()
         .with_visible(false);
     let opts = eframe::NativeOptions { viewport, vsync: !cfg!(windows), ..Default::default() };
-    graphics::run(opts,|opts|eframe::run_native("岛仔", opts, Box::new(|cc| Ok(Box::new(Shell::new(cc))))))
+    graphics::run(opts,|opts|eframe::run_native("IslandHop", opts, Box::new(|cc| Ok(Box::new(Shell::new(cc))))))
 }

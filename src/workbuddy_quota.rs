@@ -213,6 +213,9 @@ impl Connect {
         assert_eq!(session.cookie,"session=test");
     }
     #[test]
+    // `mod login` 只有 Windows 实现（#[cfg(windows)]），macOS 上跑回归测试时
+    // 这个手动验证用例不参与编译，否则整个 lib test 目标无法构建。
+    #[cfg(windows)]
     #[ignore="手动验证默认浏览器官网登录，需用户完成登录"]
     fn workbuddy_login_without_extension(){
         let config=super::super::Config::load();

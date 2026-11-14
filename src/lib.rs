@@ -6,9 +6,9 @@
 //! - `native` / `tray`：仅 Windows 的窗口区域、命中穿透与托盘
 
 pub mod display_layout;
-/// IslandHop 新增：OpenHop 跨屏引擎控制台（岛仔上游无此模块）。
+/// IslandHop 新增：OpenHop 跨屏引擎 + 内嵌在岛仔设置窗口的面板（岛仔上游无此模块）。
 pub mod cross_screen;
-/// IslandHop 新增：macOS 窗口层级 / 刘海几何（岛仔上游 0 处 macOS 分支）。
+/// IslandHop 新增：macOS 窗口层级 / 点击穿透 / 刘海几何（岛仔上游 0 处 macOS 分支）。
 pub mod mac_window;
 mod mail_privacy;
 pub mod poll_clock;
