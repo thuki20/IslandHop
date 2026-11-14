@@ -1265,10 +1265,17 @@ impl App {
             }
             if focus_requested {
                 // Glow 在首帧交换缓冲后执行窗口命令，避免先显示白色空窗口。
+                #[cfg(test)]
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
+            // 外层 send_viewport_cmd_to 发向「尚未创建的」immediate viewport，
+            // 首帧竞态时可能整个被吞掉，窗口就永久隐形。子 viewport 自己的
+            // ctx 每帧补发一次 Visible(true) 才会真正落到 NSWindow 上；
+            // Visible(true) 不会取消最小化，不打断用户手动最小化窗口。
+            #[cfg(not(test))]
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             if ctx.input(|i|i.viewport().close_requested()){self.settings_open=false;self.quota_close_connection();}
             let before=format!("{:?}",self.settings);
             egui::SidePanel::left("settings-sidebar").resizable(false).exact_width(180.0).frame(egui::Frame::new().fill(settings_color(ctx,Color32::from_rgb(29,29,32),Color32::from_rgb(237,239,243))).stroke(egui::Stroke::new(1.0,settings_color(ctx,Color32::from_rgb(42,42,45),Color32::from_rgb(216,219,225)))).inner_margin(egui::Margin::symmetric(10,12))).show(ctx,|ui|{

@@ -45,6 +45,13 @@ fn open_privacy_pane(pane: &str) {
     let _ = std::process::Command::new("open").arg(url).spawn();
 }
 
+/// 回环自测残留：openhop-core 的 `examples/loopback_e2e.rs` 会把
+/// `name = "LoopbackClient"` / `127.0.0.1` 写进 layout.screens（x=-2）。
+/// 它不是真实对端，不能当成一台显示器参与排列与显示。
+fn is_loopback_entry(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case("LoopbackClient")
+}
+
 /// UI 状态挂在线程局部：所有 egui 渲染都在主线程，避免 `Engine` 的 Send 约束，
 /// 也不必改动上游 `App` 结构体（它有 600KB 的 UI 测试基线依赖）。
 /// 第一次访问时才初始化 = 应用启动时引擎按 `enabled` 自启。
@@ -118,6 +125,11 @@ impl CrossScreen {
             ),
         };
         let cfg_loaded = load_error.is_none();
+        // 回环自测残留（LoopbackClient = 127.0.0.1, x=-2）会被当成一台真实
+        // 显示器，还会把本机排到左边两格外。只在运行时内存里剔除，交给引擎
+        // 的也是干净 layout；不主动改写用户磁盘上的 config.toml。
+        let mut cfg = cfg;
+        cfg.layout.screens.retain(|s| !is_loopback_entry(&s.name));
         let mut this = Self {
             name: cfg.name.clone(),
             pass: cfg.passphrase.clone(),
@@ -474,6 +486,10 @@ impl CrossScreen {
         let mut screens: Vec<(String, i32)> = vec![("本机".into(), 0)];
         let me = self.cfg.name.trim().to_string();
         for s in &self.cfg.layout.screens {
+            // openhop-core/examples/loopback_e2e.rs 回环自测会把
+            // "LoopbackClient" = 127.0.0.1 写进 layout（x=-2）。它不是真实对端，
+            // 画出来就是莫名其妙的第三台显示器，还会把本机排到左侧两格外。
+            if is_loopback_entry(&s.name) { continue; }
             // 改名后旧版 OpenHop 会把同一台机器记成两个名字；x=0 且名字等于
             // 本机名时不再重复画一张卡（用户截图里出现过 3 台显示器）。
             if s.x == 0 && (s.name.trim() == "本机" || s.name.trim().eq_ignore_ascii_case(&me)) { continue; }
@@ -503,6 +519,7 @@ impl CrossScreen {
             egui::FontId::proportional(10.0), Color32::from_rgb(52, 178, 116));
         let screens = self.cfg.layout.screens.clone();
         for s in &screens {
+            if is_loopback_entry(&s.name) { continue; }
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("{}  x={}", s.name, s.x)).size(10.5));
                 if ui.small_button("◀").clicked() { actions.push(Action::Place(s.name.clone(), s.x - 1)); }

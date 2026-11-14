@@ -28,7 +28,8 @@
 | **刘海机型布局（二修）** | ✅ | 本机实测刘海 185×32 pt。首版 `notch_split` 只做 x ±平移，压在中心的组件还额外推 w/2，导致右侧「16:20☀20°」重叠并溢出胶囊边界；现改为**按原顺序分左右两组、各自紧靠刘海边缘重排**，`width = 刘海 + 左组 + 右组 + 边距`，胶囊背景与 hit 跟随。实测时钟/天气分列不重叠、电池等图标可见、胶囊居中覆盖刘海 |
 | **配对界面可视化** | ✅ | 从纯文本表单改为：大号电源开关、三步连接进度、设备卡片（显示器图标/系统/地址/连接状态）、图形化屏幕排列画布、当前光标高亮；角色/口令/权限收进「高级设置」折叠 |
 | **口令一致免配对流程** | ✅ | 引擎 `needs_pairing()` 仅在口令为空时返回 true，口令一致本来就自动发现直连；UI 之前仍摆配对码输入框误导用户。现在口令模式明确显示「无需配对码、不用点配对」，只有口令为空才显示 6 位大字配对码 |
-| **设置窗口偶发打不开** | ✅ | `with_visible(false)` 的一次性 `Visible(true)` 会撞上 immediate viewport 首帧竞态被吞 → 窗口永久隐形。实际运行每帧幂等补发 `Visible(true)`（测试构建保留上游一次性语义），并在请求打开时 `activateIgnoringOtherApps` 激活应用 |
+| **顶部状态不再重叠 / 画布脏数据清理** | ✅ | 头部状态拆成「左标题 + 右侧两行（已连接台数 / 本机 IP）」，修掉 `TCP 24950` 压住右侧小字；`openhop-core/examples/loopback_e2e.rs` 回环自测写进 `config.toml` 的 `LoopbackClient = 127.0.0.1, x=-2` 会被当成第三台显示器并把本机排到左边两格外，现于配置载入时从运行时 layout 剔除（不改写用户磁盘文件），画布与位置按钮同步过滤 |
+| **设置窗口偶发打不开** | ✅ | `with_visible(false)` 的一次性 `Visible(true)` 会撞上 immediate viewport 首帧竞态被吞 → 窗口永久隐形。现做**双兜底**：外层向 viewport id 补发 + **子 viewport 自己的 `ctx` 每帧补发 `Visible(true)`**（外层命令发向尚未创建的 immediate viewport 可能整个被吞）；测试构建保留上游一次性语义，请求打开时 `activateIgnoringOtherApps` 激活应用 |
 | **Dock 图标彻底统一** | ✅ | 上一轮只改了主窗口，**设置窗口 / 更新窗口仍 `.with_icon(theme::app_icon())`**，eframe 在 macOS 会 `setApplicationIconImage` 把 Dock 图标换成岛仔 logo（黑底白 e）。现所有 viewport 在 macOS 均不设窗口图标；实测「打开设置后」bundle 与运行中 Dock 图标 TIFF 完全一致 |
 | **macOS 系统数据源** | ✅ | 新增 `src/macos_sys.rs`：电池 `pmset`、音量/静音 `osascript`（读+写）、网络 `route`、闲置 `CGEventSourceSecondsSinceLastEventType`、媒体 AppleScript（Music/Spotify，2 s 节流）、文件 `open` / `open -R` / 文件选择；接入 `Env` 与 `Cmd`。剪贴板历史改 `NSPasteboard.changeCount` 轮询。截图确认灵动岛出现绿色电池图标 |
 | **Mac 中文字体** | ✅ | 修 `theme.rs` 只查 Windows/Linux 字体目录的缺陷，加载 macOS 系统 CJK 字体；中文由满屏方块恢复可读 |
