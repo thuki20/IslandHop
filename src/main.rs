@@ -846,9 +846,15 @@ fn local_now() -> (String, String, String) {
 
 #[cfg(not(windows))]
 fn local_now() -> (String, String, String) {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    (format!("{h:02}:{m:02}:{s:02}"), "1970-01-01".into(), "1月1日 周四".into())
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Local::now();
+    let wd = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    let weekday = wd[now.weekday().num_days_from_sunday() as usize];
+    (
+        format!("{:02}:{:02}:{:02}", now.hour(), now.minute(), now.second()),
+        format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day()),
+        format!("{}月{}日 {}", now.month(), now.day(), weekday),
+    )
 }
 
 #[cfg(windows)]
