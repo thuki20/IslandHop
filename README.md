@@ -37,7 +37,7 @@
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
 | **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`；**用钥匙串 `OpenHopSign` 自签名固定身份**，重打包不丢 TCC 授权 |
 | Mac 平台层全量重写 | ⏳ | 本轮补 7 类数据源后仍有 **267 处 `cfg(windows)`**，托盘 / 开机自启 / 通知读取 / Keychain 登录 / 更新器未做，工单见下 |
-| Windows 端编译 / 出包 | ✅ | `522a4be` 触发的 `IslandHop Build` **success**，x64 zip 已拉取到 `dist/IslandHop-Windows-x64.zip`（`IslandHop.exe` SHA256 `B47002FF…82E41E`）；exe 字节级确认含「局域网跨屏 / 本机权限 / 不再显示权限相关提示」，即新界面已编进 Windows 包 |
+| Windows 端编译 / 出包 | ✅ | `57ab9a2` 触发的 `IslandHop Build` **success**，最终 x64 zip 已拉取到 `dist/IslandHop-Windows-x64.zip`（`IslandHop.exe` SHA256 `05881150…3238`，一键脚本 `ExpectedSha` 同步）；exe 字节级确认含「局域网跨屏 / 共享口令模式 / 无需配对码」，即本轮可视化面板与画布清理已编进 Windows 包 |
 | **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、设置页 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
 | **双机键鼠 / 剪贴板动作实测** | ⏳ | 会话与剪贴板线程已起，但 Mac 缺「输入监控」授权导致事件 tap 退化（见下）；内容级跨机同步需双机人工实测，**不报通过** |
 
