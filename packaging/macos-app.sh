@@ -49,8 +49,17 @@ PLIST
 
 # 不设置 LSUIElement=true：那会把 Dock 图标和菜单栏一起隐藏，用户会以为应用没启动。
 # 岛本身由 app 内部把 NSWindow 抬到 level 25（菜单栏之上）并保持无边框。
-# ad-hoc 签名：无开发者证书时也能在本机运行；授权（辅助功能/输入监控）仍需用户在系统设置里打开。
-codesign --force --deep --sign - "$APP" 2>/dev/null || true
+# 固定代码签名证书：TCC 按「签名身份 + bundle id」记授权，重打包后仍有效。
+# 用 ad-hoc 签名时每次 codesign 都会换 cdhash，用户每次打开都被要求重新授权辅助功能 /
+# 输入监控。钥匙串里已有用户自建的 OpenHopSign 证书时优先用它；没有才退回 ad-hoc。
+SIGN_IDENTITY="OpenHopSign"
+if security find-identity -v -p codesigning 2>/dev/null | /usr/bin/grep -q "\"$SIGN_IDENTITY\""; then
+  codesign --force --deep --timestamp=none --sign "$SIGN_IDENTITY" "$APP"
+  echo "signed with $SIGN_IDENTITY (stable TCC identity; authorization survives rebuilds)"
+else
+  codesign --force --deep --sign - "$APP" 2>/dev/null || true
+  echo "warning: ad-hoc signature; TCC authorization is lost on every rebuild" >&2
+fi
 echo "built $APP (version $VERSION, icon AppIcon.icns)"
 
 if [ "$APP_ONLY" -eq 0 ]; then

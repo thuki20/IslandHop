@@ -1009,8 +1009,9 @@ fn run() -> eframe::Result<()> {
     #[cfg(windows)]
     std::thread::spawn(daozai::record_install_size);
     diagnostics::startup("初始化图形窗口");
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("IslandHop").with_icon(daozai::theme::app_icon())
+    #[allow(unused_mut)]
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("IslandHop")
         .with_inner_size([app::CANVAS_W, app::WIN_H])
         .with_decorations(false)
         .with_transparent(true)
@@ -1019,6 +1020,12 @@ fn run() -> eframe::Result<()> {
         .with_taskbar(false)
         .with_always_on_top()
         .with_visible(false);
+    // macOS：eframe 的 with_icon() 会在启动时调用 NSApp.setApplicationIconImage，
+    // 把 Dock / 程序坞 / 切换器里的图标换成内嵌的岛仔 logo，而 Finder 里显示的是
+    // .app bundle 的 AppIcon.icns —— 表现就是「一打开软件图标就变」。
+    // .app 包已带图标，macOS 分支不再替换 Dock 图标；Windows 仍需要任务栏图标。
+    #[cfg(not(target_os = "macos"))]
+    { viewport = viewport.with_icon(daozai::theme::app_icon()); }
     let opts = eframe::NativeOptions { viewport, vsync: !cfg!(windows), ..Default::default() };
     graphics::run(opts,|opts|eframe::run_native("IslandHop", opts, Box::new(|cc| Ok(Box::new(Shell::new(cc))))))
 }

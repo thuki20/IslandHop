@@ -16,11 +16,34 @@
 //! 抢端口、抢组播发现组，也不会回写污染旧版配置。
 
 use eframe::egui::{self, Color32, RichText, Ui};
+use openhop_core::platform;
 use openhop_core::protocol::{DEFAULT_PORT, DISCOVERY_PORT};
 use openhop_core::{Config, Engine, Role, Status};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// UI 偏好单独存一个文件，不写进 config.toml（那个文件由引擎回写，混用会丢配置）。
+fn prefs_path() -> PathBuf {
+    Config::default_path().with_file_name("ui-prefs.toml")
+}
+
+fn read_hide_permission_hint() -> bool {
+    std::fs::read_to_string(prefs_path())
+        .is_ok_and(|s| s.lines().any(|l| l.trim() == "hide_permission_hint = true"))
+}
+
+fn write_hide_permission_hint(value: bool) {
+    let path = prefs_path();
+    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    let _ = std::fs::write(path, format!("hide_permission_hint = {value}\n"));
+}
+
+/// 打开 macOS 隐私设置对应子页；只在用户点按钮时调用。
+fn open_privacy_pane(pane: &str) {
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+    let _ = std::process::Command::new("open").arg(url).spawn();
+}
 
 /// UI 状态挂在线程局部：所有 egui 渲染都在主线程，避免 `Engine` 的 Send 约束，
 /// 也不必改动上游 `App` 结构体（它有 600KB 的 UI 测试基线依赖）。
@@ -74,6 +97,8 @@ pub struct CrossScreen {
     direct_addr: String,
     new_screen: String,
     last_notes: Vec<String>,
+    /// 用户勾选「不再显示权限相关提示」后，不再每次启动刷一屏授权指引。
+    hide_permission_hint: bool,
 }
 
 impl CrossScreen {
@@ -101,6 +126,7 @@ impl CrossScreen {
             direct_addr: String::new(),
             new_screen: String::new(),
             last_notes: Vec::new(),
+            hide_permission_hint: read_hide_permission_hint(),
             path,
             cfg,
             engine: None,
@@ -214,6 +240,8 @@ impl CrossScreen {
         }
         ui.add_space(4.0);
 
+        self.view_permissions(ui);
+        ui.separator();
         self.view_status(ui, status.as_ref());
         ui.separator();
         self.view_pairing(ui, status.as_ref(), &mut actions);
@@ -228,12 +256,44 @@ impl CrossScreen {
         for action in actions { self.handle(action); }
     }
 
+    /// 权限状态一目了然；系统授权窗口只在用户主动点按钮时才弹。
+    fn view_permissions(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("本机权限（不会自动弹授权窗口）").size(13.0).strong());
+        let (accessibility, input_monitoring) = platform::permission_state();
+        let ok = Color32::from_rgb(45, 155, 95);
+        let bad = Color32::from_rgb(205, 90, 70);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("辅助功能");
+            ui.label(RichText::new(if accessibility { "已授权" } else { "未授权" }).color(if accessibility { ok } else { bad }));
+            ui.label("·  输入监控");
+            ui.label(RichText::new(if input_monitoring { "已授权" } else { "未授权" }).color(if input_monitoring { ok } else { bad }));
+        });
+        #[cfg(target_os = "macos")]
+        {
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("请求授权").clicked() { platform::request_permissions(); }
+                if ui.small_button("辅助功能设置").clicked() { open_privacy_pane("Privacy_Accessibility"); }
+                if ui.small_button("输入监控设置").clicked() { open_privacy_pane("Privacy_ListenEvent"); }
+            });
+        }
+        let mut hide = self.hide_permission_hint;
+        if ui.checkbox(&mut hide, "不再显示权限相关提示").changed() {
+            self.hide_permission_hint = hide;
+            write_hide_permission_hint(hide);
+        }
+        if !self.hide_permission_hint && !(accessibility && input_monitoring) {
+            ui.label(RichText::new("键鼠跨屏需要「辅助功能 + 输入监控」两项都授权；授权后彻底退出 IslandHop 再重开。").size(10.5).color(bad));
+        }
+    }
+
     fn view_status(&self, ui: &mut Ui, status: Option<&Status>) {
         ui.label(RichText::new("运行状态").size(13.0).strong());
         let Some(s) = status else {
             ui.label(RichText::new("● 未启动").color(Color32::from_rgb(215, 85, 80)));
             if let Some(e) = &self.error {
-                ui.label(RichText::new(e).size(11.0).color(Color32::from_rgb(205, 90, 70)));
+                if !self.hide_permission_hint {
+                    ui.label(RichText::new(e).size(11.0).color(Color32::from_rgb(205, 90, 70)));
+                }
             }
             return;
         };
@@ -245,7 +305,11 @@ impl CrossScreen {
         });
         ui.label(RichText::new(&s.message).size(11.5));
         if let Some(e) = &s.error {
-            ui.label(RichText::new(format!("引擎错误：{e}")).size(11.5).color(Color32::from_rgb(205, 90, 70)));
+            let is_permission_hint = e.contains("授权") || e.contains("权限")
+                || e.contains("输入监控") || e.contains("辅助功能");
+            if !(self.hide_permission_hint && is_permission_hint) {
+                ui.label(RichText::new(format!("引擎错误：{e}")).size(11.5).color(Color32::from_rgb(205, 90, 70)));
+            }
         }
         if let Some(e) = &s.pair_error {
             ui.label(RichText::new(format!("配对失败：{e}")).size(11.5).color(Color32::from_rgb(205, 90, 70)));
@@ -367,7 +431,9 @@ impl CrossScreen {
             if ui.button("启动").clicked() { actions.push(Action::Start); }
             if ui.button("停止").clicked() { actions.push(Action::Stop); }
             if let Some(e) = &self.error {
-                ui.label(RichText::new(e).size(10.5).color(Color32::from_rgb(205, 90, 70)));
+                if !self.hide_permission_hint {
+                    ui.label(RichText::new(e).size(10.5).color(Color32::from_rgb(205, 90, 70)));
+                }
             }
         });
     }
@@ -375,7 +441,9 @@ impl CrossScreen {
     fn view_platform_hint(&self, ui: &mut Ui) {
         ui.add_space(4.0);
         if cfg!(target_os = "macos") {
-            ui.label(RichText::new("macOS：需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop，并彻底退出重开后才生效。TCC 按应用路径授权，换成 /Applications 下的包要重新勾。").size(10.5));
+            if !self.hide_permission_hint {
+                ui.label(RichText::new("macOS：应用已用固定证书签名，授权一次即可长期有效；只有更换签名证书或移走 /Applications 下的包才需重新勾。").size(10.5));
+            }
         } else {
             ui.label(RichText::new("IslandHop 使用独立端口 24950/24951 与独立配置目录，可与旧版 OpenHop 并存；但两者都会注入键鼠事件，实际跨屏时请只启用其中一个。").size(10.5));
         }

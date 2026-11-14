@@ -84,6 +84,22 @@ impl Layout {
     }
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
+    /// 刘海机型专用：在中心留出 `gap` 宽的空洞，把常驻小图标分列到刘海左右。
+    /// 只平移各槽 x 并加总宽，不动槽宽、顺序与任何其他平台的行为，因此
+    /// 上游录制测试（无刘海）看到的布局与原来完全一致。
+    pub fn notch_split(&mut self, gap: f32) {
+        if gap <= 0.0 { return; }
+        let half = gap / 2.0;
+        for (i, slot) in self.x.iter_mut().enumerate() {
+            let Some(x) = slot.as_mut() else { continue };
+            let w = self.widths.get(i).copied().unwrap_or(0.0);
+            if *x + w / 2.0 <= 0.0 { *x -= half; }
+            else if *x - w / 2.0 >= 0.0 { *x += half; }
+            // 恰好压在中心的组件不能留在洞里，整体推到右侧可见区。
+            else { *x += half + w / 2.0; }
+        }
+        self.width += gap;
+    }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;

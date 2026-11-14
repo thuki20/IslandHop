@@ -253,6 +253,9 @@ pub trait Injector: Send {
 
 /// Ask for OS permissions where needed (macOS Accessibility). Returns a
 /// human-readable problem if input control isn't allowed yet.
+///
+/// `prompt = true` 会弹系统授权窗口，只允许由用户显式点击按钮时传入；
+/// 引擎启动路径一律用 false。
 pub fn check_permissions(prompt: bool) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -263,6 +266,21 @@ pub fn check_permissions(prompt: bool) -> Option<String> {
         let _ = prompt;
         None
     }
+}
+
+/// 静默读取「辅助功能 / 输入监控」两项授权状态，供设置面板展示。
+/// 非 macOS 平台视为均已授权。
+pub fn permission_state() -> (bool, bool) {
+    #[cfg(target_os = "macos")]
+    { return macos::permission_state(); }
+    #[allow(unreachable_code)]
+    { (true, true) }
+}
+
+/// 用户主动点击「请求授权」时调用；非 macOS 平台无操作。
+pub fn request_permissions() {
+    #[cfg(target_os = "macos")]
+    { macos::request_permissions(); }
 }
 
 pub fn start_capture(tx: Sender<InputEvent>, override_screen: Option<Rect>) -> Result<Arc<dyn Capture>> {

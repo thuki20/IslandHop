@@ -39,24 +39,48 @@ extern "C" {
     fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
     fn _CGSDefaultConnection() -> i32;
     fn CGSSetConnectionProperty(cid: i32, target: i32, key: CFStringRef, value: *const c_void) -> i32;
+    /// 静默查询「输入监控」权限；不会弹系统授权窗口（macOS 10.15+）。
+    fn CGPreflightListenEventAccess() -> u32;
+    /// 显式请求「输入监控」权限；会弹一次系统授权窗口，仅由用户点击按钮触发。
+    fn CGRequestListenEventAccess() -> u32;
 }
 
-pub fn check_permissions(prompt: bool) -> Option<String> {
-    let trusted = unsafe {
+/// 静默读取两项 TCC 授权。引擎启动/注入键鼠时**只能**用这个，不能带 prompt，
+/// 否则每次打开软件都会弹一次「IslandHop 想要控制这台电脑」。
+pub fn permission_state() -> (bool, bool) {
+    let accessibility = unsafe {
         let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
-        let value = if prompt { CFBoolean::true_value() } else { CFBoolean::false_value() };
+        let value = CFBoolean::false_value();
         let dict = CFDictionary::from_CFType_pairs(&[(key, value)]);
         AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const c_void)
     };
-    if trusted {
+    let input_monitoring = unsafe { CGPreflightListenEventAccess() != 0 };
+    (accessibility, input_monitoring)
+}
+
+/// 用户主动点「请求授权」时才调用：最多弹一次系统授权窗口。
+pub fn request_permissions() {
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let dict = CFDictionary::from_CFType_pairs(&[(key, CFBoolean::true_value())]);
+        let _ = AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const c_void);
+        let _ = CGRequestListenEventAccess();
+    }
+}
+
+pub fn check_permissions(prompt: bool) -> Option<String> {
+    if prompt { request_permissions(); }
+    let (accessibility, input_monitoring) = permission_state();
+    if accessibility && input_monitoring {
         None
     } else {
-        Some(
-            "IslandHop 的辅助功能授权未生效。请在「系统设置 → 隐私与安全性 → 辅助功能」\
-             把 IslandHop 的开关关掉再打开（更新 app 后签名变化会让旧授权失效），\
-             并在「输入监控」里添加并勾选 IslandHop，然后彻底退出 IslandHop 再重开。"
-                .into(),
-        )
+        let mut missing = Vec::new();
+        if !accessibility { missing.push("辅助功能"); }
+        if !input_monitoring { missing.push("输入监控"); }
+        Some(format!(
+            "IslandHop 的{}授权未生效。请在「系统设置 → 隐私与安全性」勾选 IslandHop，然后彻底退出重开。",
+            missing.join(" / ")
+        ))
     }
 }
 
@@ -210,7 +234,9 @@ pub struct MacCapture {
 
 impl MacCapture {
     pub fn start(tx: Sender<InputEvent>) -> Result<Arc<MacCapture>> {
-        if let Some(msg) = check_permissions(true) {
+        // 启动引擎属于后台行为，绝不能弹系统授权窗口（用户每次打开软件都会被打扰）。
+        // 权限不足只在设置面板里报告，由用户主动点「请求授权」时才 prompt。
+        if let Some(msg) = check_permissions(false) {
             return Err(anyhow!(msg));
         }
         TX.set(tx).map_err(|_| anyhow!("capture already started"))?;
@@ -319,7 +345,7 @@ pub struct MacInjector {
 
 impl MacInjector {
     pub fn new() -> Result<MacInjector> {
-        if let Some(msg) = check_permissions(true) {
+        if let Some(msg) = check_permissions(false) {
             return Err(anyhow!(msg));
         }
         Ok(MacInjector { pos: (0.0, 0.0), buttons: HashSet::new(), mods: Vec::new(), last_click: None })

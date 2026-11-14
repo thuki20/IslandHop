@@ -22,10 +22,14 @@
 | **`.app` 启动冒烟（Mac）** | ✅ | 10 s 存活、stderr 空、窗口 `layer=25 / y=0`、旧 OpenHop 配置哈希未变 |
 | **跨屏功能内嵌岛仔设置** | ✅ | 岛仔「设置」窗口第 13 项「局域网跨屏」，无独立窗口；引擎后台自启，打开软件即用；Cmd/Ctrl+Shift+K 或 `--cross-screen` 直达该分组 |
 | **Mac 点击穿透** | ✅ | 修复 960×270 置顶透明窗口吞掉屏幕顶部鼠标事件：按 `FrameOut.hit / notice_hit / file_drop_zone` 动态设置 `NSWindow.ignoresMouseEvents`，命中区外点击落到下层应用；`env.cursor` 改用全局鼠标换算坐标 |
+| **不再每次弹授权窗口** | ✅ | 引擎启动路径原本 `check_permissions(true)` 会调 `AXIsProcessTrustedWithOptions` 两次弹系统框；改为静默查询 + 面板显示辅助功能/输入监控两项状态，只有用户点「请求授权」才弹 |
+| **固定代码签名** | ✅ | 打包脚本改用钥匙串已有的 `OpenHopSign` 证书（不再 ad-hoc），TCC 按签名身份记授权，重打包不再丢失授权 |
+| **Mac 图标统一** | ✅ | eframe 的 `with_icon()` 在 macOS 会 `setApplicationIconImage` 覆盖 Dock 图标；macOS 分支不再设置，Dock/Finder 统一用 bundle `AppIcon.icns` |
+| **刘海机型布局** | ✅ | 本机实测刘海 185×32 pt，与收起胶囊内容同宽 → 小图标全被物理遮挡；按 `safeAreaInsets` 把常驻组件分列刘海两侧，黑色胶囊仍横跨刘海 |
 | **Mac 中文字体** | ✅ | 修 `theme.rs` 只查 Windows/Linux 字体目录的缺陷，加载 macOS 系统 CJK 字体；中文由满屏方块恢复可读 |
 | **Mac 主岛窗口贴顶** | ✅ | `y=38 / layer=3` → **`y=0 / layer=25`**（CGWindowList 实测） |
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
-| **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（ad-hoc 签名 / arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`（稳定 TCC 授权路径） |
+| **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`；**用钥匙串 `OpenHopSign` 自签名固定身份**，重打包不丢 TCC 授权 |
 | Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
 | Windows 端编译 / 出包 | ✅ | **双 workflow 全绿**：`IslandHop Build` 出 x64 zip；`Windows 检查`（上游全量测试 + NSIS 打包 + 安装器测试）通过 |
 | **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、控制台 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
@@ -57,7 +61,7 @@ IslandHop/
 | 挂载点 | 做法 |
 |---|---|
 | 引擎 | `Shell::new` 里 `CrossScreen::new()` 读配置并 `Engine::start`，`update()` 每帧只做一次 `status()` |
-| 配置 | 沿用 `Config::default_path()` = `~/Library/Application Support/openhop/config.toml`，**自动继承旧 OpenHop 的配对 / 口令 / 屏幕排列**（本机已确认该文件存在） |
+| 配置 | `Config::default_path()` = `~/Library/Application Support/IslandHop/config.toml`，**不读也不回写**旧 OpenHop 的 `openhop/config.toml`（旧版 24850/24851 可并存） |
 | 界面 | 上游把页数硬编码成 `[bool; 9]` / `[usize; 9]` 并散落在大量 `match page` 与 612KB 录制测试里；硬插第 10 个功能页会破坏设置持久化与测试基线，故**只在岛仔原有设置窗口加一个分组**（`SETTINGS_GROUPS` 第 13 项），不动功能页结构 |
 | 引擎启动 | `Shell::new` 触发 `cross_screen::with()` 初始化；`config.toml` 里 `enabled=true` 时 `Engine::start` 在后台线程启动，**用户不用打开任何界面** |
 | 点击穿透 | Windows 由 `native.rs` 用 `SetWindowRgn` 裁剪；macOS 由 `mac_window.rs` 用 `NSWindow.ignoresMouseEvents` + `NSEvent.mouseLocation` 换算实现等价行为 |
@@ -102,16 +106,17 @@ IslandHop/
 
 **启动与验证**
 
-1. Mac：把 `IslandHop.app` 装到 `/Applications`（不要从 dmg 挂载目录运行，TCC 授权路径每次都变）；配置 `enabled = true`；`Cmd/Ctrl+Shift+K` 打开「设置 → 局域网跨屏」。引擎在启动软件时已经自动跑起来了，这个页面只是查看状态/改配置。
-2. Windows：解压 `IslandHop-Windows-x64.zip`，运行本机交付的 `dist/IslandHop-Windows-EnableCrossScreen.ps1`（内含共享口令明文，**仅本机使用、不要外传/提交**，故不在仓库里）。脚本会写干净配置、放行防火墙、校验 exe 版本并带 `--cross-screen` 重启（现在直达设置里的跨屏分组）。
+1. Mac：把 `IslandHop.app` 装到 `/Applications`（不要从 dmg 挂载目录运行）；配置 `enabled = true`；`Cmd/Ctrl+Shift+K` 打开「设置 → 局域网跨屏」。引擎在启动软件时已经自动跑起来了，这个页面只是查看状态/改配置。
+2. Windows：解压 `IslandHop-Windows-x64.zip`，运行本机交付的 `dist/IslandHop-Windows-EnableCrossScreen.ps1`（内含共享口令明文，**仅本机使用、不要外传/提交**，故不在仓库里）。脚本会写干净配置、放行防火墙、校验 exe 版本并**直接重启**（不需要任何启动参数，跨屏面板在「设置 → 局域网跨屏」）。
 3. 设置页出现 `Sharing with 1 computer(s) / 已连接 1 台` 即握手成功。协议层自检：`IH_PASSPHRASE='<口令>' cargo run -p openhop-core --example loopback_e2e`。
 
 **macOS 键鼠捕获还差一步（必须人工授权）**
 
-引擎用 `CGEventTap(Location::HID)` 捕获本机键鼠，需要「**输入监控**」权限。缺权限时 tap 创建失败，引擎退化成 `NoCapture` —— 设置页照样显示「运行中 / 已连接 1 台」，但鼠标永远切不过去（剪贴板线程仍可用）。
+引擎用 `CGEventTap(Location::HID)` 捕获本机键鼠，需要「**输入监控**」权限；注入事件需要「**辅助功能**」。缺任一项时 tap 创建失败，引擎退化成 `NoCapture` —— 设置页照样显示「运行中 / 已连接 1 台」，但鼠标永远切不过去（剪贴板线程仍可用）。
 
-- 系统设置 → 隐私与安全性 → 输入监控 → `+` 添加 `/Applications/IslandHop.app` 并打开开关；「辅助功能」也要勾（注入用）
-- **彻底退出 IslandHop 再重开**（TCC 按实例生效）
+- 设置页「本机权限」直接显示两项是否授权，并可一键打开对应系统设置子页；**启动软件不会自动弹系统授权框**
+- 应用已用固定证书 `OpenHopSign` 签名，授权一次即可长期有效；只有换签名证书或把 app 移出 `/Applications` 才需重新勾
+- 缺权限时彻底退出 IslandHop 再重开；不想再看到红字可勾「不再显示权限相关提示」（存 `~/Library/Application Support/IslandHop/ui-prefs.toml`）
 - 自检：`bash packaging/verify-macos-capture.sh`，出现 `✅ mac-event-tap 线程存在` 才算就绪
 
 本轮顺手修掉两个会让人「查不出原因」的缺陷：捕获失败从静默 `log::warn` 改为设置页可见的「引擎错误」；`Config::load` 解析失败时不再用默认值回写覆盖用户配置（无效 TOML 不会抹掉口令/端口/排列，并在设置页提示）。
@@ -122,11 +127,11 @@ IslandHop/
 
 ```bash
 cargo build --release
-./target/release/IslandHop --cross-screen     # 启动并打开「设置 → 局域网跨屏」
-./target/release/IslandHop                    # 只启动岛；引擎按 enabled 后台自启，Cmd/Ctrl + Shift + K 随时打开设置
+./target/release/IslandHop --cross-screen     # 启动并跳到「设置 → 局域网跨屏」（可选）
+./target/release/IslandHop                    # 正常启动；引擎按 enabled 后台自启，Cmd/Ctrl + Shift + K 随时打开设置
 ```
 
-「设置 → 局域网跨屏」里可以：一键启停、切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、启停引擎、查看引擎错误与最近事件。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
+「设置 → 局域网跨屏」里可以：查看本机权限与一键请求授权、启停引擎、切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、查看引擎错误与最近事件。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
 
 - 两端角色必须**相反**、共享口令一致、TCP **24950** / UDP **24951** 放行，**两端都要装 IslandHop**（端口与旧版 OpenHop 不通）
 - macOS 需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop 并**彻底退出重开**（TCC 按应用路径授权）
@@ -168,9 +173,7 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 | 外壳 | 1 | 82 | `main.rs` | 已补窗口层级与定位；其余系统采样仍走 Windows |
 | 图标 / 主题 | 2 | 12 | `icons.rs`、`theme.rs` | 部分资源路径 Windows 专属 |
 
-**已实修的 Mac 项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、OpenHop 引擎接入（含独立端口 / 独立配置目录）、`config_dir()` 补 macOS / Linux 标准路径（原来退化成相对路径 `./Daozai`）、刘海尺寸读取接口（`openhop_core::extras::system::notch()`，本机 185×32 pt）。
-
-**尚未适配的视觉项**：岛体形状仍按上游 Windows 顶部居中胶囊自绘，**没有按刘海做「两侧分列 + 从刘海弹出」**。这是 `app.rs` / `shape.rs` 的绘制逻辑，属于 Mac 平台层工单，不是窗口坐标问题。
+**已实修的 Mac 视觉项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、刘海机型按 `safeAreaInsets`（本机 185×32 pt）把常驻小图标分列刘海左右两侧，黑色胶囊横跨刘海（`bar_layout.rs::notch_split`，无刘海机型布局与上游完全一致）。
 
 ---
 
@@ -178,7 +181,7 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 
 - Windows 端编译与安装包：**CI 双 workflow 已全绿**（848e4eb）；zip 见 Actions artifact，exe 已验证含 IslandHop 图标资源（.rsrc 23 KB）与版本信息 0.6.64。**用户 Windows 真机已安装并连上 Mac**（TCP 会话 ESTABLISHED），但 GUI 各功能未逐项实测
 - Windows 应用内更新器仍指向上游 `Renly1994/xiaotang-daozai` 的 Release（`updates.rs`），装了会提示/拉取上游更新——**重新绑定前不要用它更新**
-- macOS `.app` / dmg：本机包已产出，见上「打包」；**未做开发者签名 / 公证**
+- macOS `.app` / dmg：本机包已产出，见上「打包」；用自签名代码签名证书固定身份（**不是 Apple Developer ID，未公证**），首次运行若被 Gatekeeper 拦需在「系统设置 → 隐私与安全性」点「仍要打开」
 - 双机跨屏切换、剪贴板同步端到端：**TCP 会话、设置页「已连接 1 台」、`clipboard` 线程均已实测**；但 Mac 未授权「输入监控」→ `mac-event-tap` 线程缺失 → 键鼠切换未跑通；剪贴板内容跨机传输还需双机各复制一次人工确认，**不报通过**
 - 改端口后的**引擎监听实测**：✅ 已重跑。TCP 24950 v4/v6 LISTEN、UDP 24951 绑定；线程采样含 `server` / `clipboard` / `peer-192.168.1.15` / `link-writer`，**唯独缺 `mac-event-tap`**（即输入监控授权缺口）
 - 窗口内部标题仍是上游「岛仔」文案，未做品牌文案替换（保持全量派生）

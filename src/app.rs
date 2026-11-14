@@ -1730,6 +1730,9 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
+        // macOS 刘海机型：把常驻小图标分列到刘海左右两侧可见区。胶囊黑色背景
+        // 仍然横跨刘海（真灵动岛观感），只是中间不再放任何内容。
+        if let Some(gap) = crate::mac_window::notch_gap() { layout.notch_split(gap); }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {
             self.poll_lyrics();

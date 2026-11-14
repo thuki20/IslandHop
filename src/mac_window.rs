@@ -62,6 +62,20 @@ pub fn notch_size() -> Option<(f64, f64)> {
 #[cfg(not(target_os = "macos"))]
 pub fn notch_size() -> Option<(f64, f64)> { None }
 
+/// 刘海机型收起胶囊需要避开的中间空洞宽度（刘海宽 + 两侧各 12pt 呼吸位）。
+/// 本机 MacBook Pro 实测：刘海 185×32 逻辑点，而岛仔收起胶囊内容宽约 185pt，
+/// 正好整条被物理刘海挡住；把常驻图标分列两侧后才能看见。
+/// 无刘海机型返回 None，布局保持上游原样。
+#[cfg(target_os = "macos")]
+pub fn notch_gap() -> Option<f32> {
+    use std::sync::OnceLock;
+    static GAP: OnceLock<Option<f32>> = OnceLock::new();
+    *GAP.get_or_init(|| notch_size().map(|(w, _)| w as f32 + 24.0))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn notch_gap() -> Option<f32> { None }
+
 #[cfg(target_os = "macos")]
 mod imp {
     use eframe::egui::Pos2;
