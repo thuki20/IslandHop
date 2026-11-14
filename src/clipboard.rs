@@ -147,11 +147,18 @@ pub fn preview(text: &str) -> String {
 pub struct Watcher {
     #[cfg(windows)]
     stop: Arc<win::Stop>,
+    #[cfg(target_os = "macos")]
+    stop: Arc<AtomicBool>,
 }
 
 #[cfg(windows)]
 impl Drop for Watcher {
     fn drop(&mut self) { self.stop.request(); }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Watcher {
+    fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); }
 }
 
 #[cfg(windows)]
@@ -165,8 +172,66 @@ pub fn watch(shared: Shared, repaint: impl Fn() + Send + 'static) -> Option<Watc
     Some(Watcher { stop })
 }
 
-#[cfg(not(windows))]
+/// macOS 没有剪贴板变更通知，只能轮询 `NSPasteboard.changeCount`；
+/// 只有计数变化时才读文本，平时只有一次 ObjC 消息，开销可忽略。
+#[cfg(target_os = "macos")]
+pub fn watch(shared: Shared, repaint: impl Fn() + Send + 'static) -> Option<Watcher> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    std::thread::Builder::new().name("daozai-clipboard".into()).spawn(move || {
+        mac::run(shared, Box::new(repaint), &thread_stop);
+    }).ok()?;
+    Some(Watcher { stop })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub fn watch(_shared: Shared, _repaint: impl Fn() + Send + 'static) -> Option<Watcher> { Some(Watcher {}) }
+
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::Shared;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use std::ffi::{c_char, CStr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn pasteboard() -> *mut AnyObject {
+        unsafe { msg_send![class!(NSPasteboard), generalPasteboard] }
+    }
+    fn change_count(pb: *mut AnyObject) -> isize {
+        if pb.is_null() { return -1; }
+        unsafe { msg_send![pb, changeCount] }
+    }
+    fn text(pb: *mut AnyObject) -> Option<String> {
+        if pb.is_null() { return None; }
+        unsafe {
+            // NSPasteboardTypeString 的 raw value；用运行时构造 NSString 避免引入
+            // objc2-foundation / objc2-app-kit 新依赖。
+            let ty: *mut AnyObject = msg_send![class!(NSString),
+                stringWithUTF8String: b"public.utf8-plain-text\0".as_ptr()];
+            if ty.is_null() { return None; }
+            let s: *mut AnyObject = msg_send![pb, stringForType: ty];
+            if s.is_null() { return None; }
+            let ptr: *const c_char = msg_send![s, UTF8String];
+            if ptr.is_null() { return None; }
+            Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
+    }
+    pub fn run(shared: Shared, repaint: Box<dyn Fn() + Send>, stop: &AtomicBool) {
+        let pb = pasteboard();
+        let mut last = change_count(pb);
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(350));
+            let now = change_count(pb);
+            if now < 0 || now == last { continue; }
+            last = now;
+            if let Some(t) = text(pb) {
+                if shared.record(&t) { repaint(); }
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 const HISTORY_COPY_FORMAT: &str = "Daozai.ClipboardHistoryCopy";

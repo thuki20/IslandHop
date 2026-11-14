@@ -66,6 +66,15 @@ pub fn notch_size() -> Option<(f64, f64)> { None }
 /// 本机 MacBook Pro 实测：刘海 185×32 逻辑点，而岛仔收起胶囊内容宽约 185pt，
 /// 正好整条被物理刘海挡住；把常驻图标分列两侧后才能看见。
 /// 无刘海机型返回 None，布局保持上游原样。
+/// 把应用切到前台。设置窗口用 `with_active(false)` 创建，macOS 上不会自动
+/// 激活，用户点了设置却看不到窗口（体感「偶尔打不开」），所以每次请求打开时
+/// 主动激活一次。
+#[cfg(target_os = "macos")]
+pub fn activate_app() { imp::activate_app(); }
+
+#[cfg(not(target_os = "macos"))]
+pub fn activate_app() {}
+
 #[cfg(target_os = "macos")]
 pub fn notch_gap() -> Option<f32> {
     use std::sync::OnceLock;
@@ -124,6 +133,15 @@ mod imp {
     }
 
     fn window() -> *mut AnyObject { WINDOW.load(Ordering::Relaxed) as *mut AnyObject }
+
+    pub fn activate_app() {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if !app.is_null() {
+                let _: () = msg_send![app, activateIgnoringOtherApps: Bool::YES];
+            }
+        }
+    }
 
     pub fn elevate(frame: &eframe::Frame) -> bool {
         let Ok(handle) = frame.window_handle() else { return false };

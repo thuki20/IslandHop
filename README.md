@@ -25,19 +25,25 @@
 | **不再每次弹授权窗口** | ✅ | 引擎启动路径原本 `check_permissions(true)` 会调 `AXIsProcessTrustedWithOptions` 两次弹系统框；改为静默查询 + 面板显示辅助功能/输入监控两项状态，只有用户点「请求授权」才弹 |
 | **固定代码签名** | ✅ | 打包脚本改用钥匙串已有的 `OpenHopSign` 证书（不再 ad-hoc），TCC 按签名身份记授权，重打包不再丢失授权 |
 | **Mac 图标统一** | ✅ | eframe 的 `with_icon()` 在 macOS 会 `setApplicationIconImage` 覆盖 Dock 图标；macOS 分支不再设置，Dock/Finder 统一用 bundle `AppIcon.icns` |
-| **刘海机型布局** | ✅ | 本机实测刘海 185×32 pt，与收起胶囊内容同宽 → 小图标全被物理遮挡；按 `safeAreaInsets` 把常驻组件分列刘海两侧，黑色胶囊仍横跨刘海 |
+| **刘海机型布局（二修）** | ✅ | 本机实测刘海 185×32 pt。首版 `notch_split` 只做 x ±平移，压在中心的组件还额外推 w/2，导致右侧「16:20☀20°」重叠并溢出胶囊边界；现改为**按原顺序分左右两组、各自紧靠刘海边缘重排**，`width = 刘海 + 左组 + 右组 + 边距`，胶囊背景与 hit 跟随。实测时钟/天气分列不重叠、电池等图标可见、胶囊居中覆盖刘海 |
+| **配对界面可视化** | ✅ | 从纯文本表单改为：大号电源开关、三步连接进度、设备卡片（显示器图标/系统/地址/连接状态）、图形化屏幕排列画布、当前光标高亮；角色/口令/权限收进「高级设置」折叠 |
+| **口令一致免配对流程** | ✅ | 引擎 `needs_pairing()` 仅在口令为空时返回 true，口令一致本来就自动发现直连；UI 之前仍摆配对码输入框误导用户。现在口令模式明确显示「无需配对码、不用点配对」，只有口令为空才显示 6 位大字配对码 |
+| **设置窗口偶发打不开** | ✅ | `with_visible(false)` 的一次性 `Visible(true)` 会撞上 immediate viewport 首帧竞态被吞 → 窗口永久隐形。实际运行每帧幂等补发 `Visible(true)`（测试构建保留上游一次性语义），并在请求打开时 `activateIgnoringOtherApps` 激活应用 |
+| **Dock 图标彻底统一** | ✅ | 上一轮只改了主窗口，**设置窗口 / 更新窗口仍 `.with_icon(theme::app_icon())`**，eframe 在 macOS 会 `setApplicationIconImage` 把 Dock 图标换成岛仔 logo（黑底白 e）。现所有 viewport 在 macOS 均不设窗口图标；实测「打开设置后」bundle 与运行中 Dock 图标 TIFF 完全一致 |
+| **macOS 系统数据源** | ✅ | 新增 `src/macos_sys.rs`：电池 `pmset`、音量/静音 `osascript`（读+写）、网络 `route`、闲置 `CGEventSourceSecondsSinceLastEventType`、媒体 AppleScript（Music/Spotify，2 s 节流）、文件 `open` / `open -R` / 文件选择；接入 `Env` 与 `Cmd`。剪贴板历史改 `NSPasteboard.changeCount` 轮询。截图确认灵动岛出现绿色电池图标 |
 | **Mac 中文字体** | ✅ | 修 `theme.rs` 只查 Windows/Linux 字体目录的缺陷，加载 macOS 系统 CJK 字体；中文由满屏方块恢复可读 |
 | **Mac 主岛窗口贴顶** | ✅ | `y=38 / layer=3` → **`y=0 / layer=25`**（CGWindowList 实测） |
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
 | **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`；**用钥匙串 `OpenHopSign` 自签名固定身份**，重打包不丢 TCC 授权 |
-| Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
+| Mac 平台层全量重写 | ⏳ | 本轮补 7 类数据源后仍有 **267 处 `cfg(windows)`**，托盘 / 开机自启 / 通知读取 / Keychain 登录 / 更新器未做，工单见下 |
 | Windows 端编译 / 出包 | ✅ | `522a4be` 触发的 `IslandHop Build` **success**，x64 zip 已拉取到 `dist/IslandHop-Windows-x64.zip`（`IslandHop.exe` SHA256 `B47002FF…82E41E`）；exe 字节级确认含「局域网跨屏 / 本机权限 / 不再显示权限相关提示」，即新界面已编进 Windows 包 |
 | **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、设置页 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
 | **双机键鼠 / 剪贴板动作实测** | ⏳ | 会话与剪贴板线程已起，但 Mac 缺「输入监控」授权导致事件 tap 退化（见下）；内容级跨机同步需双机人工实测，**不报通过** |
 
-> ⚠️ **最关键的一句**：`cargo check` 通过 ≠ 岛仔功能在 Mac 上可用。上游非 Windows 分支基本是**空实现**
-> （`smtc::query → None`、`clipboard::watch → 空 Watcher`、`display_layout::connected → Vec::new()`）。
-> Windows 侧是原样全量；Mac 侧目前拿到的是完整 UI 外壳 + 可跑的跨屏引擎，平台数据源要逐模块重写。
+> ⚠️ **平台边界**：上游非 Windows 分支原本基本是空实现（`smtc::query → None`、`clipboard::watch → 空 Watcher`、
+> `display_layout::connected → Vec::new()`，`system/native/tray/backdrop` 整模块被 `cfg(windows)` 排除）。
+> 本轮已补**电池 / 音量 / 网络 / 闲置 / 媒体 / 文件 / 剪贴板**数据源；仍缺**菜单栏托盘、开机自启、
+> 跨进程通知读取、蓝牙、Keychain 登录、应用内更新**（见下方缺口清单），这些不拿占位冒充。
 
 ---
 
@@ -46,8 +52,10 @@
 ```
 IslandHop/
 ├─ src/                     岛仔 102 个模块（业务模块原样，仅 extras.rs 加 1 个设置分组）
-│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 内嵌在岛仔设置窗口的面板
-│  ├─ mac_window.rs         ← 新增：macOS 窗口层级 / 点击穿透 / 刘海几何
+│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 内嵌在岛仔设置窗口的可视化面板
+│  ├─ mac_window.rs         ← 新增：macOS 窗口层级 / 点击穿透 / 刘海几何 / 激活应用
+│  ├─ macos_sys.rs          ← 新增（macOS）：电池/音量/网络/闲置/媒体/文件数据源 + 后台采样线程
+│  ├─ clipboard.rs          ← 改动（macOS 分支）：NSPasteboard.changeCount 轮询监听
 │  └─ extras.rs             ← 仅加 1 个设置分组（第 13 项），102 个业务模块不动
 ├─ vendor/                  岛仔 5 个魔改库（原样，[patch.crates-io] 不变）
 ├─ assets/ docs/ installer/ scripts/ tests/   上游原样
@@ -131,7 +139,7 @@ cargo build --release
 ./target/release/IslandHop                    # 正常启动；引擎按 enabled 后台自启，Cmd/Ctrl + Shift + K 随时打开设置
 ```
 
-「设置 → 局域网跨屏」里可以：查看本机权限与一键请求授权、启停引擎、切换主控/受控、改名称与共享口令、看本机配对码、发现并配对同网段设备、IP 直连、调整屏幕左右排列、查看引擎错误与最近事件。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
+「设置 → 局域网跨屏」现在是可视化面板：顶部大开关与运行状态、三步连接进度、附近设备卡片（系统 / 地址 / 连接态 / 一键配对）、图形化屏幕排列画布（当前光标高亮）、连接方式说明。两端口令一致时引擎自动发现直连，页面直接写明「无需配对码、不用点配对」；只有口令为空才用 6 位配对码。角色 / 名称 / 口令 / 权限 / IP 直连 / 运行日志收在「高级设置」「运行状态与日志」两个折叠区。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
 
 - 两端角色必须**相反**、共享口令一致、TCP **24950** / UDP **24951** 放行，**两端都要装 IslandHop**（端口与旧版 OpenHop 不通）
 - macOS 需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop 并**彻底退出重开**（TCC 按应用路径授权）
@@ -159,21 +167,23 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 
 ## Mac 平台层缺口清单（策略 B 工单）
 
-统计口径：`src/**/*.rs` 里 `cfg(windows)` **261** 处、`cfg(not(windows))` **59** 处、`target_os = "macos"` **0** 处。
+统计口径：`src/**/*.rs` 里 `cfg(windows)` **267** 处、`cfg(not(windows))` **61** 处、`target_os = "macos"` **38** 处（本轮前为 0）。
 
 | 分组 | 模块数 | Windows 分支 | 代表文件 | Mac 现状 / 需做 |
 |---|---|---|---|---|
-| 媒体 / 音乐 | 4 | 66 | `smtc.rs` 86 KB、`lyrics.rs` 64 KB | 空实现；需 MediaRemote / AppleScript 重写，网易云等客户端需逐家适配 |
-| 通知 / IM 未读 | 3 | 23 | `messenger.rs`、`input.rs`、`system.rs` | 微信/QQ 未读靠 Windows 任务栏闪动，**Mac 无等价公开接口，无解** |
-| 托盘 / 窗口 / 毛玻璃 | 3+ | 4+ | `display_layout.rs`、`avoidance.rs`、`native`、`tray`、`backdrop` | `native/tray/backdrop/composition` 整个模块 `#[cfg(windows)]` 不存在；需 NSStatusItem / SMAppService / 自绘模糊 |
-| AI 额度 | 11 | 34 | `grok_quota.rs`、`gemini_quota.rs`、`api_quota.rs`… | 依赖 Chrome 调试协议与 Windows 路径，需逐个改 |
-| 邮件 / 日程 | 3 | 7 | `mail.rs` 77 KB、`calendar.rs` 102 KB | 网络逻辑可搬；凭据 `keyring(windows-native)` 要换 Keychain |
-| 剪贴板 / 置物架 | 1 | 7 | `clipboard.rs` | 监听是空 Watcher；需 NSPasteboard 轮询 |
-| 更新 / 诊断 / 资源 | 4 | 12 | `updates.rs`、`diagnostics.rs` | Windows 安装器语义，需换成 dmg / Sparkle |
-| 外壳 | 1 | 82 | `main.rs` | 已补窗口层级与定位；其余系统采样仍走 Windows |
-| 图标 / 主题 | 2 | 12 | `icons.rs`、`theme.rs` | 部分资源路径 Windows 专属 |
+| 媒体 / 音乐 | 4 | 66 | `smtc.rs`、`lyrics.rs` | **已补** AppleScript 读 Music / Spotify（歌名/艺术家/进度/播放态，2 s 节流）；封面、网易云等客户端仍未适配 |
+| 通知 / IM 未读 | 3 | 23 | `messenger.rs`、`system.rs` | 微信/QQ 未读靠 Windows 任务栏闪动，**Mac 无等价公开接口，无解** |
+| 托盘 / 窗口 / 毛玻璃 | 3+ | 4+ | `tray`、`native`、`backdrop` | **仍缺** NSStatusItem / SMAppService / 自绘模糊；当前 Mac 无菜单栏入口，靠 Cmd+Shift+K 打开设置 |
+| AI 额度 | 11 | 34 | `grok_quota.rs`、`gemini_quota.rs` | 依赖 Chrome 调试协议与 DPAPI，**仍缺** Keychain / ASWebAuthenticationSession |
+| 邮件 / 日程 | 3 | 7 | `mail.rs`、`calendar.rs` | 网络逻辑可搬；凭据 `keyring(windows-native)` 仍需换 Keychain |
+| 剪贴板 / 置物架 | 1 | 7 | `clipboard.rs` | **已补** `NSPasteboard.changeCount` 350 ms 轮询 + `stringForType:` 读文本 |
+| 电池 / 音量 / 网络 / 闲置 | — | — | `macos_sys.rs` | **已补** `pmset` / `osascript` / `route` / `CGEventSource` |
+| 文件打开 / 选择 / 显示 | — | — | `macos_sys.rs`、`main.rs` | **已补** `/usr/bin/open`、`open -R`、AppleScript `choose file` |
+| 更新 / 诊断 / 资源 | 4 | 12 | `updates.rs` | Windows 安装器语义，仍需换成 dmg / Sparkle |
+| 外壳 | 1 | 82 | `main.rs` | 已补窗口层级、刘海、点击穿透、系统采样接入；全局热键 / 输入法仍缺 |
+| 蓝牙 / 锁屏 / 浏览器避让 | 3 | — | `bt.rs`、`system.rs` | 仍空（IOBluetooth / AXUIElement 轮询未做） |
 
-**已实修的 Mac 视觉项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、刘海机型按 `safeAreaInsets`（本机 185×32 pt）把常驻小图标分列刘海左右两侧，黑色胶囊横跨刘海（`bar_layout.rs::notch_split`，无刘海机型布局与上游完全一致）。
+**已实修的 Mac 项**：窗口层级（`NSStatusWindowLevel=25` + `collectionBehavior`）、主岛贴顶 `y=0`、点击穿透、刘海分列重排（胶囊宽度按「刘海 + 左右内容」重算）、固定签名、Dock 图标统一、设置窗口可见性、时钟本地时区、CJK 字体，以及上表标注「已补」的 7 类数据源。
 
 ---
 
@@ -185,7 +195,8 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 - 双机跨屏切换、剪贴板同步端到端：**TCP 会话、设置页「已连接 1 台」、`clipboard` 线程均已实测**；但 Mac 未授权「输入监控」→ `mac-event-tap` 线程缺失 → 键鼠切换未跑通；剪贴板内容跨机传输还需双机各复制一次人工确认，**不报通过**
 - 改端口后的**引擎监听实测**：✅ 已重跑。TCP 24950 v4/v6 LISTEN、UDP 24951 绑定；线程采样含 `server` / `clipboard` / `peer-192.168.1.15` / `link-writer`，**唯独缺 `mac-event-tap`**（即输入监控授权缺口）
 - 窗口内部标题仍是上游「岛仔」文案，未做品牌文案替换（保持全量派生）
-- 刘海外形、桌面伙伴在 Mac 的资源加载、托盘、开机自启、自动更新、DWM 毛玻璃
+- **Mac 仍未适配（不拿占位冒充）**：菜单栏托盘 / 开机自启（SMAppService）、跨进程通知读取（系统无公开接口）、蓝牙音频设备、AI 额度账号的 Keychain 登录、应用内更新器、全局热键与输入法、毛玻璃与浏览器避让、桌面伙伴资源、音乐封面与国内客户端媒体源
+- **Mac 已适配但需真实数据才看得到**：媒体卡片要求 Music / Spotify 正在播放（本机测试时两者均未运行，故截图里没有音乐图标）；AI 额度环需先配置账号；通知铃依赖系统通知
 - 微信/QQ 未读提醒：Mac 无解，将明确标注「仅 Windows」
 - 本轮已出本机 macOS 包，但**未创建 GitHub Release、未上传任何资产**
 

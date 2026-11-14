@@ -93,6 +93,9 @@ struct Shell {
     /// 非 Windows 分支：NSWindow 是否已抬到菜单栏之上。
     #[cfg(not(windows))]
     elevated: bool,
+    /// IslandHop：macOS 后台采样线程的最新快照 + 接收端。
+    #[cfg(target_os = "macos")]
+    mac_sys: (daozai::macos_sys::Snapshot, std::sync::mpsc::Receiver<daozai::macos_sys::Snapshot>),
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -167,6 +170,9 @@ impl Shell {
         // IslandHop：打开软件即按 config.toml 的 enabled 启动跨屏 / 剪贴板引擎，
         // 不需要用户打开任何设置页面。
         daozai::cross_screen::with(|_| ());
+        // IslandHop：macOS 补电池/音量/网络/闲置等系统数据源（上游整模块 Windows-only）。
+        #[cfg(target_os = "macos")]
+        let mac_sys = (daozai::macos_sys::Snapshot::default(), daozai::macos_sys::start(cc.egui_ctx.clone()));
         // 岛体大小只作用于主窗口，在首帧之前生效，避免启动时先按 100% 闪一下。
         #[cfg(windows)] eframe::set_root_viewport_scale(app.settings.island_scale());
         Self {
@@ -224,6 +230,8 @@ impl Shell {
             mac_cursor: None,
             #[cfg(not(windows))]
             elevated: false,
+            #[cfg(target_os = "macos")]
+            mac_sys,
         }
     }
 
@@ -261,6 +269,9 @@ impl Shell {
     }
 
     fn env(&mut self, ctx: &egui::Context) -> Env {
+        // IslandHop：macOS 后台采样线程推送最新系统快照，主线程只读不阻塞。
+        #[cfg(target_os = "macos")]
+        while let Ok(snap) = self.mac_sys.1.try_recv() { self.mac_sys.0 = snap; }
         if let Some((source,rx))=&self.music_volume_rx {
             if let Ok(success)=rx.try_recv() {
                 if !success && self.media.lock().is_ok_and(|media|media.source==*source) {
@@ -311,12 +322,14 @@ impl Shell {
             // IslandHop 在 macOS 上走 Default，保持 Env 结构不变、不删功能。
             network: {
                 #[cfg(windows)] { Some(self.system_state.network) }
-                #[cfg(not(windows))] { Default::default() }
+                #[cfg(target_os = "macos")] { self.mac_sys.0.network }
+                #[cfg(not(any(windows, target_os = "macos")))] { Default::default() }
             },
             cursor,
             idle_seconds: {
                 #[cfg(windows)] {Some(daozai::system::idle_seconds())}
-                #[cfg(not(windows))] {None}
+                #[cfg(target_os = "macos")] { self.mac_sys.0.idle }
+                #[cfg(not(any(windows, target_os = "macos")))] {None}
             },
             screen_locked: {
                 #[cfg(windows)] {daozai::system::screen_locked()}
@@ -329,7 +342,8 @@ impl Shell {
             media: self.media.lock().map(|m| m.clone()).unwrap_or_default(),
             volume: {
                 #[cfg(windows)] { self.system_state.volume }
-                #[cfg(not(windows))] { Default::default() }
+                #[cfg(target_os = "macos")] { self.mac_sys.0.volume }
+                #[cfg(not(any(windows, target_os = "macos")))] { Default::default() }
             },
             bt: self.bt.clone(),
             bt_ready: self.bt_ready,
@@ -687,13 +701,17 @@ impl eframe::App for Shell {
                 },
                 Cmd::AddFiles=>{
                     #[cfg(windows)] match daozai::system::pick_files(){Ok(files)=>if !files.is_empty(){self.app.on_drop(files);self.app.show_page(3);},Err(e)=>self.app.say(format!("无法选择文件：{}",e.code()))}
+                    #[cfg(target_os="macos")] {let files=daozai::macos_sys::pick_files();if !files.is_empty(){self.app.on_drop(files);self.app.show_page(3);}}
                 },
                 Cmd::DragFile(p)=>{
                     #[cfg(windows)] if let Err(e)=daozai::system::drag_file(&p){self.app.say(format!("无法拖出文件：{}",e.code()));}
                     ctx.input_mut(|i| i.pointer=Default::default());
                 },
                 Cmd::DisconnectNotifications=>{#[cfg(windows)]{self.incoming=None;self.app.settings.read_notifications=false;self.app.settings.save();self.app.listener_status="已断开，不再读取 Windows 通知".into();}},
-                Cmd::Reveal(p)=>{let _=daozai::child_process::spawn(std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())));},
+                Cmd::Reveal(p)=>{
+                    #[cfg(windows)] {let _=daozai::child_process::spawn(std::process::Command::new("explorer.exe").arg(format!("/select,{}",p.display())));}
+                    #[cfg(target_os="macos")] daozai::macos_sys::reveal(&p);
+                },
                 Cmd::QuotaChooseFile=>{
                     #[cfg(windows)] match daozai::system::pick_files_for("选择 AI 账号的登录 JSON 文件",false){Ok(files)=>if let Some(path)=files.into_iter().next(){self.app.quota_set_source(path);},Err(_)=>self.app.say("无法选择登录文件")}
                 },
@@ -709,10 +727,12 @@ impl eframe::App for Shell {
                 },
                 Cmd::SetVolume(v)=>{
                     #[cfg(windows)] daozai::system::set_volume(v);
+                    #[cfg(target_os="macos")] daozai::macos_sys::set_volume(v);
                     self.volume_quiet=PollClock::now();
                 },
                 Cmd::ToggleMute=>{
                     #[cfg(windows)] daozai::system::toggle_mute();
+                    #[cfg(target_os="macos")] daozai::macos_sys::toggle_mute();
                     self.volume_quiet=PollClock::now();
                 },
                 Cmd::Copy(text)=>{ctx.copy_text(text);self.app.say("已复制");},
@@ -891,10 +911,11 @@ fn read_power() -> (Option<u8>, bool) {
     }
 }
 
-#[cfg(not(windows))]
-fn read_power() -> (Option<u8>, bool) {
-    (None, true)
-}
+#[cfg(target_os = "macos")]
+fn read_power() -> (Option<u8>, bool) { daozai::macos_sys::power() }
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn read_power() -> (Option<u8>, bool) { (None, true) }
 
 #[cfg(windows)]
 fn cursor_logical(ppp: f32) -> Option<(f32, f32)> {
@@ -937,7 +958,10 @@ fn open_path_result(p:&std::path::Path,result:windows::core::Result<()>,choose:i
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_path(p: &std::path::Path)->Result<(),String> { daozai::macos_sys::open_path(p) }
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn open_path(_p: &std::path::Path)->Result<(),String> {Ok(())}
 
 #[cfg(all(test,windows))]

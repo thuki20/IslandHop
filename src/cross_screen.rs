@@ -219,6 +219,7 @@ impl CrossScreen {
         }
     }
 
+
     fn render(&mut self, ui: &mut Ui) {
         // 引擎状态是外部线程推进的，面板打开期间定时刷新。
         ui.ctx().request_repaint_after(Duration::from_millis(500));
@@ -232,30 +233,287 @@ impl CrossScreen {
         let status = self.status();
         let mut actions: Vec<Action> = Vec::new();
 
-        ui.label(RichText::new("后台自动运行：勾选后每次打开 IslandHop 即启用，无需再打开这个页面。").size(11.5));
-        ui.add_space(6.0);
-        let mut enabled = self.cfg.enabled;
-        if ui.checkbox(&mut enabled, "启用局域网键鼠共享 / 剪贴板同步").changed() {
-            actions.push(if enabled { Action::Start } else { Action::Stop });
-        }
-        ui.add_space(4.0);
+        self.view_header(ui, status.as_ref(), &mut actions);
+        ui.add_space(10.0);
+        self.view_steps(ui, status.as_ref());
+        ui.add_space(10.0);
+        self.view_devices(ui, status.as_ref(), &mut actions);
+        ui.add_space(10.0);
+        self.view_pair_mode(ui, status.as_ref());
+        ui.add_space(10.0);
+        self.view_canvas(ui, status.as_ref(), &mut actions);
+        ui.add_space(8.0);
 
-        self.view_permissions(ui);
-        ui.separator();
-        self.view_status(ui, status.as_ref());
-        ui.separator();
-        self.view_pairing(ui, status.as_ref(), &mut actions);
-        ui.separator();
-        self.view_config(ui, &mut actions);
-        ui.separator();
-        self.view_layout(ui, &mut actions);
-        ui.separator();
-        self.view_actions(ui, &mut actions);
-        self.view_platform_hint(ui);
+        egui::CollapsingHeader::new("高级设置 · 角色 / 名称 / 口令 / 权限")
+            .default_open(false).show(ui, |ui| {
+                self.view_permissions(ui);
+                ui.separator();
+                self.view_config(ui, &mut actions);
+                ui.separator();
+                self.view_direct(ui, &mut actions);
+                ui.separator();
+                self.view_actions(ui, &mut actions);
+            });
+        egui::CollapsingHeader::new("运行状态与日志")
+            .default_open(false).show(ui, |ui| {
+                self.view_status(ui, status.as_ref());
+                self.view_platform_hint(ui);
+            });
 
         for action in actions { self.handle(action); }
     }
 
+    fn theme_colors(ui: &Ui) -> (Color32, Color32, Color32, Color32) {
+        let v = ui.visuals();
+        let card = if v.dark_mode { Color32::from_rgb(38, 41, 48) } else { Color32::from_rgb(244, 246, 250) };
+        let border = if v.dark_mode { Color32::from_rgb(62, 67, 78) } else { Color32::from_rgb(216, 221, 230) };
+        (card, border, v.text_color(), v.strong_text_color())
+    }
+
+    /// 顶部：大号电源开关 + 当前状态，一眼看出「开着没」。
+    fn view_header(&self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
+        let (card, border, text, strong) = Self::theme_colors(ui);
+        let on = self.engine.is_some();
+        let h = 58.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 12.0, card);
+        p.rect_stroke(rect, 12.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+
+        // 开关轨道
+        let track = egui::Rect::from_min_size(rect.min + egui::vec2(16.0, 15.0), egui::vec2(50.0, 28.0));
+        let green = Color32::from_rgb(52, 178, 116);
+        p.rect_filled(track, 14.0, if on { green } else { Color32::from_gray(120) });
+        let knob_x = if on { track.right() - 17.0 } else { track.left() + 14.0 };
+        p.circle_filled(egui::pos2(knob_x, track.center().y), 11.0, Color32::WHITE);
+        let hit = ui.interact(track.expand(5.0), ui.id().with("cross-power"), egui::Sense::click());
+        if hit.clicked() { actions.push(if on { Action::Stop } else { Action::Start }); }
+
+        p.text(rect.min + egui::vec2(80.0, 9.0), egui::Align2::LEFT_TOP,
+            "局域网键鼠共享 / 剪贴板同步", egui::FontId::proportional(14.0), strong);
+        let (dot, line) = match status {
+            Some(s) => (green, format!("● 运行中 · {:?} · {} · TCP {}", s.role, s.name, s.port)),
+            None => (Color32::from_rgb(215, 85, 80), "● 未启动 · 打开左侧开关即可启用".into()),
+        };
+        p.text(rect.min + egui::vec2(80.0, 30.0), egui::Align2::LEFT_TOP, line,
+            egui::FontId::proportional(11.5), dot);
+        let _ = text;
+        if let Some(s) = status {
+            let tail = format!("已连接 {} 台 · {}", s.peers.len(),
+                s.addresses.first().cloned().unwrap_or_default());
+            p.text(rect.right_bottom() + egui::vec2(-12.0, -9.0), egui::Align2::RIGHT_BOTTOM, tail,
+                egui::FontId::proportional(9.5), ui.visuals().weak_text_color());
+        }
+    }
+
+    /// 三步连接进度，把「现在卡在哪一步」画出来。
+    fn view_steps(&self, ui: &mut Ui, status: Option<&Status>) {
+        let (card, border, _, strong) = Self::theme_colors(ui);
+        let h = 52.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 10.0, card);
+        p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        let labels = ["1  本机就绪", "2  发现设备", "3  已连接"];
+        let done = [
+            status.is_some(),
+            status.is_some_and(|s| !s.discovered.is_empty() || !s.peers.is_empty()),
+            status.is_some_and(|s| !s.peers.is_empty()),
+        ];
+        let green = Color32::from_rgb(52, 178, 116);
+        let idle = Color32::from_gray(if ui.visuals().dark_mode { 95 } else { 175 });
+        let w = rect.width() / 3.0;
+        for i in 0..3 {
+            let cx = rect.left() + w * (i as f32 + 0.5);
+            let cy = rect.top() + 18.0;
+            if i > 0 {
+                let from = rect.left() + w * (i as f32 - 0.5) + 12.0;
+                let to = cx - w * 0.5 + 12.0;
+                p.line_segment([egui::pos2(from, cy), egui::pos2(to, cy)],
+                    egui::Stroke::new(2.0, if done[i] { green } else { idle }));
+            }
+            p.circle_filled(egui::pos2(cx, cy), 9.0, if done[i] { green } else { idle });
+            // 岛仔自定义 CJK 字体缺 U+2713，之前画「✓」会变成豆腐块，改用白色内点。
+            p.circle_filled(egui::pos2(cx, cy), 3.0, Color32::WHITE);
+            p.text(egui::pos2(cx, rect.top() + 36.0), egui::Align2::CENTER_CENTER, labels[i],
+                egui::FontId::proportional(11.0), if done[i] { strong } else { ui.visuals().weak_text_color() });
+        }
+    }
+
+    /// 设备卡片：图标 / 名称 / 系统 / 地址 / 连接状态 / 操作按钮。
+    fn view_devices(&mut self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
+        let (card, border, text, strong) = Self::theme_colors(ui);
+        ui.label(RichText::new("附近的电脑").size(14.0).strong().color(strong));
+        ui.add_space(4.0);
+        let Some(s) = status else {
+            ui.label(RichText::new("引擎未启动，尚未扫描局域网。打开上方开关后会自动发现同网段设备。")
+                .size(11.0).color(ui.visuals().weak_text_color()));
+            return;
+        };
+        if s.discovered.is_empty() && s.peers.is_empty() {
+            let dots = ".".repeat((ui.input(|i| i.time) * 2.0) as usize % 4);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 10.0, card);
+            p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            p.text(rect.left_center() + egui::vec2(16.0, 0.0), egui::Align2::LEFT_CENTER,
+                format!("◌ 正在扫描局域网{dots}  请确认对端已启动、口令一致、防火墙放行 TCP {} / UDP {}",
+                    DEFAULT_PORT, DISCOVERY_PORT),
+                egui::FontId::proportional(11.0), ui.visuals().weak_text_color());
+            return;
+        }
+        let needs_code = s.needs_pairing;
+        for d in &s.discovered {
+            let connected = s.peers.iter().any(|p| p.name == d.name || p.addr == d.addr.to_string());
+            let paired = s.paired.iter().any(|p| p.device == d.device);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 10.0, card);
+            p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+            // 显示器图标
+            let icon = egui::Rect::from_min_size(rect.min + egui::vec2(14.0, 12.0), egui::vec2(32.0, 24.0));
+            p.rect_filled(icon, 4.0, Color32::from_rgb(58, 118, 196));
+            p.rect_filled(egui::Rect::from_min_size(icon.min + egui::vec2(3.0, 3.0), egui::vec2(26.0, 16.0)),
+                2.0, Color32::from_rgb(18, 28, 44));
+            p.rect_filled(egui::Rect::from_min_size(icon.min + egui::vec2(12.0, 24.0), egui::vec2(8.0, 5.0)),
+                1.0, Color32::from_rgb(58, 118, 196));
+            let os = format!("{:?}", d.os);
+            let name = if d.name.trim().is_empty() { "未命名电脑" } else { &d.name };
+            p.text(rect.min + egui::vec2(58.0, 9.0), egui::Align2::LEFT_TOP,
+                name, egui::FontId::proportional(13.0), strong);
+            p.text(rect.min + egui::vec2(58.0, 28.0), egui::Align2::LEFT_TOP,
+                format!("{os} · {:?} · {}", d.role, d.addr), egui::FontId::proportional(10.5),
+                ui.visuals().weak_text_color());
+            let (dot, label) = if connected {
+                (Color32::from_rgb(52, 178, 116), "● 已连接")
+            } else if paired {
+                (Color32::from_rgb(70, 140, 210), "● 已配对 · 连接中")
+            } else if needs_code {
+                (Color32::from_rgb(200, 150, 45), "● 待配对")
+            } else {
+                (Color32::from_rgb(52, 178, 116), "● 口令一致 · 自动连接")
+            };
+            p.text(rect.min + egui::vec2(58.0, 43.0), egui::Align2::LEFT_TOP, label,
+                egui::FontId::proportional(10.0), dot);
+            if needs_code && !connected {
+                let btn = egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 88.0, rect.center().y - 13.0), egui::vec2(74.0, 26.0));
+                p.rect_filled(btn, 7.0, Color32::from_rgb(58, 118, 196));
+                p.text(btn.center(), egui::Align2::CENTER_CENTER, "配对", egui::FontId::proportional(11.5), Color32::WHITE);
+                if ui.interact(btn, ui.id().with(&d.device), egui::Sense::click()).clicked() {
+                    actions.push(Action::Pair(d.device.clone(), self.pair_code.trim().to_string()));
+                }
+            } else {
+                p.text(rect.right_top() + egui::vec2(-14.0, 24.0), egui::Align2::RIGHT_TOP,
+                    if connected { "使用中" } else { "自动" }, egui::FontId::proportional(10.5),
+                    ui.visuals().weak_text_color());
+            }
+            let _ = text;
+        }
+    }
+
+    /// 连接方式可视化：口令模式明确「无需配对码」，配对码模式才显示 6 位大字。
+    fn view_pair_mode(&mut self, ui: &mut Ui, status: Option<&Status>) {
+        let (card, border, _, strong) = Self::theme_colors(ui);
+        ui.label(RichText::new("连接方式").size(14.0).strong().color(strong));
+        ui.add_space(4.0);
+        let passphrase = !self.pass.trim().is_empty();
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), if passphrase { 60.0 } else { 88.0 }), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 10.0, card);
+        p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        let green = Color32::from_rgb(52, 178, 116);
+        if passphrase {
+            p.text(rect.min + egui::vec2(14.0, 9.0), egui::Align2::LEFT_TOP,
+                "● 共享口令模式 · 无需配对码", egui::FontId::proportional(13.0), green);
+            p.text(rect.min + egui::vec2(14.0, 29.0), egui::Align2::LEFT_TOP,
+                "两端口令一致时引擎自动发现并直连，不用点「配对」、不用输 6 位码。", egui::FontId::proportional(11.0), strong);
+            p.text(rect.min + egui::vec2(14.0, 45.0), egui::Align2::LEFT_TOP,
+                "若一直连不上，检查对端是否也填了同一个口令（改口令后需重启引擎）。",
+                egui::FontId::proportional(10.0), ui.visuals().weak_text_color());
+        } else {
+            let code = status.and_then(|s| s.pairing_code.clone()).unwrap_or_else(|| "––– –––".into());
+            p.text(rect.min + egui::vec2(14.0, 8.0), egui::Align2::LEFT_TOP,
+                "配对码模式（未设置共享口令）", egui::FontId::proportional(11.5), strong);
+            p.text(rect.min + egui::vec2(14.0, 25.0), egui::Align2::LEFT_TOP,
+                "本机配对码", egui::FontId::proportional(10.5), ui.visuals().weak_text_color());
+            p.text(rect.min + egui::vec2(110.0, 21.0), egui::Align2::LEFT_TOP, code,
+                egui::FontId::proportional(22.0), green);
+            // 对端配对码输入（只有口令为空、且客户端需要配对时才用得上）
+            p.text(rect.right_top() + egui::vec2(-14.0, 58.0), egui::Align2::RIGHT_TOP,
+                "在设备卡片点「配对」完成连接", egui::FontId::proportional(10.0), ui.visuals().weak_text_color());
+            let row = egui::Rect::from_min_size(rect.min + egui::vec2(14.0, 54.0), egui::vec2(rect.width() - 28.0, 22.0));
+            ui.put(row, egui::TextEdit::singleline(&mut self.pair_code).desired_width(90.0).hint_text("对端 6 位码"));
+        }
+    }
+
+    /// IP 直连放在高级设置里：正常自动发现场景下不需要这一行。
+    fn view_direct(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("IP 直连").size(11.0));
+            ui.add(egui::TextEdit::singleline(&mut self.direct_addr).desired_width(150.0).hint_text("192.168.1.15"));
+            if ui.small_button("连接").clicked() && !self.direct_addr.trim().is_empty() {
+                actions.push(Action::PairAddr(self.direct_addr.trim().to_string(), self.pair_code.trim().to_string()));
+            }
+        });
+    }
+
+    /// 屏幕排列画布：显示器矩形按 x 排列，当前光标所在设备高亮。
+    fn view_canvas(&mut self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
+        let (card, border, _, strong) = Self::theme_colors(ui);
+        ui.label(RichText::new("屏幕排列 · 鼠标从哪条边切过去").size(14.0).strong().color(strong));
+        ui.add_space(4.0);
+        let h = 86.0;
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 10.0, card);
+        p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
+        let mut screens: Vec<(String, i32)> = vec![("本机".into(), 0)];
+        let me = self.cfg.name.trim().to_string();
+        for s in &self.cfg.layout.screens {
+            // 改名后旧版 OpenHop 会把同一台机器记成两个名字；x=0 且名字等于
+            // 本机名时不再重复画一张卡（用户截图里出现过 3 台显示器）。
+            if s.x == 0 && (s.name.trim() == "本机" || s.name.trim().eq_ignore_ascii_case(&me)) { continue; }
+            screens.push((s.name.clone(), s.x));
+        }
+        screens.sort_by_key(|(_, x)| *x);
+        let active = status.map(|s| s.active.clone()).unwrap_or_default();
+        let unit = 92.0;
+        let total = unit * screens.len() as f32 + 10.0 * (screens.len().saturating_sub(1) as f32);
+        let mut x = rect.center().x - total / 2.0;
+        for (name, _) in &screens {
+            let r = egui::Rect::from_min_size(egui::pos2(x, rect.top() + 13.0), egui::vec2(unit, 50.0));
+            let here = active.is_empty() && name == "本机" || active == *name;
+            p.rect_filled(r, 7.0, if here { Color32::from_rgb(52, 106, 176) } else { Color32::from_rgb(58, 64, 76) });
+            p.rect_stroke(r, 7.0, egui::Stroke::new(if here { 2.0 } else { 1.0 },
+                if here { Color32::from_rgb(105, 180, 255) } else { border }),
+                egui::StrokeKind::Inside);
+            // 屏幕里的菜单栏
+            p.rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(5.0, 5.0), egui::vec2(unit - 10.0, 8.0)),
+                2.0, Color32::from_gray(28));
+            p.text(r.min + egui::vec2(unit / 2.0, 32.0), egui::Align2::CENTER_CENTER, name,
+                egui::FontId::proportional(11.0), Color32::WHITE);
+            x += unit + 10.0;
+        }
+        p.text(rect.left_bottom() + egui::vec2(12.0, -10.0), egui::Align2::LEFT_BOTTOM,
+            format!("● 光标当前在：{}", if active.is_empty() { "本机" } else { &active }),
+            egui::FontId::proportional(10.0), Color32::from_rgb(52, 178, 116));
+        let screens = self.cfg.layout.screens.clone();
+        for s in &screens {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}  x={}", s.name, s.x)).size(10.5));
+                if ui.small_button("◀").clicked() { actions.push(Action::Place(s.name.clone(), s.x - 1)); }
+                if ui.small_button("▶").clicked() { actions.push(Action::Place(s.name.clone(), s.x + 1)); }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.new_screen).desired_width(120.0).hint_text("加入对端屏幕名"));
+            if ui.small_button("添加").clicked() {
+                actions.push(Action::AddScreen(self.new_screen.clone()));
+                self.new_screen.clear();
+            }
+        });
+    }
     /// 权限状态一目了然；系统授权窗口只在用户主动点按钮时才弹。
     fn view_permissions(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("本机权限（不会自动弹授权窗口）").size(13.0).strong());
@@ -344,35 +602,6 @@ impl CrossScreen {
         }
     }
 
-    fn view_pairing(&mut self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
-        ui.label(RichText::new("配对 / 发现的设备").size(13.0).strong());
-        if let Some(s) = status {
-            if s.discovered.is_empty() {
-                ui.label(RichText::new(format!("尚未发现同网段设备。请确认对端已启动、口令一致、防火墙放行 TCP {} / UDP {}。", DEFAULT_PORT, DISCOVERY_PORT)).size(11.0));
-            }
-            for d in &s.discovered {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("{} · {:?} · {:?} · {}", d.name, d.os, d.role, d.addr)).size(11.0));
-                    if ui.small_button("配对").clicked() {
-                        actions.push(Action::Pair(d.device.clone(), self.pair_code.trim().to_string()));
-                    }
-                });
-            }
-        }
-        ui.horizontal(|ui| {
-            ui.label("配对码：");
-            ui.add(egui::TextEdit::singleline(&mut self.pair_code).desired_width(90.0).hint_text("6 位数字"));
-            ui.label(RichText::new("由主控端显示").size(10.5));
-        });
-        ui.horizontal(|ui| {
-            ui.label("IP 直连：");
-            ui.add(egui::TextEdit::singleline(&mut self.direct_addr).desired_width(160.0).hint_text("192.168.1.15"));
-            if ui.small_button("连接").clicked() && !self.direct_addr.trim().is_empty() {
-                actions.push(Action::PairAddr(self.direct_addr.trim().to_string(), self.pair_code.trim().to_string()));
-            }
-        });
-    }
-
     fn view_config(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         ui.label(RichText::new("本机配置").size(13.0).strong());
         ui.horizontal(|ui| {
@@ -398,30 +627,6 @@ impl CrossScreen {
         ui.horizontal(|ui| {
             if ui.button("保存并重启引擎").clicked() { actions.push(Action::Apply); }
             ui.label(RichText::new("改角色 / 口令 / 端口后必须重启引擎").size(10.5));
-        });
-    }
-
-    fn view_layout(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
-        ui.label(RichText::new("屏幕排列（主控端生效）").size(13.0).strong());
-        ui.label(RichText::new("本机固定在 (0,0)；左右位置决定鼠标从哪条边切过去。").size(10.5));
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("▣ 本机 (0,0)").size(11.5).color(Color32::from_rgb(45, 110, 190)));
-        });
-        let screens = self.cfg.layout.screens.clone();
-        for s in &screens {
-            ui.horizontal(|ui| {
-                ui.label(format!("▣ {}  → x={}", s.name, s.x));
-                if ui.small_button("◀ 左移").clicked() { actions.push(Action::Place(s.name.clone(), s.x - 1)); }
-                if ui.small_button("右移 ▶").clicked() { actions.push(Action::Place(s.name.clone(), s.x + 1)); }
-            });
-        }
-        ui.horizontal(|ui| {
-            ui.label("加入屏幕：");
-            ui.add(egui::TextEdit::singleline(&mut self.new_screen).desired_width(130.0).hint_text("对端显示的名称"));
-            if ui.small_button("添加到右侧").clicked() {
-                actions.push(Action::AddScreen(self.new_screen.clone()));
-                self.new_screen.clear();
-            }
         });
     }
 

@@ -1237,7 +1237,21 @@ impl App {
         let id=egui::ViewportId::from_hash_of("daozai-settings");
         let focus_requested=std::mem::take(&mut self.settings_focus_requested);
         let opening=self.window_layout().open();
-        ctx.show_viewport_immediate(id,egui::ViewportBuilder::default().with_title("岛仔设置").with_icon(theme::app_icon()).with_inner_size([690.0,560.0]).with_min_inner_size([600.0,450.0]).with_visible(false).with_active(false).with_window_level(egui::WindowLevel::Normal),|ctx,_|{
+        #[allow(unused_mut)]
+        let mut builder=egui::ViewportBuilder::default().with_title("岛仔设置").with_inner_size([690.0,560.0]).with_min_inner_size([600.0,450.0]).with_visible(false).with_active(false).with_window_level(egui::WindowLevel::Normal);
+        // macOS：eframe 的 with_icon() 会调 NSApp.setApplicationIconImage，把 Dock
+        // 图标换成岛仔 logo，与 bundle 的 AppIcon.icns 不一致（启动前后图标变化）。
+        // 因此 macOS 所有 viewport 都不设窗口图标，统一使用 bundle 图标。
+        #[cfg(not(target_os="macos"))] { builder=builder.with_icon(theme::app_icon()); }
+        // `with_visible(false)` 只在 focus_requested 那一帧发 Visible(true) 会丢：
+        // immediate viewport 首帧可能尚未创建，命令被吞掉后窗口永久隐形
+        // （「设置偶尔打不开」）。真实运行时每帧幂等补发一次 Visible(true)；
+        // 测试构建沿用上游「只在打开时显示一次」的语义，保持 612KB 录制基线。
+        // Visible(true) 不会取消最小化，打断最小化的是 Minimized(false)。
+        #[cfg(not(test))]
+        ctx.send_viewport_cmd_to(id,egui::ViewportCommand::Visible(true));
+        if focus_requested { crate::mac_window::activate_app(); }
+        ctx.show_viewport_immediate(id,builder,|ctx,_|{
             let restored=opening && self.window_layout().restore(ctx);
             if !restored{self.window_layout().observe(ctx);}
             let dark=self.settings.settings_theme.dark(crate::settings_theme::system_dark(ctx));

@@ -62,6 +62,9 @@ pub mod shape;
 mod fluid;
 pub mod smtc;
 pub mod music_volume;
+/// IslandHop：macOS 系统数据源（上游整模块 Windows-only，Mac 上补电池/音量/网络/闲置/媒体/文件）。
+#[cfg(target_os = "macos")]
+pub mod macos_sys;
 pub mod theme;
 pub mod settings_theme;
 mod updates;

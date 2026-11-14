@@ -393,7 +393,10 @@ fn read_session(session:&windows::Media::Control::GlobalSystemMediaTransportCont
 
 #[cfg(not(windows))]
 fn query(_artwork:&mut ArtworkCache) -> Option<NowPlaying> {
-    None
+    // IslandHop：macOS 用 AppleScript 读 Music / Spotify（内部 2 秒节流）。
+    // 其它非 Windows 平台保持上游行为。
+    #[cfg(target_os="macos")] { crate::macos_sys::now_playing() }
+    #[cfg(not(target_os="macos"))] { None }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

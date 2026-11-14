@@ -108,10 +108,13 @@ impl State {
             ctx.load_texture("update-logo", egui::ColorImage::from_rgba_unmultiplied([icon.width as usize,icon.height as usize],&icon.rgba),egui::TextureOptions::LINEAR)
         }).id();
         let installing = self.rx.is_some() && self.cancel.is_none();
-        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("daozai-update"),
-            egui::ViewportBuilder::default().with_title("岛仔更新").with_icon(theme::app_icon())
+        #[allow(unused_mut)]
+        let mut builder=egui::ViewportBuilder::default().with_title("岛仔更新")
                 .with_inner_size([520.0, 416.0]).with_resizable(false).with_decorations(false)
-                .with_transparent(true).with_active(true), |ctx, _| {
+                .with_transparent(true).with_active(true);
+        // macOS 不设窗口图标：eframe 会用它替换 Dock 图标，导致与 bundle 图标不一致。
+        #[cfg(not(target_os="macos"))] { builder=builder.with_icon(theme::app_icon()); }
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("daozai-update"), builder, |ctx, _| {
                 if focus {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);

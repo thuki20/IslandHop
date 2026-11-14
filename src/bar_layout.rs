@@ -84,21 +84,47 @@ impl Layout {
     }
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
-    /// 刘海机型专用：在中心留出 `gap` 宽的空洞，把常驻小图标分列到刘海左右。
-    /// 只平移各槽 x 并加总宽，不动槽宽、顺序与任何其他平台的行为，因此
-    /// 上游录制测试（无刘海）看到的布局与原来完全一致。
+    /// 刘海机型专用：在中心留出 `gap` 宽的空洞（物理刘海），把常驻组件按
+    /// 原有顺序分成左右两组，**各自紧靠刘海边缘重新排布**，并把胶囊总宽
+    /// 重算成「刘海 + 左组 + 右组 + 边距」。
+    ///
+    /// 旧实现只是把每个 x 平移 ±gap/2，压在中心的组件还额外推 w/2，导致
+    /// 右侧时钟与天气叠在一起、最右内容溢出胶囊边界（用户截图里的
+    /// 「16:20☀20° 重叠 / 界面显示不完整」）。无刘海机型不调用本函数，
+    /// 上游录制测试看到的布局保持原样。
     pub fn notch_split(&mut self, gap: f32) {
         if gap <= 0.0 { return; }
+        const PAD: f32 = 14.0;   // 刘海边缘到第一个图标
+        const EDGE: f32 = 16.0;  // 图标组到胶囊圆角
+        const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
+        let mut items: Vec<(usize, f32, f32)> = self.x.iter().enumerate()
+            .filter_map(|(i, x)| x.map(|cx| (i, cx, self.widths.get(i).copied().unwrap_or(0.0))))
+            .collect();
+        if items.is_empty() { return; }
+        items.sort_by(|a, b| a.1.total_cmp(&b.1));
+        // 前半放刘海左侧、后半放右侧；组件少时左侧至少留一个，右侧至少留一个，
+        // 保证两边都有内容可见。只有时钟的极端情况全部放右侧。
+        let cut = if items.len() < 2 { 0 } else { items.len().div_ceil(2).min(items.len() - 1) };
+        let group_width = |group: &[(usize, f32, f32)]| -> f32 {
+            group.iter().map(|(_, _, w)| *w).sum::<f32>()
+                + SPACE * group.len().saturating_sub(1) as f32
+        };
+        let left_w = group_width(&items[..cut]);
+        let right_w = group_width(&items[cut..]);
         let half = gap / 2.0;
-        for (i, slot) in self.x.iter_mut().enumerate() {
-            let Some(x) = slot.as_mut() else { continue };
-            let w = self.widths.get(i).copied().unwrap_or(0.0);
-            if *x + w / 2.0 <= 0.0 { *x -= half; }
-            else if *x - w / 2.0 >= 0.0 { *x += half; }
-            // 恰好压在中心的组件不能留在洞里，整体推到右侧可见区。
-            else { *x += half + w / 2.0; }
+        // 左组右对齐到 -half-PAD，按原顺序向左排。
+        let mut cursor = -half - PAD - left_w;
+        for &(i, _, w) in &items[..cut] {
+            self.x[i] = Some(cursor + w / 2.0);
+            cursor += w + SPACE;
         }
-        self.width += gap;
+        // 右组左对齐到 +half+PAD，按原顺序向右排。
+        let mut cursor = half + PAD;
+        for &(i, _, w) in &items[cut..] {
+            self.x[i] = Some(cursor + w / 2.0);
+            cursor += w + SPACE;
+        }
+        self.width = gap + 2.0 * (PAD + EDGE) + left_w + right_w;
     }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
