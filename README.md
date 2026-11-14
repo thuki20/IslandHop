@@ -31,8 +31,8 @@
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
 | **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`；**用钥匙串 `OpenHopSign` 自签名固定身份**，重打包不丢 TCC 授权 |
 | Mac 平台层全量重写 | ⏳ | **261 处 `cfg(windows)`、0 处 macOS 分支**，工单见下 |
-| Windows 端编译 / 出包 | ✅ | **双 workflow 全绿**：`IslandHop Build` 出 x64 zip；`Windows 检查`（上游全量测试 + NSIS 打包 + 安装器测试）通过 |
-| **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、控制台 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
+| Windows 端编译 / 出包 | ✅ | `522a4be` 触发的 `IslandHop Build` **success**，x64 zip 已拉取到 `dist/IslandHop-Windows-x64.zip`（`IslandHop.exe` SHA256 `B47002FF…82E41E`）；exe 字节级确认含「局域网跨屏 / 本机权限 / 不再显示权限相关提示」，即新界面已编进 Windows 包 |
+| **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、设置页 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
 | **双机键鼠 / 剪贴板动作实测** | ⏳ | 会话与剪贴板线程已起，但 Mac 缺「输入监控」授权导致事件 tap 退化（见下）；内容级跨机同步需双机人工实测，**不报通过** |
 
 > ⚠️ **最关键的一句**：`cargo check` 通过 ≠ 岛仔功能在 Mac 上可用。上游非 Windows 分支基本是**空实现**
@@ -179,7 +179,7 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 
 ## 未实现 / 未验证（不拿占位冒充）
 
-- Windows 端编译与安装包：**CI 双 workflow 已全绿**（848e4eb）；zip 见 Actions artifact，exe 已验证含 IslandHop 图标资源（.rsrc 23 KB）与版本信息 0.6.64。**用户 Windows 真机已安装并连上 Mac**（TCP 会话 ESTABLISHED），但 GUI 各功能未逐项实测
+- Windows 端编译与安装包：`522a4be` 的 `IslandHop Build` 已 success，新 zip 已落到 `dist/` 并校验 exe SHA256；**用户 Windows 真机装的仍是旧包**，需解压新 zip 覆盖后重跑一键脚本（脚本会停掉旧版 OpenHop，避免 24850 广播与双引擎抢键鼠）。GUI 各功能未逐项真机实测
 - Windows 应用内更新器仍指向上游 `Renly1994/xiaotang-daozai` 的 Release（`updates.rs`），装了会提示/拉取上游更新——**重新绑定前不要用它更新**
 - macOS `.app` / dmg：本机包已产出，见上「打包」；用自签名代码签名证书固定身份（**不是 Apple Developer ID，未公证**），首次运行若被 Gatekeeper 拦需在「系统设置 → 隐私与安全性」点「仍要打开」
 - 双机跨屏切换、剪贴板同步端到端：**TCP 会话、设置页「已连接 1 台」、`clipboard` 线程均已实测**；但 Mac 未授权「输入监控」→ `mac-event-tap` 线程缺失 → 键鼠切换未跑通；剪贴板内容跨机传输还需双机各复制一次人工确认，**不报通过**
