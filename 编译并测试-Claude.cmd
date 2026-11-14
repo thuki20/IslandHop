@@ -1,7 +1,7 @@
 @echo off
 setlocal
 chcp 65001 >nul
-rem 岛仔：编译正式程序并运行完整回归，结果写入 target\claude-check\build.log
+rem IslandHop：编译正式程序并运行完整回归，结果写入 target\claude-check\build.log
 cd /d "%~dp0"
 if not exist "%~dp0target\claude-check" mkdir "%~dp0target\claude-check" || exit /b 1
 set LOG=%~dp0target\claude-check\build.log

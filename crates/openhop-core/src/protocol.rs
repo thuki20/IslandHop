@@ -4,7 +4,9 @@
 use crate::layout::{Layout, Side};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 15;
+// 16: IslandHop 新增 `Ext::IslandState`，旧版收到未知枚举会整帧 decode 失败，
+// 因此握手阶段就拒绝协议不一致的对端（双端都用同一版 IslandHop 即可互联）。
+pub const PROTOCOL_VERSION: u32 = 16;
 // IslandHop 使用独立的端口组，避免与仍在运行的旧版 OpenHop
 // （TCP 24850 / UDP 24851）抢占端口和组播发现组。双端都用 IslandHop 即可互联。
 pub const DEFAULT_PORT: u16 = 24950;
@@ -518,6 +520,19 @@ pub enum Ext {
     Icons {
         list: Vec<(String, String)>,
     },
+    /// IslandHop: 岛仔业务状态同步。走的是键鼠/剪贴板同一条加密 TCP 连接，
+    /// `to = "*"` 时由 Server 转发给所有对端（`route_ext`）。
+    IslandState(IslandSync),
+}
+
+/// IslandHop 业务状态同步信封：`payload` 是与平台无关的 JSON 快照，
+/// `rev` / `updated_at` / `device` 用于 LWW 冲突裁决（Server 优先）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IslandSync {
+    pub device: String,
+    pub rev: u64,
+    pub updated_at: i64,
+    pub payload: String,
 }
 
 /// An app that can be opened from the launcher.

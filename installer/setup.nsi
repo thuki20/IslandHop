@@ -10,7 +10,7 @@ Unicode true
   !define APP_ID "Daozai"
 !endif
 !ifndef APP_NAME
-  !define APP_NAME "岛仔"
+  !define APP_NAME "IslandHop"
 !endif
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 Name "${APP_NAME}"
@@ -24,9 +24,9 @@ VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey /LANG=2052 "ProductName" "${APP_NAME}"
 VIAddVersionKey /LANG=2052 "FileDescription" "${APP_NAME}安装程序"
 VIAddVersionKey /LANG=2052 "FileVersion" "${APP_VERSION}"
-VIAddVersionKey /LANG=2052 "LegalCopyright" "岛仔贡献者"
-!define MUI_ICON "${PROJECT_DIR}\assets\daozai.ico"
-!define MUI_UNICON "${PROJECT_DIR}\assets\daozai.ico"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "IslandHop contributors"
+!define MUI_ICON "${PROJECT_DIR}\packaging\assets\AppIcon.ico"
+!define MUI_UNICON "${PROJECT_DIR}\packaging\assets\AppIcon.ico"
 !define MUI_ABORTWARNING
 Var BrandIcon
 Var PathInput

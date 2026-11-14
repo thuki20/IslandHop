@@ -88,7 +88,7 @@ impl TrayLog {
         let key=w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
         let build=registry_string(HKEY_LOCAL_MACHINE,key,w!("CurrentBuild")).unwrap_or_default();
         let display=registry_string(HKEY_LOCAL_MACHINE,key,w!("DisplayVersion")).unwrap_or_default();
-        Self(vec![format!("岛仔 {} · Windows 内部版本 {build} ({display}) · 账号进程 {} · 闪动窗口 {:#x}",env!("CARGO_PKG_VERSION"),unread.pid,unread.window)])
+        Self(vec![format!("IslandHop {} · Windows 内部版本 {build} ({display}) · 账号进程 {} · 闪动窗口 {:#x}",env!("CARGO_PKG_VERSION"),unread.pid,unread.window)])
     }
     fn step(&mut self,line:impl Into<String>){self.0.push(line.into());}
     /// 写入日志并返回给用户看的提示（带错误码，便于反馈）。
@@ -544,8 +544,8 @@ impl Listener {
         // 每次启动监听都记一条：日志里没有这一行，就说明监听从未启动。
         let elevated=if process_elevated(){"是"}else{"否"};
         match &result {
-            Ok(listener)=>trace(format!("监听已启动 · 岛仔管理员权限={elevated} · 微信安装路径：{}",listener.state.borrow().paths.iter().filter(|p|!p.starts_with('*')).cloned().collect::<Vec<_>>().join("，"))),
-            Err(error)=>trace(format!("监听启动失败：{error} · 岛仔管理员权限={elevated}")),
+            Ok(listener)=>trace(format!("监听已启动 · IslandHop管理员权限={elevated} · 微信安装路径：{}",listener.state.borrow().paths.iter().filter(|p|!p.starts_with('*')).cloned().collect::<Vec<_>>().join("，"))),
+            Err(error)=>trace(format!("监听启动失败：{error} · IslandHop管理员权限={elevated}")),
         }
         result
     }

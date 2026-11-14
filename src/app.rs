@@ -1646,7 +1646,8 @@ impl App {
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
-            (self.resident.target.width.min(WIN_W-32.0), BAR_H)
+            // 有刘海 Mac：岛体向下延长，把整行常驻内容（含充放电）放到刘海下方。
+            (self.resident.target.width.min(WIN_W-32.0), BAR_H + self.resident.target.notch_y)
         }
     }
 
@@ -1730,9 +1731,14 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS 刘海机型：把常驻小图标分列到刘海左右两侧可见区。胶囊黑色背景
-        // 仍然横跨刘海（真灵动岛观感），只是中间不再放任何内容。
-        if let Some(gap) = crate::mac_window::notch_gap() { layout.notch_split(gap); }
+        // macOS 有刘海机型走**另一套**灵动岛布局：岛体向下延长，常驻内容整行
+        // 落到刘海下方的可见区（含充放电信息），并隐藏时钟（系统菜单栏已有）。
+        // Windows / 无刘海 Mac 保持上游的顶边胶囊布局，两端不共用一套做法。
+        if let Some((gap, notch_h)) = crate::mac_window::notch_layout() {
+            if !self.side() && !self.effective_minimal() && !self.island_lyrics_active() {
+                layout.notch_shelf(gap, notch_h);
+            }
+        }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {
             self.poll_lyrics();
@@ -1982,7 +1988,9 @@ impl App {
             let y=(h.min(self.base_size().1)-BAR_H).max(0.0)/2.0;
             // 吉祥物跟随皮肤换色：浅色底上变成深色版本，保持清晰。
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
-            self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
+            // 吉祥物与常驻行一起下移到刘海下方，收起态才不会一半被物理刘海挡住。
+            let shelf=self.resident.target.notch_y*(1.0-anim::ease_in_out(smoothstep(0.0,0.85,pc)));
+            self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y+shelf).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
         }
         if reveal > 0.004 && !banner && !restoring_lyrics {
             let c = base.shifted(0.0, (1.0 - reveal) * -5.0).faded(reveal);
@@ -2566,6 +2574,12 @@ impl App {
     // 顶栏：电池 + 日期 + 时钟。药丸里的电池与时钟会「飞」到顶栏位置（共享元素过渡）。
     // ---------------------------------------------------------------
     fn shared_header(&mut self, base: &Card, cx: f32, p: f32, reveal: f32, env: &Env) {
+        let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
+        // macOS 刘海：收起时常驻行（电池 / 天气 / 额度 …）整体下移到物理刘海下方；
+        // 展开面板时随进度平滑收回顶栏。Windows 的 notch_y 恒为 0，此步是 no-op。
+        let shelf = self.resident.target.notch_y * (1.0 - m);
+        let shelved = base.shifted(0.0, shelf);
+        let base = &shelved;
         let local_cx = cx - base.origin.x;
         let fit=((WIN_W-32.0)/self.resident.target.width).min(1.0);
         let fitted=base.scaled(local_cx,15.0,lerp(fit,1.0,p));
@@ -2606,8 +2620,13 @@ impl App {
         if lyric_alpha>=0.997 {return;}
         let header=base.faded(1.0-lyric_alpha);
         let base=&header;
-        let m = anim::ease_in_out(smoothstep(0.0, 0.85, p));
-        let clock = self.settings.clock_text(&env.clock);
+        // macOS 有刘海机型：灵动岛里不显示时间（系统菜单栏右上角本来就有），
+        // 收起态与展开态顶栏都不重复画；天气徽标仍保留。
+        let clock = if self.resident.target.notch_y > 0.0 {
+            String::new()
+        } else {
+            self.settings.clock_text(&env.clock)
+        };
         let show_battery=self.settings.show_battery && env.battery.is_some();
 
         // 顶栏终点布局：[电池][日期][时钟] 作为一组整体居中
@@ -2625,7 +2644,7 @@ impl App {
         let has_music=self.media.is_music();
         let layout=self.resident.current();
         let pb=(local_cx+layout.x[bar::BATTERY].unwrap_or(0.0),15.0);
-        let pcx=local_cx+layout.x[bar::CLOCK].unwrap()-paint::clock_width(base,&clock,size::PILL_CLOCK)/2.0;
+        let pcx=local_cx+layout.x[bar::CLOCK].unwrap_or(0.0)-paint::clock_width(base,&clock,size::PILL_CLOCK)/2.0;
 
         if self.effective_minimal() && self.t>=self.notification_bell_until && p < 0.02 { return; }
         // 电池：位置/大小连续插值
@@ -2637,10 +2656,10 @@ impl App {
         let cpos = (lerp(pcx, hc, m), lerp(21.0, 23.0, m));
         let a_pill = (1.0 - smoothstep(0.25, 0.6, m)) * layout.clearance(bar::CLOCK);
         let a_head = smoothstep(0.35, 0.75, m);
-        if a_pill > 0.0 {
+        if a_pill > 0.0 && !clock.is_empty() {
             paint::clock(&base.faded(a_pill),cpos.0,cpos.1,&clock,size::PILL_CLOCK);
         }
-        if a_head > 0.0 {
+        if a_head > 0.0 && !clock.is_empty() {
             paint::clock(&base.faded(a_head),cpos.0,cpos.1-0.5,&clock,size::CLOCK);
         }
         // 日期随内容淡入，从药丸方向轻轻滑出
@@ -2801,7 +2820,7 @@ impl App {
             6 => ("AI", "额度", theme::SOFT_GREEN),
             8 if self.weather.solar_open => ("日出", "日落", theme::YELLOW),
             8 => ("当地", "天气", theme::CYAN),
-            _ => ("岛仔", "设置", theme::WHITE),
+            _ => ("IslandHop", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
         if !b.is_empty() {

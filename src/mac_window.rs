@@ -85,6 +85,23 @@ pub fn notch_gap() -> Option<f32> {
 #[cfg(not(target_os = "macos"))]
 pub fn notch_gap() -> Option<f32> { None }
 
+/// **macOS 刘海机型专用**灵动岛布局参数：`(中心不可用宽度, 刘海高度)`，单位逻辑点。
+///
+/// 物理刘海是屏幕上的一块死区，Windows 没有，所以两端不能共用同一套收起态：
+/// * Windows / 无刘海 Mac：常驻图标在顶边胶囊里横向排开（上游原样）。
+/// * 有刘海 Mac：胶囊向下延长，常驻图标整体落到刘海**下方**的单行「下挂托盘」里，
+///   中心不再放任何内容；同时隐藏时钟（macOS 右上角系统菜单栏已有时间）。
+///
+/// 用 `not(test)` 隔离：上游 612KB 录制测试跑在本机 MacBook 上，若测试构建也读到
+/// 真实刘海尺寸，像素断言会随硬件变化。测试构建一律返回 None，保持上游基线。
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn notch_layout() -> Option<(f32, f32)> {
+    notch_size().map(|(w, h)| (w as f32 + 24.0, (h as f32).clamp(24.0, 48.0)))
+}
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn notch_layout() -> Option<(f32, f32)> { None }
+
 #[cfg(target_os = "macos")]
 mod imp {
     use eframe::egui::Pos2;

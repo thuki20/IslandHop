@@ -924,7 +924,7 @@ impl App {
             0=>{
                 let choices=[("吉祥物",self.settings.pet),("极简刘海",self.settings.minimal),("系统提示",self.settings.system_hud),("全屏隐藏",self.settings.hide_fullscreen)];
                 for (i,(name,on)) in choices.iter().enumerate(){let x=42.0+(i%2) as f32*169.0;let y=57.0+(i/2) as f32*27.0;let text=format!("{}  {}",name,if *on{"开"}else{"关"});if setting_button(c,x,y,158.0,&text,*on,&format!("general-{i}")){match i{0=>self.set_pet(!self.settings.pet),1=>self.set_minimal(!self.settings.minimal),2=>self.settings.system_hud=!self.settings.system_hud,_=>self.settings.hide_fullscreen=!self.settings.hide_fullscreen}}}
-                c.text(42.0,116.0,"岛仔收起时常驻；极简模式保留细线",10.5,W::Regular,theme::GRAY,H::Left);
+                c.text(42.0,116.0,"IslandHop收起时常驻；极简模式保留细线",10.5,W::Regular,theme::GRAY,H::Left);
             }
             1 if self.health_time=>self.health_time_page(c),
             1=>{
@@ -1098,58 +1098,27 @@ pub(crate) fn settings_label(ui:&mut egui::Ui,text:&str){
     ui.add_space(2.0);
 }
 fn support_author(ui:&mut egui::Ui){
-    let id=egui::Id::new("support-author-open");
-    let open=ui.ctx().data(|data|data.get_temp::<bool>(id).unwrap_or(false));
-    if !open {release_support_codes(ui.ctx());}
+    // 旧版「支持作者」收款码贴图若展开过，关闭设置窗口时一并释放显存。
+    release_support_codes(ui.ctx());
     let dark=ui.visuals().dark_mode;
-    let accent=if dark{Color32::from_rgb(182,163,245)}else{Color32::from_rgb(105,77,163)};
+    let accent=if dark{Color32::from_rgb(150,205,255)}else{Color32::from_rgb(40,90,150)};
     ui.scope(|ui|{
     ui.set_min_height(225.0);
-    if !open {
-    egui::Frame::new().fill(if dark{Color32::from_rgb(42,37,53)}else{Color32::from_rgb(239,233,250)})
+    egui::Frame::new().fill(if dark{Color32::from_rgb(30,42,62)}else{Color32::from_rgb(235,242,252)})
         .corner_radius(10.0).show(ui,|ui|{
             ui.set_min_width(ui.available_width());
             ui.vertical_centered(|ui|{
-                ui.add(egui::Image::new(egui::include_image!("../assets/support/daozai-coffee.svg")).fit_to_exact_size(egui::vec2(211.0,110.0)));
+                ui.add(egui::Image::new(egui::include_image!("../assets/support/islandhop-badge.svg")).fit_to_exact_size(egui::vec2(211.0,110.0)));
             });
         });
     ui.add_space(9.0);
-    ui.label(egui::RichText::new("小唐维护 · 岛仔陪伴").size(10.5).color(accent));
-    ui.label(egui::RichText::new("请小唐喝杯咖啡").size(19.0).strong());
-    ui.label("岛仔陪你认真生活，\n你的支持，陪小唐把它慢慢做好。");
-    } else {
-        let ctx=ui.ctx().clone();
-        // 只解码一次并裁出二维码区域，按实际显示像素缩小：原图解码后两张合计约 17MB，缩小后不到 1MB。
-        let pixels=((180.0*ctx.pixels_per_point()).ceil() as u32).clamp(180,600);
-        ui.columns(2,|columns|{
-            for (i,(name,bytes,crop,color)) in [
-                ("微信支付",include_bytes!("../assets/support/support-wechat-original.jpg").as_slice(),[330.0,370.0,600.0],Color32::from_rgb(5,160,80)),
-                ("支付宝",include_bytes!("../assets/support/support-alipay-original.jpg").as_slice(),[200.0,660.0,860.0],Color32::from_rgb(22,120,255)),
-            ].into_iter().enumerate(){
-                let texture_id=egui::Id::new(("support-author-qr",i));
-                let texture=ctx.data_mut(|data|data.get_temp::<egui::TextureHandle>(texture_id)).filter(|texture|texture.size()==[pixels as usize;2]).unwrap_or_else(||{
-                    let image=support_code_image(bytes,crop,pixels);
-                    let texture=ctx.load_texture(name,image,egui::TextureOptions::LINEAR);
-                    ctx.data_mut(|data|data.insert_temp(texture_id,texture.clone()));texture
-                });
-                let uv=egui::Rect::from_min_max(egui::pos2(0.0,0.0),egui::pos2(1.0,1.0));
-                columns[i].vertical_centered(|ui|{
-                    ui.label(egui::RichText::new(name).color(color).strong());
-                    let side=ui.available_width().min(180.0);
-                    ui.add(egui::Image::new((texture.id(),egui::vec2(side,side))).uv(uv));
-                    ui.label(egui::RichText::new(if i==0{"打开微信扫一扫"}else{"打开支付宝扫一扫"}).size(11.0));
-                });
-            }
-        });
-    }
+    ui.label(egui::RichText::new("IslandHop · 你的桌面灵动岛").size(10.5).color(accent));
+    ui.label(egui::RichText::new("IslandHop 全部功能 + 局域网键鼠共享").size(19.0).strong());
+    ui.label("源码、版本更新与问题反馈都在你自己的 GitHub 仓库，\n不再指向上游仓库的发布页。");
+    ui.hyperlink_to("github.com/thuki20/IslandHop", "https://github.com/thuki20/IslandHop");
     });
-    let button=egui::Button::new(egui::RichText::new(if open{"返回"}else{"请喝咖啡 · 支持作者"}).color(Color32::from_rgb(33,27,51)))
-        .fill(Color32::from_rgb(182,163,245)).corner_radius(8.0);
-    if ui.add_sized([ui.available_width(),32.0],button).clicked(){
-        ui.ctx().data_mut(|data|data.insert_temp(id,!open));
-    }
     ui.add_space(7.0);
-    ui.label(egui::RichText::new("完全自愿 · 感谢每一份支持 · 不影响功能使用").size(11.0).color(ui.visuals().weak_text_color()));
+    ui.label(egui::RichText::new("本地数据保留在本机；跨屏数据通过加密局域网连接同步").size(11.0).color(ui.visuals().weak_text_color()));
 }
 pub(crate) fn settings_control_row(ui:&mut egui::Ui,title:&str,label_width:f32,controls:impl FnOnce(&mut egui::Ui)->egui::Response)->egui::Response{
     ui.horizontal(|ui|{
@@ -1238,7 +1207,7 @@ impl App {
         let focus_requested=std::mem::take(&mut self.settings_focus_requested);
         let opening=self.window_layout().open();
         #[allow(unused_mut)]
-        let mut builder=egui::ViewportBuilder::default().with_title("岛仔设置").with_inner_size([690.0,560.0]).with_min_inner_size([600.0,450.0]).with_visible(false).with_active(false).with_window_level(egui::WindowLevel::Normal);
+        let mut builder=egui::ViewportBuilder::default().with_title("IslandHop 设置").with_inner_size([690.0,560.0]).with_min_inner_size([600.0,450.0]).with_visible(false).with_active(false).with_window_level(egui::WindowLevel::Normal);
         // macOS：eframe 的 with_icon() 会调 NSApp.setApplicationIconImage，把 Dock
         // 图标换成岛仔 logo，与 bundle 的 AppIcon.icns 不一致（启动前后图标变化）。
         // 因此 macOS 所有 viewport 都不设窗口图标，统一使用 bundle 图标。
@@ -1299,8 +1268,8 @@ impl App {
                         4=>egui::include_image!("../assets/settings-icons/system/tasks.svg"),
                         6=>egui::include_image!("../assets/settings-icons/system/notifications.svg"),
                         12=>egui::include_image!("../assets/settings-icons/system/weather.svg"),
-                        13=>egui::include_image!("../assets/settings-icons/system/pages.svg"),
-                        _=>egui::include_image!("../assets/settings-icons/system/about.svg"),
+                        13=>egui::include_image!("../assets/settings-icons/system/crossscreen.svg"),
+                        _=>egui::include_image!("../assets/settings-icons/system/islandhop.svg"),
                     };
                     let icon_bg=egui::Rect::from_center_size(egui::pos2(rect.left()+21.0,rect.center().y),egui::vec2(25.0,25.0));
                     egui::Image::new(icon).paint_at(ui,icon_bg);
@@ -1435,19 +1404,19 @@ impl App {
                         settings_label(ui,"启动");
                         settings_card(ui,|ui|{
                             let mut a=autostart;
-                            setting_row(ui,"开机启动","登录 Windows 时自动打开岛仔",&mut a);
+                            setting_row(ui,"开机启动","登录 Windows 时自动打开IslandHop",&mut a);
                             if a!=autostart{self.pending.push(Cmd::ToggleAutostart);}
                         });
                         settings_label(ui,"图形渲染");
                         settings_card(ui,|ui|{
                             let before=self.settings.render_compat;
-                            setting_row(ui,"兼容渲染（Direct3D 12）","岛周围出现黑框、画面闪烁或错乱，或打开设置后崩溃退出时开启；切换后重启岛仔生效",&mut self.settings.render_compat);
+                            setting_row(ui,"兼容渲染（Direct3D 12）","岛周围出现黑框、画面闪烁或错乱，或打开设置后崩溃退出时开启；切换后重启IslandHop生效",&mut self.settings.render_compat);
                             // 手动关闭后不再显示自动切换的原因；再次开启视为手动开启。
                             if before!=self.settings.render_compat {self.settings.render_compat_reason.clear();}
                             if !self.settings.render_compat_reason.is_empty() {settings_hint(ui,&self.settings.render_compat_reason);}
                             if self.settings.render_compat!=self.render_compat_running {
                                 ui.horizontal(|ui|{
-                                    ui.label(egui::RichText::new("重启岛仔后生效").size(12.0).color(Color32::from_rgb(230,150,40)));
+                                    ui.label(egui::RichText::new("重启IslandHop后生效").size(12.0).color(Color32::from_rgb(230,150,40)));
                                     if ui.button("立即重启").clicked(){self.pending.push(Cmd::RestartApp);}
                                 });
                             }
@@ -1537,7 +1506,7 @@ impl App {
                             ui.separator();
 
                             let mut pet=self.settings.pet;
-                            setting_row(ui,"岛仔吉祥物","收起时常驻，播放音乐时一起唱歌",&mut pet);
+                            setting_row(ui,"IslandHop吉祥物","收起时常驻，播放音乐时一起唱歌",&mut pet);
                             if pet!=self.settings.pet {self.set_pet(pet);}
                         });
                         self.avoidance.settings(ui,&mut self.settings);
@@ -1716,7 +1685,7 @@ impl App {
                             ui.separator();
                             let sync_before=self.settings.mail_sync_operations;
                             ui.add_enabled_ui(self.mail.manage.pending.is_empty(),|ui|{
-                                setting_row(ui,"同步邮件操作到邮箱","开启后同步已读、删除和恢复；关闭时仅整理岛仔中的记录",&mut self.settings.mail_sync_operations);
+                                setting_row(ui,"同步邮件操作到邮箱","开启后同步已读、删除和恢复；关闭时仅整理IslandHop中的记录",&mut self.settings.mail_sync_operations);
                             });
                             if sync_before!=self.settings.mail_sync_operations{self.mail_manage_mode_changed();}
                             ui.label(egui::RichText::new("切换开关不会补交之前的本机操作。").size(11.5).color(settings_color(ctx,Color32::from_gray(195),Color32::from_gray(60))));
@@ -2009,21 +1978,26 @@ impl App {
                         });
                     }
                     _=>{
-                        settings_label(ui,"岛仔 Daozai");
+                        settings_label(ui,"IslandHop");
                         settings_card(ui,|ui|{
                             ui.horizontal(|ui|{
                                 ui.label(egui::RichText::new(format!("版本 {}",env!("CARGO_PKG_VERSION"))).size(13.0));
                                 ui.add_space(8.0);
                                 ui.vertical(|ui|self.updates.ui(ui));
                             });
-                            ui.label(egui::RichText::new("桌面顶部的音乐、专注、提醒与日程小助手。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                            ui.label(egui::RichText::new("桌面顶部的音乐、专注、提醒与日程小助手，内置局域网键鼠共享与剪贴板同步。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                            ui.horizontal_wrapped(|ui|{
+                                ui.hyperlink_to("GitHub · thuki20/IslandHop", "https://github.com/thuki20/IslandHop");
+                                ui.label(egui::RichText::new("·").size(11.0));
+                                ui.hyperlink_to("发布与下载", "https://github.com/thuki20/IslandHop/releases/latest");
+                            });
                             ui.horizontal_wrapped(|ui|{
                                 if ui.button("打开本地数据目录").clicked(){self.pending.push(Cmd::Open(crate::model::config_dir()));}
                                 ui.label(egui::RichText::new("设备图标：Solar Icons · 480 Design").size(11.0).color(settings_color(ctx,Color32::from_gray(150),Color32::from_gray(105))));
                                 ui.hyperlink_to("CC BY 4.0", "https://creativecommons.org/licenses/by/4.0/");
                             });
                         });
-                        settings_label(ui,"支持作者");
+                        settings_label(ui,"项目与源码");
                         settings_card(ui,support_author);
                     }
                     }
@@ -2043,6 +2017,8 @@ fn release_support_codes(ctx:&egui::Context){
 }
 
 /// 从原图裁出二维码区域 `[x, y, 边长]` 并缩放到 `pixels` 见方。
+/// 上游「支持作者」收款码卡片已由 IslandHop 项目卡片取代；保留解码函数供按需导出旧预览用。
+#[allow(dead_code)]
 fn support_code_image(bytes:&[u8],crop:[f32;3],pixels:u32)->egui::ColorImage {
     let image=image::load_from_memory(bytes).expect("内置收款码图片有效");
     let side=(crop[2] as u32).min(image.width().saturating_sub(crop[0] as u32)).min(image.height().saturating_sub(crop[1] as u32));

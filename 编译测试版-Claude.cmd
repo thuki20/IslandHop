@@ -1,7 +1,7 @@
 @echo off
 setlocal
 chcp 65001 >nul
-rem 岛仔：编译当前任务分支的本机测试版
+rem IslandHop：编译当前任务分支的本机测试版
 cd /d "%~dp0"
 if not exist "target\claude-skin\." mkdir "target\claude-skin" || exit /b 1
 set "LOG=%~dp0target\claude-skin\build.log"

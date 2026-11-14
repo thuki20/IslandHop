@@ -112,7 +112,7 @@ impl<'a> Session<'a> {
     fn provision(&mut self) -> Result<(), Failure> {
         self.provisioned = true;
         let label = self.cfg.provider.label();
-        let refused = || Failure::text(format!("{label}要求设备满足安全策略（如锁屏密码、远程擦除），岛仔不执行这些管控；请联系管理员允许不受管控的设备"));
+        let refused = || Failure::text(format!("{label}要求设备满足安全策略（如锁屏密码、远程擦除），IslandHop不执行这些管控；请联系管理员允许不受管控的设备"));
         let first = command(&self.agent, self.cfg, self.password, "Provision", &provision_request(None), None)?;
         // 服务器下发远程擦除时绝不执行，直接停止同步。
         if first.child(PROVISION, 0x0c).is_some() { return Err(refused()); }
@@ -161,7 +161,7 @@ fn command(agent: &ureq::Agent, cfg: &Config, password: &str, name: &str, root: 
 fn check_status(n: &Node, page: u8, tag: u8, label: &str) -> Result<(), Failure> {
     match n.required(page, tag)? {
         "1" => Ok(()),
-        code if NEEDS_PROVISION.contains(&code) => Err(Failure::text(format!("{label}要求设备满足安全策略，岛仔不执行这些管控；请联系管理员允许不受管控的设备"))),
+        code if NEEDS_PROVISION.contains(&code) => Err(Failure::text(format!("{label}要求设备满足安全策略，IslandHop不执行这些管控；请联系管理员允许不受管控的设备"))),
         code => Err(Failure::text(format!("{label}同步失败（Exchange {code}），请检查日历授权后重试"))),
     }
 }

@@ -30,9 +30,9 @@ try {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [IO.Compression.ZipFile]::OpenRead($archive)
     try {
-        $name = 'Daozai-v' + $version + '-windows-x64/daozai.exe'
+        $name = 'IslandHop-v' + $version + '-windows-x64/daozai.exe'
         $entries = @($zip.Entries | Where-Object {$_.FullName.Replace('\','/') -ceq $name})
-        if ($entries.Count -ne 1 -or $entries[0].Length -gt 200MB) { throw '更新包中缺少唯一的岛仔程序。' }
+        if ($entries.Count -ne 1 -or $entries[0].Length -gt 200MB) { throw '更新包中缺少唯一的 IslandHop 程序。' }
         [IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], $staged)
     } finally { $zip.Dispose() }
     $actual = [Diagnostics.FileVersionInfo]::GetVersionInfo($staged).FileVersion
@@ -40,7 +40,7 @@ try {
     Set-Content -LiteralPath (Join-Path $workRoot 'ready') -Value 'ok'
     if ($ParentProcessId -gt 0) {
         $parent = Get-Process -Id $ParentProcessId -ErrorAction SilentlyContinue
-        if ($parent -and -not $parent.WaitForExit(60000)) { throw '岛仔尚未退出，请稍后重试。' }
+        if ($parent -and -not $parent.WaitForExit(60000)) { throw 'IslandHop 尚未退出，请稍后重试。' }
     }
     $exited = $true
     # 缓存可能启用 EFS；先复制备份，避免原子替换时跨加密边界移动旧程序。
@@ -73,6 +73,6 @@ try {
     }
     if ($exited) { Start-Process -FilePath $target -WorkingDirectory $targetDir -WindowStyle Hidden }
     Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.MessageBox]::Show("更新未完成：$message`r`n原版本已保留，可稍后重试或通过浏览器下载。", '岛仔更新') | Out-Null
+    [System.Windows.Forms.MessageBox]::Show("更新未完成：$message`r`n原版本已保留，可稍后重试或通过浏览器下载。", 'IslandHop 更新') | Out-Null
     exit 1
 }

@@ -8,7 +8,7 @@ fn write_report(directory: &Path, title: &str, details: &str) -> std::io::Result
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     std::fs::write(&path, format!(
-        "岛仔 {}\n系统：{} / {}\n时间（Unix 秒）：{timestamp}\n{title}\n{details}\n",
+        "IslandHop {}\n系统：{} / {}\n时间（Unix 秒）：{timestamp}\n{title}\n{details}\n",
         env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH,
     ))?;
     Ok(path)
@@ -28,7 +28,7 @@ pub fn report(title: &str, details: &str) {
         use windows::core::{w, PCWSTR};
         use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
         let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        unsafe { MessageBoxW(None, PCWSTR(wide.as_ptr()), w!("岛仔"), MB_OK | MB_ICONERROR); }
+        unsafe { MessageBoxW(None, PCWSTR(wide.as_ptr()), w!("IslandHop"), MB_OK | MB_ICONERROR); }
     }
     #[cfg(not(windows))]
     eprintln!("{text}");
@@ -39,7 +39,7 @@ pub fn startup(stage:&str) {
     let directory=daozai::model::config_dir().join("diagnostics");
     if std::fs::create_dir_all(&directory).is_ok() {
         let _=std::fs::write(directory.join("last-startup.log"),format!(
-            "岛仔 {}\n进程：{}\n启动阶段：{stage}\n",env!("CARGO_PKG_VERSION"),std::process::id()));
+            "IslandHop {}\n进程：{}\n启动阶段：{stage}\n",env!("CARGO_PKG_VERSION"),std::process::id()));
     }
 }
 
@@ -150,8 +150,8 @@ mod native_crash {
             details.push_str("判断：崩在显卡的 OpenGL 驱动里，下次启动自动改用兼容渲染（Direct3D 12）。\n");
         }
         let restarted = super::relaunch_after_failure(&format!("进程崩溃（{module}）"));
-        details.push_str(if restarted { "已自动重新启动岛仔。\n" } else { "未自动重启（运行不足 30 秒或一小时内已重启 3 次）。\n" });
-        let _ = super::write_report(&super::diagnostics_dir(), "岛仔意外退出（进程崩溃）", &details);
+        details.push_str(if restarted { "已自动重新启动IslandHop。\n" } else { "未自动重启（运行不足 30 秒或一小时内已重启 3 次）。\n" });
+        let _ = super::write_report(&super::diagnostics_dir(), "IslandHop意外退出（进程崩溃）", &details);
         // 交给系统继续处理，Windows 事件日志里仍会留下崩溃记录。
         EXCEPTION_CONTINUE_SEARCH
     }
@@ -180,10 +180,10 @@ pub fn install() {
         let details = format!("代码位置：{location}\n调用栈：\n{}", std::backtrace::Backtrace::force_capture());
         // 主线程出错会让整个岛仔退出：记下原因后直接自动重启，不弹窗打断。后台线程出错不影响主界面，仍按原样提示。
         if std::thread::current().name() == Some("main") && relaunch_after_failure("程序异常") {
-            let _ = write_report(&diagnostics_dir(), "岛仔发生异常，已自动重新启动。", &details);
+            let _ = write_report(&diagnostics_dir(), "IslandHop发生异常，已自动重新启动。", &details);
             return;
         }
-        report("岛仔发生异常，请重新启动。", &details);
+        report("IslandHop发生异常，请重新启动。", &details);
     }));
 }
 

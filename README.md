@@ -10,7 +10,7 @@
 
 ---
 
-## TL;DR（2026-11-14 更新）
+## TL;DR（2026-11-15 更新）
 
 | 阶段 | 状态 | 证据 |
 |---|---|---|
@@ -36,6 +36,11 @@
 | **Mac 主岛窗口贴顶** | ✅ | `y=38 / layer=3` → **`y=0 / layer=25`**（CGWindowList 实测） |
 | **与旧版 OpenHop 隔离** | ✅ | 独立端口 24950/24951、独立配置目录、macOS 数据目录修复；不再抢端口、不回写旧配置 |
 | **macOS 应用包** | ✅ | 本机产出 `IslandHop.app` + dmg（arm64 / 图标 / Info.plist 校验通过）；已装到 `/Applications`；**用钥匙串 `OpenHopSign` 自签名固定身份**，重打包不丢 TCC 授权 |
+| **Mac 刘海专用灵动岛（三修，取代分列方案）** | ✅ | 物理刘海是不可显示死区，Windows 没有，两端不能共用一套收起态。`notch_shelf()`：Mac 收起胶囊**向下延长**（`BAR_H + 刘海高 + 6`），常驻组件排成**一整行落到刘海下方**（含充放电），中心不留任何内容；胶囊宽度至少覆盖刘海宽；隐藏时钟（系统右上角已有时间，收起/展开顶栏都不画）。`notch_layout()` 用 `not(test)` 隔离，录制测试不受本机硬件影响 |
+| **双机业务数据同步** | ✅ | 复用 OpenHop 已加密的 TCP 连接新增 `Msg::Ext::IslandState`（协议版本 15→16），`Hub` 加可靠收件箱 `take_island_states()`；`src/sync_state.rs` 每秒 LWW 裁决：喝水/久坐/专注/天气城市/常用偏好 + `todo.txt` + `water*.txt` + `shelf.txt` + 账号清单元数据。**主设备 `Role::Server` 冲突时胜出**，先落盘再刷新 `App` 内存，重算指纹防回环 |
+| **品牌与更新源切到 IslandHop** | ✅ | 设置窗口标题/关于页/托盘菜单/安装包脚本（NSIS + PowerShell）全部由「岛仔/Daozai」改名 IslandHop；应用内更新器指向 `thuki20/IslandHop` 的 GitHub Releases（`REPOSITORY/API/RELEASES` 常量 + 包名 `IslandHop-v*-windows-x64.zip` + 缓存目录），上游夸克网盘兜底改为发布页；新增 IslandHop 自有设置分组图标与关于页徽标 SVG |
+| **macOS 剪贴板拖拽段错误修复** | ✅ | 实测 SIGSEGV：引擎后台线程裸调 `NSPasteboard.pasteboardItems()`（内部 `readObjectsForClasses` 快速枚举）无 autorelease pool，与系统拖拽写入竞争 → `objc_opt_class` 解引用野指针（崩溃报告 `IslandHop-2026-11-15-050812.ips`）。`dnd.rs::drag_files` 与 `clipboard.rs` 监听循环全部包 `objc2::rc::autoreleasepool` |
+| **品牌与更新源改为 IslandHop** | ✅ | 设置/关于/托盘/诊断/安装脚本里的「岛仔」用户可见文案全部替换；`theme::app_icon()` 与 NSIS 向导改用自有 `AppIcon.*`；设置分组「局域网跨屏」「关于」换成自有 SVG 图标；关于页去掉上游收款码卡片，改成 `thuki20/IslandHop` 源码与发布页链接；`updates.rs` 的 `REPOSITORY/API/RELEASES/BACKUP_DOWNLOAD` 全部指向 `thuki20/IslandHop`，资产名改 `IslandHop-v…zip`，User-Agent 改 `IslandHop/` |
 | Mac 平台层全量重写 | ⏳ | 本轮补 7 类数据源后仍有 **267 处 `cfg(windows)`**，托盘 / 开机自启 / 通知读取 / Keychain 登录 / 更新器未做，工单见下 |
 | Windows 端编译 / 出包 | ✅ | `57ab9a2` 触发的 `IslandHop Build` **success**，最终 x64 zip 已拉取到 `dist/IslandHop-Windows-x64.zip`（`IslandHop.exe` SHA256 `05881150…3238`，一键脚本 `ExpectedSha` 同步）；exe 字节级确认含「局域网跨屏 / 共享口令模式 / 无需配对码」，即本轮可视化面板与画布清理已编进 Windows 包 |
 | **双机连通（协议层）** | ✅ | 2026-11-14 实测：`192.168.1.16:24950 -> 192.168.1.15:64772 ESTABLISHED`、设置页 `Sharing with 1 computer(s) / 已连接 1 台`；回环 Client 自检 `CONNECTED=true, peers=1` |
@@ -53,11 +58,13 @@
 ```
 IslandHop/
 ├─ src/                     岛仔 102 个模块（业务模块原样，仅 extras.rs 加 1 个设置分组）
-│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 内嵌在岛仔设置窗口的可视化面板
+│  ├─ cross_screen.rs       ← 新增：OpenHop 引擎后台线程 + 内嵌在设置窗口的可视化面板 + 同步收发封装
+│  ├─ sync_state.rs         ← 新增：双机业务状态同步（快照 / LWW 裁决 / 先落盘再刷内存）
 │  ├─ mac_window.rs         ← 新增：macOS 窗口层级 / 点击穿透 / 刘海几何 / 激活应用
 │  ├─ macos_sys.rs          ← 新增（macOS）：电池/音量/网络/闲置/媒体/文件数据源 + 后台采样线程
+│  ├─ bar_layout.rs         ← 改动：新增 `notch_shelf()`（macOS 刘海下方单行布局）
 │  ├─ clipboard.rs          ← 改动（macOS 分支）：NSPasteboard.changeCount 轮询监听
-│  └─ extras.rs             ← 仅加 1 个设置分组（第 13 项），102 个业务模块不动
+│  └─ extras.rs / theme.rs / updates.rs / tray.rs  ← 改动：品牌与更新源换绑
 ├─ vendor/                  岛仔 5 个魔改库（原样，[patch.crates-io] 不变）
 ├─ assets/ docs/ installer/ scripts/ tests/   上游原样
 ├─ crates/openhop-core/     ← 新增：OpenHop 纯 Rust 引擎（54 文件，零 egui 依赖）
@@ -73,6 +80,9 @@ IslandHop/
 | 配置 | `Config::default_path()` = `~/Library/Application Support/IslandHop/config.toml`，**不读也不回写**旧 OpenHop 的 `openhop/config.toml`（旧版 24850/24851 可并存） |
 | 界面 | 上游把页数硬编码成 `[bool; 9]` / `[usize; 9]` 并散落在大量 `match page` 与 612KB 录制测试里；硬插第 10 个功能页会破坏设置持久化与测试基线，故**只在岛仔原有设置窗口加一个分组**（`SETTINGS_GROUPS` 第 13 项），不动功能页结构 |
 | 引擎启动 | `Shell::new` 触发 `cross_screen::with()` 初始化；`config.toml` 里 `enabled=true` 时 `Engine::start` 在后台线程启动，**用户不用打开任何界面** |
+| 业务同步 | `Shell::update` 每秒调 `sync.tick()` → `cross_screen::sync_inbox/broadcast` → `Hub::tell("*", Ext::IslandState)`；走键鼠/剪贴板同一条 Noise 加密 TCP，`route_ext` 负责 Server 转发；`schedule_repaint` 取 `min(1s)` 保证无交互时也醒 |
+| 冲突口径 | `rev` 大者胜 → `updated_at` 大者胜 → `Role::Server`（主设备）胜；应用后重算本地快照指纹，避免两端互推 |
+| 平台差异 | `notch_layout()` 只在 `macOS + 有刘海 + 非测试构建` 返回 `Some`，Windows 永远走上游顶边胶囊 |
 | 点击穿透 | Windows 由 `native.rs` 用 `SetWindowRgn` 裁剪；macOS 由 `mac_window.rs` 用 `NSWindow.ignoresMouseEvents` + `NSEvent.mouseLocation` 换算实现等价行为 |
 | 剪贴板 | OpenHop 引擎内部已有回声抑制；岛仔剪贴板历史会把对端写入也记一条（历史污染，不是同步循环） |
 | 依赖并存 | `windows` 0.58（岛仔）与 0.62.2（core）、`tungstenite` 0.28/0.30 可共存；边界只传裸句柄。**egui/eframe 零冲突**，这是方案成立的关键 |
@@ -142,6 +152,25 @@ cargo build --release
 
 「设置 → 局域网跨屏」现在是可视化面板：顶部大开关与运行状态、三步连接进度、附近设备卡片（系统 / 地址 / 连接态 / 一键配对）、图形化屏幕排列画布（当前光标高亮）、连接方式说明。两端口令一致时引擎自动发现直连，页面直接写明「无需配对码、不用点配对」；只有口令为空才用 6 位配对码。角色 / 名称 / 口令 / 权限 / IP 直连 / 运行日志收在「高级设置」「运行状态与日志」两个折叠区。屏幕顶部除岛体以外的区域已做点击穿透，不会再挡住下面应用的菜单和按钮。
 
+**Mac 与 Windows 的灵动岛不一样（本轮新增）**
+
+| | Windows / 无刘海 Mac | 有刘海 Mac |
+|---|---|---|
+| 收起胶囊 | 顶边一条 `BAR_H=30` 横条，图标横向排开 | 向下延长到 `30 + 刘海高 + 6`，黑色岛体从刘海长出来 |
+| 充放电信息 | 胶囊内常驻 | **整行下移到刘海下方**，不再压在物理刘海死区里 |
+| 时钟 | 胶囊内显示 | **不显示**（macOS 右上角系统菜单栏已有时间） |
+| 图标排布 | `Layout::new` 单组顺序 | `notch_shelf()` 单行居中，宽度至少覆盖刘海 |
+
+**两台互联后数据自动一致（本轮新增）**
+
+打开软件并让两端连上后（设置页「已连接 N 台」），每秒自动对齐一次，不需要点任何按钮：
+
+- 同步：`settings.txt` 白名单（喝水间隔/单次容量/提醒时段、久坐与午休、专注时长、天气城市与收藏、常用偏好）、`todo.txt`（整表）、`water.txt` + `water-extra.txt`（当日饮水）、`shelf.txt`（置物架）、`ai-quota.json` 的账号清单元数据
+- 不同步：显示器 id / 停靠位置 / 避让应用路径等本机键、天气实况缓存、久坐计时与番茄钟剩余（纯本地会话）、剪贴板历史（OpenHop 已有实时同步）、以及所有凭据
+- 冲突：`rev` → 时间戳 → 主设备（`role="server"`）优先；新连接立即推全量，之后每 15 秒心跳一次
+- 设置页「双机数据同步」一行实时显示 `未连接 / 已从对端同步 / 数据一致 + rev + 摘要`
+- ⚠️ 账号清单会一致，但登录凭据不跨机：`source` 登录 JSON 与 `credentials/` 是本机绝对路径、部分加密绑定系统钥匙串，新增账号在从机需各自登录一次
+
 - 两端角色必须**相反**、共享口令一致、TCP **24950** / UDP **24951** 放行，**两端都要装 IslandHop**（端口与旧版 OpenHop 不通）
 - macOS 需在「系统设置 → 隐私与安全性 → 辅助功能 / 输入监控」勾选 IslandHop 并**彻底退出重开**（TCC 按应用路径授权）
 - 端口与配置已与旧版 OpenHop 隔离（24950/24951 vs 24850/24851），不会抢端口；但两者都会注入键鼠事件，**实际跨屏时请只启用其中一个**
@@ -191,11 +220,13 @@ bash packaging/macos-app.sh             # 产出 IslandHop.app + dist/IslandHop-
 ## 未实现 / 未验证（不拿占位冒充）
 
 - Windows 端编译与安装包：`522a4be` 的 `IslandHop Build` 已 success，新 zip 已落到 `dist/` 并校验 exe SHA256；**用户 Windows 真机装的仍是旧包**，需解压新 zip 覆盖后重跑一键脚本（脚本会停掉旧版 OpenHop，避免 24850 广播与双引擎抢键鼠）。GUI 各功能未逐项真机实测
-- Windows 应用内更新器仍指向上游 `Renly1994/xiaotang-daozai` 的 Release（`updates.rs`），装了会提示/拉取上游更新——**重新绑定前不要用它更新**
+- Windows 应用内更新器 **已重新绑定**到 `thuki20/IslandHop`（`updates.rs` 的 API / 发布页 / 备用下载 / 资产名 / User-Agent / 缓存目录）；但**仓库尚未创建任何 GitHub Release**，点「检查更新」会得到 404「暂未找到正式版本」，需先在 `thuki20/IslandHop/releases` 发一版并附 `IslandHop-v<版本>-windows-x64.zip` + digest 才能走完整自动更新链路
+- 账号同步只传**清单元数据**（id / provider / alias / slot / enabled / pinned），`source` 登录 JSON 路径、`credentials/*.bin`、邮件密码、Keychain / DPAPI 绑定的 token **一律不跨机**：两端账号清单会一致，但凭据必须在各自电脑登录一次才能读数，新增账号初始 `source=""` 会在额度页显示需要重新登录
 - macOS `.app` / dmg：本机包已产出，见上「打包」；用自签名代码签名证书固定身份（**不是 Apple Developer ID，未公证**），首次运行若被 Gatekeeper 拦需在「系统设置 → 隐私与安全性」点「仍要打开」
 - 双机跨屏切换、剪贴板同步端到端：**TCP 会话、设置页「已连接 1 台」、`clipboard` 线程均已实测**；但 Mac 未授权「输入监控」→ `mac-event-tap` 线程缺失 → 键鼠切换未跑通；剪贴板内容跨机传输还需双机各复制一次人工确认，**不报通过**
 - 改端口后的**引擎监听实测**：✅ 已重跑。TCP 24950 v4/v6 LISTEN、UDP 24951 绑定；线程采样含 `server` / `clipboard` / `peer-192.168.1.15` / `link-writer`，**唯独缺 `mac-event-tap`**（即输入监控授权缺口）
-- 窗口内部标题仍是上游「岛仔」文案，未做品牌文案替换（保持全量派生）
+- 应用内「岛仔」用户可见文案**已全部替换**为 IslandHop（注释里保留「岛仔上游」作为溯源说明）；`ui_tests.rs` 里的测试断言字符串按上游原样保留，避免破坏 612KB 录制基线
+- **双机数据同步未经双机人工端到端实测**：本轮只做了单机构建、协议编译、LWW 逻辑与测试回归；两台真机同时运行、一端改待办/喝水后另一端是否即时刷新，需要用户实测，**不报通过**
 - **Mac 仍未适配（不拿占位冒充）**：菜单栏托盘 / 开机自启（SMAppService）、跨进程通知读取（系统无公开接口）、蓝牙音频设备、AI 额度账号的 Keychain 登录、应用内更新器、全局热键与输入法、毛玻璃与浏览器避让、桌面伙伴资源、音乐封面与国内客户端媒体源
 - **Mac 已适配但需真实数据才看得到**：媒体卡片要求 Music / Spotify 正在播放（本机测试时两者均未运行，故截图里没有音乐图标）；AI 额度环需先配置账号；通知铃依赖系统通知
 - 微信/QQ 未读提醒：Mac 无解，将明确标注「仅 Windows」

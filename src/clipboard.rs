@@ -219,14 +219,17 @@ mod mac {
         }
     }
     pub fn run(shared: Shared, repaint: Box<dyn Fn() + Send>, stop: &AtomicBool) {
+        // AppKit 只能在 autorelease pool 里调：stringWithUTF8String/stringForType
+        // 都返回 autorelease 对象，后台线程无池会悬垂（同类崩溃已在引擎侧实测）。
+        fn pool<R>(f: impl FnOnce() -> R) -> R { objc2::rc::autoreleasepool(|_| f()) }
         let pb = pasteboard();
-        let mut last = change_count(pb);
+        let mut last = pool(|| change_count(pb));
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(350));
-            let now = change_count(pb);
+            let now = pool(|| change_count(pb));
             if now < 0 || now == last { continue; }
             last = now;
-            if let Some(t) = text(pb) {
+            if let Some(t) = pool(|| text(pb)) {
                 if shared.record(&t) { repaint(); }
             }
         }

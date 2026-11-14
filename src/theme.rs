@@ -209,11 +209,11 @@ fn build_fonts()->FontDefinitions {
     fonts
 }
 
-/// 各个原生窗口统一使用岛仔品牌图标，避免回落到框架默认图标。
+/// 各个原生窗口统一使用 IslandHop 品牌图标，避免回落到框架默认图标。
 pub fn app_icon()->std::sync::Arc<eframe::egui::IconData>{
     static ICON:std::sync::OnceLock<std::sync::Arc<eframe::egui::IconData>>=std::sync::OnceLock::new();
     ICON.get_or_init(||{
-        let image=image::load_from_memory(include_bytes!("../assets/daozai-logo.png")).expect("岛仔图标资源应有效").thumbnail(128,128).to_rgba8();
+        let image=image::load_from_memory(include_bytes!("../packaging/assets/AppIcon.png")).expect("IslandHop 图标资源应有效").thumbnail(128,128).to_rgba8();
         std::sync::Arc::new(eframe::egui::IconData{width:image.width(),height:image.height(),rgba:image.into_raw()})
     }).clone()
 }

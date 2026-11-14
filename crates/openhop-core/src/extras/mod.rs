@@ -261,6 +261,8 @@ pub struct Hub {
     out: RwLock<Option<Out>>,
     inject: Mutex<Option<Inject>>,
     ui: Mutex<Vec<UiEvent>>,
+    /// IslandHop: 对端发来的岛仔业务状态快照，主线程每秒取走一次。
+    island_states: Mutex<Vec<crate::protocol::IslandSync>>,
     lists: Mutex<BTreeMap<String, Vec<WinInfo>>>,
     viewers: Mutex<HashMap<u64, Viewer>>,
     frames: Condvar,
@@ -362,6 +364,7 @@ impl Hub {
             out: RwLock::new(None),
             inject: Mutex::new(None),
             ui: Mutex::new(vec![]),
+            island_states: Mutex::new(vec![]),
             lists: Mutex::new(BTreeMap::new()),
             viewers: Mutex::new(HashMap::new()),
             frames: Condvar::new(),
@@ -1109,6 +1112,12 @@ impl Hub {
         std::mem::take(&mut *self.ui.lock())
     }
 
+    /// IslandHop: 取走自上次调用以来收到的所有业务状态快照。
+    /// 与 `take_ui()` 不同，这里不做「指针是否在本机」判断——数据必须可靠送达。
+    pub fn take_island_states(&self) -> Vec<crate::protocol::IslandSync> {
+        std::mem::take(&mut *self.island_states.lock())
+    }
+
     fn ui(&self, ev: UiEvent) {
         self.ui.lock().push(ev);
     }
@@ -1602,6 +1611,14 @@ impl Hub {
                     s.stop.store(true, Ordering::SeqCst);
                     s.poke.notify_all();
                 }
+            }
+            // IslandHop: 岛仔业务状态快照只入队，不碰本机系统设置，也不弹通知。
+            // 由 IslandHop 主线程每秒 `take_island_states()` 取走后做 LWW 裁决与落盘。
+            Ext::IslandState(sync) => {
+                let mut q = self.island_states.lock();
+                q.push(sync);
+                // 只保留最新的一批，避免对端疯狂刷状态时无界增长。
+                if q.len() > 32 { q.remove(0); }
             }
             Ext::WinPause { stream, paused, reason } => {
                 if let Some(s) = self.sources.lock().get(&stream) {

@@ -2,10 +2,10 @@
 use eframe::egui;
 use std::{io::{Read, Write}, path::PathBuf, sync::{mpsc::{self, Receiver}, Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 
-const REPOSITORY: &str = "https://github.com/Renly1994/xiaotang-daozai";
-const API: &str = "https://api.github.com/repos/Renly1994/xiaotang-daozai/releases/latest";
-const RELEASES: &str = "https://github.com/Renly1994/xiaotang-daozai/releases/latest";
-const BACKUP_DOWNLOAD: &str = "https://pan.quark.cn/s/0a39b4e1f332";
+const REPOSITORY: &str = "https://github.com/thuki20/IslandHop";
+const API: &str = "https://api.github.com/repos/thuki20/IslandHop/releases/latest";
+const RELEASES: &str = "https://github.com/thuki20/IslandHop/releases/latest";
+const BACKUP_DOWNLOAD: &str = "https://github.com/thuki20/IslandHop/releases/latest";
 
 #[derive(Clone, Debug)]
 struct Release { version: String, notes: String, page: String, package: Option<Package> }
@@ -109,7 +109,7 @@ impl State {
         }).id();
         let installing = self.rx.is_some() && self.cancel.is_none();
         #[allow(unused_mut)]
-        let mut builder=egui::ViewportBuilder::default().with_title("岛仔更新")
+        let mut builder=egui::ViewportBuilder::default().with_title("IslandHop 更新")
                 .with_inner_size([520.0, 416.0]).with_resizable(false).with_decorations(false)
                 .with_transparent(true).with_active(true);
         // macOS 不设窗口图标：eframe 会用它替换 Dock 图标，导致与 bundle 图标不一致。
@@ -154,7 +154,7 @@ impl State {
                             ui.image((logo,egui::vec2(52.0,52.0)));
                             ui.add_space(4.0);
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new("岛仔有新版本了").font(theme::font(21.0,W::Semibold)));
+                                ui.label(egui::RichText::new("IslandHop 有新版本了").font(theme::font(21.0,W::Semibold)));
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new(option_env!("DAOZAI_BUILD_LABEL").unwrap_or(env!("CARGO_PKG_VERSION"))).color(theme::DIM));
                                     ui.label(egui::RichText::new("→").color(theme::DIM));
@@ -212,7 +212,7 @@ impl State {
                         }
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
-                            ui.hyperlink_to(egui::RichText::new("网盘下载").size(11.5).color(theme::BLUE),BACKUP_DOWNLOAD);
+                            ui.hyperlink_to(egui::RichText::new("打开发布页").size(11.5).color(theme::BLUE),BACKUP_DOWNLOAD);
                             ui.label(egui::RichText::new("·").color(theme::DIM));
                             ui.hyperlink_to(egui::RichText::new("浏览器下载").size(11.5).color(theme::GRAY),&release.page);
                             ui.label(egui::RichText::new("·").color(theme::DIM));
@@ -260,7 +260,7 @@ fn clip_update_window(rect: egui::Rect, scale: f32) {
     unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> BOOL {
         let mut title = [0u16; 64];
         let len = GetWindowTextW(hwnd, &mut title) as usize;
-        if String::from_utf16_lossy(&title[..len]) != "岛仔更新" { return BOOL(1); }
+        if String::from_utf16_lossy(&title[..len]) != "IslandHop 更新" { return BOOL(1); }
         let &(rect, scale) = &*(data.0 as *const (egui::Rect, f32));
         let region = update_window_region(rect, scale);
         let old = CreateRectRgn(0, 0, 0, 0);
@@ -303,7 +303,7 @@ fn http_agent() -> Result<ureq::Agent, String> {
 
 fn check() -> Result<Option<Release>, String> {
     let response = http_agent()?
-        .get(API).set("User-Agent", concat!("Daozai/", env!("CARGO_PKG_VERSION")))
+        .get(API).set("User-Agent", concat!("IslandHop/", env!("CARGO_PKG_VERSION")))
         .set("Accept", "application/vnd.github+json").call().map_err(|error| match error {
             ureq::Error::Status(403 | 429, _) => "检查过于频繁，请稍后重试".to_owned(),
             ureq::Error::Status(404, _) => "暂未找到正式版本，请查看发布页".to_owned(),
@@ -316,7 +316,7 @@ fn check() -> Result<Option<Release>, String> {
 
 fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Release>, String> {
     let Some(tag) = parse_release(value, current)? else { return Ok(None); };
-    let name = format!("Daozai-v{}-windows-x64.zip", tag.trim_start_matches('v'));
+    let name = format!("IslandHop-v{}-windows-x64.zip", tag.trim_start_matches('v'));
     let expected = format!("{REPOSITORY}/releases/download/{tag}/{name}");
     let package = value["assets"].as_array().and_then(|assets| assets.iter().find(|asset| asset["name"] == name))
         .and_then(|asset| {
@@ -332,7 +332,7 @@ fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Relea
 
 fn download(release: &Release, tx: &mpsc::Sender<Event>, cancel: &AtomicBool) -> Result<PathBuf, String> {
     let package = release.package.as_ref().ok_or("请通过浏览器下载此版本")?;
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("无法找到更新缓存目录")?.join("Daozai/Updates");
+    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("无法找到更新缓存目录")?.join("IslandHop/Updates");
     let work = root.join(format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
     std::fs::create_dir_all(&work).map_err(|_| "无法创建更新缓存")?;
     let result = (|| {
@@ -506,8 +506,8 @@ mod tests {
     fn only_matching_verified_windows_package_can_install() {
         let mut value = release("v0.6.40");
         value["body"] = "更新说明".into();
-        value["assets"] = serde_json::json!([{"name":"Daozai-v0.6.40-windows-x64.zip",
-            "browser_download_url":format!("{REPOSITORY}/releases/download/v0.6.40/Daozai-v0.6.40-windows-x64.zip"),
+        value["assets"] = serde_json::json!([{"name":"IslandHop-v0.6.40-windows-x64.zip",
+            "browser_download_url":format!("{REPOSITORY}/releases/download/v0.6.40/IslandHop-v0.6.40-windows-x64.zip"),
             "size":123,"digest":format!("sha256:{}", "a".repeat(64))}]);
         let parsed = release_info(&value, "0.6.39").unwrap().unwrap();
         assert!(parsed.package.is_some()); assert_eq!(parsed.notes, "更新说明");

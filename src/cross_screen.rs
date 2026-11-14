@@ -17,7 +17,7 @@
 
 use eframe::egui::{self, Color32, RichText, Ui};
 use openhop_core::platform;
-use openhop_core::protocol::{DEFAULT_PORT, DISCOVERY_PORT};
+use openhop_core::protocol::{Ext, IslandSync, DEFAULT_PORT, DISCOVERY_PORT};
 use openhop_core::{Config, Engine, Role, Status};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -71,6 +71,49 @@ pub fn with<R>(f: impl FnOnce(&mut CrossScreen) -> R) -> R {
 /// 渲染在岛仔「设置 → 局域网跨屏」分组里。
 pub fn settings_ui(ui: &mut Ui) {
     with(|cross| cross.render(ui));
+}
+
+// ---------------- IslandHop 业务状态同步 ----------------
+// 复用 OpenHop 已经建好的加密 TCP 连接（`Msg::Ext` / `Hub::tell`），
+// 不另起端口、不复制一份发现/配对/转发逻辑。以下三个函数由
+// `sync_state::SyncManager` 在应用主线程的 1 秒轮询里调用；Engine 是
+// !Send，只能待在 thread_local 里，所以不要把它们挪到后台线程。
+
+/// 把本机岛仔业务状态快照广播给所有对端（`to="*"`，Server 自动转发）。
+/// 返回 false 表示引擎未启动，调用方应保留脏标记，连上后重发。
+pub fn sync_broadcast(rev: u64, updated_at: i64, payload: String) -> bool {
+    with(|cross| {
+        let Some(engine) = &cross.engine else { return false; };
+        let sync = IslandSync {
+            device: cross.cfg.name.clone(),
+            rev,
+            updated_at,
+            payload,
+        };
+        engine.hub().tell("*", Ext::IslandState(sync));
+        true
+    })
+}
+
+/// 取走自上次调用以来收到的所有对端快照。
+pub fn sync_inbox() -> Vec<IslandSync> {
+    with(|cross| cross.engine.as_ref().map(|e| e.hub().take_island_states()).unwrap_or_default())
+}
+
+/// 本机在局域网里的设备名，用于过滤自己广播出去的回声。
+pub fn sync_device() -> String {
+    with(|cross| cross.cfg.name.clone())
+}
+
+/// `(已连接对端数, 本机是否为主设备 Server)`。主设备在 rev 相同时胜出。
+pub fn sync_link() -> (usize, bool) {
+    with(|cross| match &cross.engine {
+        Some(e) => {
+            let s = e.status();
+            (s.peers.len(), matches!(s.role, Role::Server))
+        }
+        None => (0, false),
+    })
 }
 
 /// 打开设置窗口并跳到跨屏分组（热键 / 启动参数用）。
@@ -255,6 +298,8 @@ impl CrossScreen {
         ui.add_space(10.0);
         self.view_canvas(ui, status.as_ref(), &mut actions);
         ui.add_space(8.0);
+        self.view_data_sync(ui);
+        ui.add_space(8.0);
 
         egui::CollapsingHeader::new("高级设置 · 角色 / 名称 / 口令 / 权限")
             .default_open(false).show(ui, |ui| {
@@ -273,6 +318,17 @@ impl CrossScreen {
             });
 
         for action in actions { self.handle(action); }
+    }
+
+    /// 两台电脑互联后的业务数据同步状态（喝水/天气/久坐/待办/账号清单）。
+    fn view_data_sync(&self, ui: &mut Ui) {
+        ui.label(RichText::new("双机数据同步").size(13.0).strong());
+        ui.label(RichText::new(format!("● {}", crate::sync_state::status_text()))
+            .size(11.5)
+            .color(Color32::from_rgb(76, 209, 160)));
+        ui.label(RichText::new("喝水 / 天气 / 久坐 / 待办 / 账号清单自动互通；登录凭据与本机路径留在各自电脑")
+            .size(10.0)
+            .color(ui.visuals().weak_text_color()));
     }
 
     fn theme_colors(ui: &Ui) -> (Color32, Color32, Color32, Color32) {
@@ -348,7 +404,7 @@ impl CrossScreen {
                     egui::Stroke::new(2.0, if done[i] { green } else { idle }));
             }
             p.circle_filled(egui::pos2(cx, cy), 9.0, if done[i] { green } else { idle });
-            // 岛仔自定义 CJK 字体缺 U+2713，之前画「✓」会变成豆腐块，改用白色内点。
+            // IslandHop自定义 CJK 字体缺 U+2713，之前画「✓」会变成豆腐块，改用白色内点。
             p.circle_filled(egui::pos2(cx, cy), 3.0, Color32::WHITE);
             p.text(egui::pos2(cx, rect.top() + 36.0), egui::Align2::CENTER_CENTER, labels[i],
                 egui::FontId::proportional(11.0), if done[i] { strong } else { ui.visuals().weak_text_color() });
@@ -672,7 +728,7 @@ impl CrossScreen {
         } else {
             ui.label(RichText::new("IslandHop 使用独立端口 24950/24951 与独立配置目录，可与旧版 OpenHop 并存；但两者都会注入键鼠事件，实际跨屏时请只启用其中一个。").size(10.5));
         }
-        ui.label(RichText::new("提示：岛仔自带的剪贴板历史会把对端同步过来的内容也记一条，属正常现象，不会形成同步循环（引擎内部已做回声抑制）。").size(10.0));
+        ui.label(RichText::new("提示：应用自带的剪贴板历史会把对端同步过来的内容也记一条，属正常现象，不会形成同步循环（引擎内部已做回声抑制）。").size(10.0));
         ui.label(RichText::new(format!("配置文件：{}", self.path.display())).size(9.5));
     }
 }

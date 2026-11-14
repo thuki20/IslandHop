@@ -5810,9 +5810,7 @@ fn about_support_preview() {
             let child=output.lock().unwrap().take().unwrap();
             raster.update_textures(&root.textures_delta);raster.update_textures(&child.textures_delta);
             if frame==3 {
-                let has_wechat=child.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text()=="微信支付"));
-                assert_eq!(has_wechat,open);
-                for label in [if open{"返回"}else{"请喝咖啡 · 支持作者"},"完全自愿 · 感谢每一份支持 · 不影响功能使用"] {
+                for label in ["IslandHop · 你的桌面灵动岛","IslandHop 全部功能 + 局域网键鼠共享"] {
                     let shape=child.shapes.iter().find(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text()==label)).expect("按钮和说明必须可见");
                     assert!(shape.clip_rect.contains_rect(shape.shape.visual_bounding_rect()),"默认窗口中内容不能被裁切：{label}");
                 }

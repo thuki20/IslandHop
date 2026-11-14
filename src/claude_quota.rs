@@ -173,7 +173,7 @@ mod tests {
         // 退出只保存窗口状态，账号标识没有变化。
         fs::write(&path,json!({"lastKnownAccountUuid":"owner","windowBounds":{"width":1200}}).to_string()).unwrap();
         let (_,after)=desktop_record(&path,Some(&saved),&cache).expect("已绑定账号退出后仍应显示自己的历史记录");assert_eq!((after.at,&after.windows),(before.at,&before.windows));assert_eq!(fs::read_to_string(dir.join(HISTORY)).unwrap(),history);
-        let (_,restored)=desktop_record(&path,Some(&saved.clone()),&cache).unwrap();assert_eq!((restored.at,&restored.windows),(before.at,&before.windows),"岛仔重新启动后也应保留历史额度");
+        let (_,restored)=desktop_record(&path,Some(&saved.clone()),&cache).unwrap();assert_eq!((restored.at,&restored.windows),(before.at,&before.windows),"IslandHop重新启动后也应保留历史额度");
         fs::write(&path,json!({"lastKnownAccountUuid":"different-owner"}).to_string()).unwrap();assert!(fetch(&saved).is_err(),"真正切换账号后不能继续读取当前来源的历史");let _=fs::remove_dir_all(dir);
     }
     #[test]

@@ -31,7 +31,7 @@ try {
         else { $NsisCompiler = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe' }
     }
     if (-not (Test-Path -LiteralPath $NsisCompiler)) { throw 'NSIS compiler not found; install NSIS or pass -NsisCompiler' }
-    $packageName = "Daozai-v$version-windows-x64"
+    $packageName = "IslandHop-v$version-windows-x64"
     if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot 'dist' }
     $outputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
     $stagingDirectory = Join-Path $outputDirectory $packageName

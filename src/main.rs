@@ -96,6 +96,8 @@ struct Shell {
     /// IslandHop：macOS 后台采样线程的最新快照 + 接收端。
     #[cfg(target_os = "macos")]
     mac_sys: (daozai::macos_sys::Snapshot, std::sync::mpsc::Receiver<daozai::macos_sys::Snapshot>),
+    /// IslandHop：两台电脑互联后同步岛仔业务数据（主设备 → 从设备，LWW 裁决）。
+    sync: daozai::sync_state::SyncManager,
 }
 
 const MODULE_OFF:&str="该功能已在「页面管理」中关闭";
@@ -232,6 +234,7 @@ impl Shell {
             elevated: false,
             #[cfg(target_os = "macos")]
             mac_sys,
+            sync: daozai::sync_state::SyncManager::new(),
         }
     }
 
@@ -379,7 +382,7 @@ impl eframe::App for Shell {
         if guarded && !self.guard_notified {
             // 资源保护熔断：停止音乐会话轮询（含封面、网易云日志）与歌词查询，保住用户电脑，重启后恢复。
             self.guard_notified=true;self.app.opts.fetch_lyrics=false;
-            self.app.alert("岛仔已暂停音乐功能","检测到资源占用异常，已暂停读取音乐信息和歌词。重启岛仔即可恢复；诊断记录在数据目录的 diagnostics 文件夹。",0,false);
+            self.app.alert("IslandHop已暂停音乐功能","检测到资源占用异常，已暂停读取音乐信息和歌词。重启IslandHop即可恢复；诊断记录在数据目录的 diagnostics 文件夹。",0,false);
         }
         self.media_enabled.store(self.app.settings.visible_pages[0] && !guarded,std::sync::atomic::Ordering::Relaxed);
         if self.media_fast_until.is_some_and(|until|Instant::now()>=until){self.media_fast_until=None;}
@@ -567,6 +570,9 @@ impl eframe::App for Shell {
             self.mac_cursor = daozai::mac_window::cursor_local(ctx.pixels_per_point());
         }
         let env = self.env(ctx);
+        // IslandHop：跨设备业务状态同步。引擎在 thread_local 里（!Send），
+        // 只能在主线程的 1 秒轮询里收发；放在 app.frame 之前，保证本帧就显示新数据。
+        self.sync.tick(&mut self.app, &env.today, env.t);
         self.reconcile_modules(ctx);
         // v0.5.5 邮件：开关 / 间隔 / 账号清单变了就重新对齐收信线程，再把事件交给界面。
         // 每帧只比较不复制，确有变化时才复制账号清单。
@@ -678,7 +684,7 @@ impl eframe::App for Shell {
                         self.app.save_window_before_exit();
                         #[cfg(windows)] if let Some(tray)=&self.tray {tray.exit_process();}
                         std::process::exit(0);
-                    }else{self.app.say("无法重新启动岛仔，请从托盘退出后手动打开");}
+                    }else{self.app.say("无法重新启动IslandHop，请从托盘退出后手动打开");}
                 }
                 Cmd::Open(p) => {if let Err(e)=open_path(&p){self.app.say(e);}},
                 Cmd::OpenUrl(url)=>{
@@ -779,7 +785,8 @@ impl eframe::App for Shell {
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         // 穿透时主窗口收不到 mousemove，用 20fps 轮询全局坐标以保证移回岛上立即恢复。
         #[cfg(not(windows))] let repaint_after=if passthrough{Duration::from_millis(50)}else{out.repaint_after};
-        schedule_repaint(ctx,repaint_after);
+        // 双机数据同步需要无交互时也每秒醒一次，取两者较小值。
+        schedule_repaint(ctx,repaint_after.min(Duration::from_secs(1)));
     }
 }
 
@@ -972,7 +979,7 @@ mod open_path_tests {
 
     #[test]
     fn unassociated_files_offer_open_with_and_cancellation_is_normal(){
-        let path=std::env::temp_dir().join(format!("岛仔 无关联-{}.daozai-open-test",std::process::id()));
+        let path=std::env::temp_dir().join(format!("IslandHop 无关联-{}.daozai-open-test",std::process::id()));
         std::fs::write(&path,b"fixture").unwrap();
         for cancel in [false,true]{
             let mut chosen=false;
@@ -1013,7 +1020,7 @@ fn main() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            diagnostics::report("岛仔启动或运行失败。", &error.to_string());
+            diagnostics::report("IslandHop启动或运行失败。", &error.to_string());
             std::process::ExitCode::FAILURE
         }
     }
@@ -1026,7 +1033,7 @@ fn run() -> eframe::Result<()> {
     #[cfg(windows)]
     if !daozai::tray::single_instance() {
         if !daozai::tray::activate_existing(std::env::args().any(|arg|arg=="--calendar")) {
-            diagnostics::report("岛仔已在运行，但暂时无法打开窗口。\n请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe 后重试。", "已有实例可能正在启动或已无响应。请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe，再重新启动。");
+            diagnostics::report("IslandHop已在运行，但暂时无法打开窗口。\n请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe 后重试。", "已有实例可能正在启动或已无响应。请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe，再重新启动。");
         }
         return Ok(());
     }

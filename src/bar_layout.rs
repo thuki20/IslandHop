@@ -41,6 +41,8 @@ pub(crate) struct Layout {
     pub x: Vec<Option<f32>>,
     pub widths:Vec<f32>,
     quotas:usize,
+    /// macOS 刘海机型：常驻行整体下移的距离（0 = 无刘海，Windows 永远是 0）。
+    pub notch_y: f32,
 }
 
 impl Layout {
@@ -72,7 +74,7 @@ impl Layout {
         }
         let width=cursor-12.0+16.0;
         for value in x.iter_mut().flatten() {*value-=width/2.0;}
-        Self {width:width.max(96.0),x,widths,quotas}
+        Self {width:width.max(96.0),x,widths,quotas,notch_y:0.0}
     }
     pub fn quota_slots(&self)->impl Iterator<Item=usize> { (0..self.quotas).map(quota_slot) }
     /// 把某个槽加宽 extra：其余槽对称让位并记入总宽。点数文字、时段时钟、天气温度共用。
@@ -125,6 +127,35 @@ impl Layout {
             cursor += w + SPACE;
         }
         self.width = gap + 2.0 * (PAD + EDGE) + left_w + right_w;
+    }
+    /// **macOS 刘海机型专用**（Windows / 无刘海机型不调用）。
+    ///
+    /// 与 `notch_split` 的「左右分列、中间留洞」不同，这里改成真正的 macOS 灵动岛：
+    /// 岛体向下延长，常驻内容排成**一整行放到刘海下方**（物理刘海下面那块可见区域），
+    /// 而不是挤在顶部菜单栏里被刘海挡住。中心区域不再放任何图标。
+    ///
+    /// 另外隐藏时钟：macOS 右上角系统菜单栏本来就显示时间，刘海里不重复显示。
+    pub fn notch_shelf(&mut self, gap: f32, notch_h: f32) {
+        // 时间交给系统菜单栏，刘海里的时钟槽位直接撤掉（天气徽标保留）。
+        self.x[CLOCK] = None;
+        const EDGE: f32 = 16.0;
+        const SPACE: f32 = 12.0;
+        let mut items: Vec<(usize, f32, f32)> = self.x.iter().enumerate()
+            .filter_map(|(i, x)| x.map(|cx| (i, cx, self.widths.get(i).copied().unwrap_or(0.0))))
+            .collect();
+        if items.is_empty() { return; }
+        items.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let row_w: f32 = items.iter().map(|(_, _, w)| *w).sum::<f32>()
+            + SPACE * items.len().saturating_sub(1) as f32;
+        let mut cursor = -row_w / 2.0;
+        for &(i, _, w) in &items {
+            self.x[i] = Some(cursor + w / 2.0);
+            cursor += w + SPACE;
+        }
+        // 胶囊至少覆盖整个物理刘海宽度，看起来才像从刘海长出来的岛；
+        // 同时不超过透明画布，避免被裁切。
+        self.width = (row_w + 2.0 * EDGE).max(gap).min(crate::app::WIN_W - 32.0);
+        self.notch_y = notch_h + 6.0;
     }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}

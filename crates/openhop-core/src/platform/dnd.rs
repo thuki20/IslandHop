@@ -483,20 +483,25 @@ mod imp {
     }
 
     pub fn drag_files() -> Option<Vec<PathBuf>> {
-        let pb = drag_pb();
-        // The drag pasteboard keeps the last drag's contents: only use it if a
-        // new drag has started since the button went down.
-        if pb.changeCount() == DOWN_COUNT.load(Ordering::SeqCst) {
-            return None;
-        }
-        let items = pb.pasteboardItems()?;
-        let mut out = Vec::new();
-        for item in items.iter() {
-            if let Some(s) = item.stringForType(unsafe { NSPasteboardTypeFileURL }) {
-                out.extend(parse_uri_list(&s.to_string()));
+        // 引擎线程里调 AppKit 必须包 autorelease pool：pasteboardItems 内部走
+        // readObjectsForClasses 快速枚举，无池时对象生命周期失控会直接段错误
+        // （实测 SIGSEGV @ objc_opt_class 0x1e）。
+        objc2::rc::autoreleasepool(|_| {
+            let pb = drag_pb();
+            // The drag pasteboard keeps the last drag's contents: only use it if a
+            // new drag has started since the button went down.
+            if pb.changeCount() == DOWN_COUNT.load(Ordering::SeqCst) {
+                return None;
             }
-        }
-        Some(out)
+            let items = pb.pasteboardItems()?;
+            let mut out = Vec::new();
+            for item in items.iter() {
+                if let Some(s) = item.stringForType(unsafe { NSPasteboardTypeFileURL }) {
+                    out.extend(parse_uri_list(&s.to_string()));
+                }
+            }
+            Some(out)
+        })
     }
 
     /// Not yet on macOS: the files land in Downloads › OpenHop and on the clipboard.

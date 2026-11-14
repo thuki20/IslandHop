@@ -72,11 +72,11 @@ try {
     } catch { $info.EventQuery = '无法读取 Windows 事件记录' }
     Save-Text 'environment.json' ($info | ConvertTo-Json -Depth 7)
     New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-    $archive = Join-Path $OutputDirectory ('岛仔诊断-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.zip')
+    $archive = Join-Path $OutputDirectory ('IslandHop诊断-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.zip')
     Compress-Archive -Path (Join-Path $collectionRoot '*') -DestinationPath $archive
     Write-Output ('诊断包已保存：' + $archive)
-    Write-Output '请将诊断包发给开发者，并说明异常出现时间、重启岛仔能否恢复、是否发生在睡眠唤醒后。'
-    Write-Output '仅收集指定诊断日志、显示设置、系统与显卡信息及岛仔崩溃事件；不会自动上传。'
+    Write-Output '请将诊断包发给开发者，并说明异常出现时间、重启IslandHop能否恢复、是否发生在睡眠唤醒后。'
+    Write-Output '仅收集指定诊断日志、显示设置、系统与显卡信息及IslandHop崩溃事件；不会自动上传。'
 } finally {
     Get-ChildItem -LiteralPath $collectionRoot -File | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
     Remove-Item -LiteralPath $collectionRoot -Force
