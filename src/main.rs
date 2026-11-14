@@ -639,6 +639,23 @@ impl eframe::App for Shell {
             let mut hits = vec![out.hit];
             hits.extend(out.notice_hit);
             hits.extend(out.file_drop_zone);
+            // IslandHop：把这些命中区注册成引擎的「UI 排除区」——岛体/面板贴在
+            // 跨屏边缘上，光标在其上不能被引擎当作跨屏意图 grab 输入。
+            #[cfg(target_os = "macos")]
+            if let Some((ox, oy)) = daozai::mac_window::window_origin_top_left() {
+                // hits 是窗口本地 egui 逻辑点；macOS 上 egui 逻辑点与屏幕点 1:1
+                // （AppKit point == winit logical pixel，见 cursor_local 注释），
+                // 窗口原点也是屏幕点，直接相加即可，不要乘 pixels_per_point。
+                let live: Vec<_> = hits.iter().copied().filter(|r| r.is_positive() && r.width() > 1.0).collect();
+                if let (Some(min), Some(max)) = (
+                    live.iter().map(|r| r.min).fold(None, |acc: Option<egui::Pos2>, p| Some(acc.map_or(p, |a| egui::Pos2::new(a.x.min(p.x), a.y.min(p.y))))),
+                    live.iter().map(|r| r.max).fold(None, |acc: Option<egui::Pos2>, p| Some(acc.map_or(p, |a| egui::Pos2::new(a.x.max(p.x), a.y.max(p.y))))),
+                ) {
+                    let rect=[(ox + min.x) as i32, (oy + min.y) as i32,
+                        (max.x - min.x) as i32, (max.y - min.y) as i32];
+                    openhop_core::platform::set_ui_exclude(Some(rect));
+                }
+            }
             daozai::mac_window::sync_passthrough(self.mac_cursor, &hits)
         };
         for cmd in out.cmds {

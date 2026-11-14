@@ -1489,6 +1489,12 @@ impl Server {
         match (ev, self.active) {
             (InputEvent::LocalMove { x, y }, None) => {
                 self.last_local = (x, y);
+                // IslandHop：宿主自己的 UI（顶边岛体/面板）压在跨屏边缘上，
+                // 光标在其上不是「要跨屏」——否则引擎会 grab 输入导致 UI 点不动。
+                if platform::in_ui_exclude(x, y) {
+                    self.edge_wait = None;
+                    return;
+                }
                 let screen = self.capture.screen();
                 let Some(side) = touching_edge_mon(&screen, &platform::monitors(), x, y) else {
                     self.edge_wait = None;
@@ -1968,6 +1974,17 @@ impl Server {
         }
         if self.local_inj.is_none() && to_peer.is_none() {
             return;
+        }
+        // IslandHop：远端要接管本机屏幕时，若本地光标正停在宿主 UI（岛体/面板，
+        // UI 排除区）上，说明本地用户正在操作自己的界面——此时注入会把光标拽走，
+        // 毁掉进行中的点击/拖拽。拒绝这次接管，等本地用户离开 UI 再说。
+        if to_peer.is_none() {
+            if let Some((cx, cy)) = platform::cursor_pos() {
+                if platform::in_ui_exclude(cx, cy) {
+                    log::debug!("refuse takeover: local pointer is on host UI");
+                    return;
+                }
+            }
         }
         // Whoever was driving stops.
         let r = self.capture.screen();
@@ -3259,7 +3276,14 @@ impl Client {
                         link.send(Msg::LocalPos { x: x - screen.x, y: y - screen.y });
                     }
                 }
-                match touching_edge_mon(&screen, &platform::monitors(), x, y) {
+                let edge = if platform::in_ui_exclude(x, y) {
+                    // IslandHop：宿主 UI 保护区内的光标不算边缘命中。
+                    self.edge_wait = None;
+                    None
+                } else {
+                    touching_edge_mon(&screen, &platform::monitors(), x, y)
+                };
+                match edge {
                     Some(side) => {
                         let frac = edge_fraction(&screen, side, x, y);
                         // Not from corners or a pinned pointer;

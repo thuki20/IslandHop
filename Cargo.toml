@@ -44,6 +44,9 @@ imap-proto = { path = "vendor/imap-proto" }
 eframe = { path = "vendor/eframe" }
 egui = { path = "vendor/egui" }
 ureq = { path = "vendor/ureq" }
+# IslandHop：macOS 穿透恢复瞬间 CursorLeft 清空指针位置，mouseDown 会被整体丢弃
+# （岛内按钮点不动）。补丁在 MouseInput 分支用 NSEvent 全局位置兜底。
+egui-winit = { path = "vendor/egui-winit" }
 
 [dependencies]
 openhop-core = { path = "crates/openhop-core" }

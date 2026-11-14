@@ -373,3 +373,24 @@ impl WheelAccum {
         (nx, ny)
     }
 }
+
+/// IslandHop：宿主 UI 保护区（全局屏幕坐标，`[x, y, w, h]`）。
+///
+/// 岛体/面板贴在屏幕顶边 —— 那同时也是跨屏边缘。光标在 UI 上悬停会被
+/// 误判为「要跨屏」而 grab 本地输入，宿主窗口的点击全部失效。引擎在
+/// 边缘检测前先查这里，区内一律不算边缘命中。
+static UI_EXCLUDE: std::sync::Mutex<Option<[i32; 4]>> = std::sync::Mutex::new(None);
+
+pub fn set_ui_exclude(rect: Option<[i32; 4]>) {
+    if let Ok(mut slot) = UI_EXCLUDE.lock() {
+        *slot = rect;
+    }
+}
+
+pub fn in_ui_exclude(x: i32, y: i32) -> bool {
+    UI_EXCLUDE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.map(|[x0, y0, w, h]| x >= x0 && x < x0 + w && y >= y0 && y < y0 + h))
+        .unwrap_or(false)
+}

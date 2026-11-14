@@ -45,7 +45,13 @@ pub fn cursor_local(_ppp: f32) -> Option<eframe::egui::Pos2> { None }
 #[cfg(target_os = "macos")]
 pub fn sync_passthrough(cursor: Option<eframe::egui::Pos2>, hits: &[eframe::egui::Rect]) -> bool {
     let inside = cursor.is_some_and(|p| hits.iter().any(|r| r.expand(10.0).contains(p)));
-    imp::set_passthrough(!inside);
+    let recovered = imp::set_passthrough(!inside);
+    if recovered {
+        // 穿透期间系统丢弃了全部 mouseMoved：恢复接收后 egui 没有指针位置，
+        // press 起点缺失 → click 永远判定失败（「岛内按钮点不动」根因之一）。
+        // 这里补发一条当前位置的 mouseMoved 让 egui 重建指针状态。
+        imp::synthesize_mouse_moved();
+    }
     !inside
 }
 
@@ -203,11 +209,63 @@ mod imp {
         Some(Pos2::new(x as f32, y as f32))
     }
 
-    pub fn set_passthrough(ignore: bool) {
+    pub fn set_passthrough(ignore: bool) -> bool {
         let ns = window();
-        if ns.is_null() { return }
-        if IGNORING.swap(ignore, Ordering::Relaxed) == ignore { return }
+        if ns.is_null() { return false }
+        // 返回是否发生了「穿透 → 接收」切换（调用方需要补发 mouseMoved）。
+        let was_ignoring = IGNORING.swap(ignore, Ordering::Relaxed);
+        if was_ignoring == ignore { return false }
         let value = if ignore { Bool::YES } else { Bool::NO };
         unsafe { let _: () = msg_send![ns, setIgnoresMouseEvents: value]; }
+        was_ignoring && !ignore
+    }
+
+    /// 合成一条当前位置的 `kCGEventMouseMoved`。窗口恢复接收事件的瞬间调用，
+    /// 让 winit/egui 立刻拿到指针位置（否则 press 无起点，click 判定失败）。
+    pub fn synthesize_mouse_moved() {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventCreateMouseEvent(source: *mut c_void, mouse_type: u32, cursor: CGPoint, button: u32) -> *mut c_void;
+            fn CGEventPost(tap: u32, event: *mut c_void);
+            fn CFRelease(cf: *mut c_void);
+        }
+        #[repr(C)]
+        struct CGPoint { x: CGFloat, y: CGFloat }
+        unsafe {
+            let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            if screen.is_null() { return }
+            let frame: NSRect = msg_send![screen, frame];
+            // AppKit 坐标系原点在左下，CoreGraphics 在左上。
+            let pt = CGPoint { x: mouse.x, y: frame.origin.y + frame.size.height - mouse.y };
+            // kCGEventMouseMoved = 5, kCGHIDEventTap = 0, kCGMouseButtonLeft = 0
+            let ev = CGEventCreateMouseEvent(std::ptr::null_mut(), 5, pt, 0);
+            if !ev.is_null() {
+                CGEventPost(0, ev);
+                CFRelease(ev);
+            }
+        }
+    }
+
+    /// 主窗口左上角的全局逻辑坐标（AppKit 左下原点已换算）。
+    /// 供引擎「UI 排除区」使用：岛体在跨屏边缘上，不能当作跨屏意图。
+    pub fn window_origin_top_left() -> Option<(f32, f32)> {
+        let ns = window();
+        if ns.is_null() { return None }
+        unsafe {
+            let frame: NSRect = msg_send![ns, frame];
+            let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            if screen.is_null() { return None }
+            let sf: NSRect = msg_send![screen, frame];
+            let top = sf.origin.y + sf.size.height - frame.origin.y - frame.size.height;
+            Some((frame.origin.x as f32, top as f32))
+        }
     }
 }
+
+/// 主窗口左上角的全局逻辑坐标（顶层转发，实现见 `imp`）。
+#[cfg(target_os = "macos")]
+pub fn window_origin_top_left() -> Option<(f32, f32)> { imp::window_origin_top_left() }
+
+#[cfg(not(target_os = "macos"))]
+pub fn window_origin_top_left() -> Option<(f32, f32)> { None }
