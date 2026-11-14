@@ -278,7 +278,13 @@ impl Shell {
         let origin = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min).unwrap_or(Pos2::new(self.win_x, 0.0));
         #[cfg(windows)]
         let origin=self.native.as_ref().and_then(|w|w.logical_origin(ppp)).unwrap_or(origin);
+        #[cfg(windows)]
         let cursor = cursor_logical(ppp).map(|(x, y)| Pos2::new(x - origin.x, y - origin.y));
+        // macOS：egui 的指针坐标本身就是窗口本地逻辑坐标（已实测与 Windows 路径一致），
+        // 直接取用。上游 `cursor_logical` 只有 Windows 实现，Mac 上恒 None 会导致
+        // `inside` 永远为 false，岛完全无法悬停展开/交互。
+        #[cfg(not(windows))]
+        let cursor = ctx.input(|i| i.pointer.latest_pos());
         // 所在屏幕换算到窗口逻辑坐标，供通知详情等浮层避开屏幕边缘。
         #[cfg(windows)]
         let screen=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id).map(|d|{
