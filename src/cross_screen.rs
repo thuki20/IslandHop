@@ -292,16 +292,19 @@ impl CrossScreen {
         p.text(rect.min + egui::vec2(80.0, 9.0), egui::Align2::LEFT_TOP,
             "局域网键鼠共享 / 剪贴板同步", egui::FontId::proportional(14.0), strong);
         let (dot, line) = match status {
-            Some(s) => (green, format!("● 运行中 · {:?} · {} · TCP {}", s.role, s.name, s.port)),
+            Some(s) => (green, format!("● 运行中 · {:?} · TCP {}", s.role, s.port)),
             None => (Color32::from_rgb(215, 85, 80), "● 未启动 · 打开左侧开关即可启用".into()),
         };
         p.text(rect.min + egui::vec2(80.0, 30.0), egui::Align2::LEFT_TOP, line,
             egui::FontId::proportional(11.5), dot);
         let _ = text;
         if let Some(s) = status {
-            let tail = format!("已连接 {} 台 · {}", s.peers.len(),
-                s.addresses.first().cloned().unwrap_or_default());
-            p.text(rect.right_bottom() + egui::vec2(-12.0, -9.0), egui::Align2::RIGHT_BOTTOM, tail,
+            // 两行各自「左标题 / 右状态」，避免长状态串把右侧小字压掉（旧版重叠）。
+            p.text(rect.right_top() + egui::vec2(-12.0, 11.0), egui::Align2::RIGHT_TOP,
+                format!("已连接 {} 台", s.peers.len()), egui::FontId::proportional(10.0),
+                ui.visuals().weak_text_color());
+            let ip = s.addresses.first().cloned().unwrap_or_default();
+            p.text(rect.right_top() + egui::vec2(-12.0, 32.0), egui::Align2::RIGHT_TOP, ip,
                 egui::FontId::proportional(9.5), ui.visuals().weak_text_color());
         }
     }
