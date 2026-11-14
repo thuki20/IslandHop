@@ -31,6 +31,13 @@ pub fn elevate(frame: &eframe::Frame) -> bool {
         let _: () = objc2::msg_send![ns, setCollectionBehavior: (1usize | 16 | 256)];
         let _: () = objc2::msg_send![ns, setHasShadow: Bool::NO];
         let _: () = objc2::msg_send![ns, setOpaque: Bool::NO];
+        // 启动反馈：上游 `with_active(false)` 会让 macOS 完全不激活本应用，
+        // 用户双击后看不到任何变化（无菜单栏切换、无 Dock 弹跳），体感是「打不开」。
+        // 这里激活一次：菜单栏切到本应用、Dock 图标亮起，作为「已成功打开」的明确信号。
+        let app: *mut AnyObject = objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        if !app.is_null() {
+            let _: () = objc2::msg_send![app, activateIgnoringOtherApps: Bool::YES];
+        }
     }
     true
 }
