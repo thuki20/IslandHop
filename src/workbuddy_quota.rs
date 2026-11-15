@@ -178,7 +178,8 @@ pub fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>
     }
     Err(("WorkBuddy 登录已过期或尚未连接，请点击重新连接".into(),60))
 }
-#[cfg(windows)]
+// 官网浏览器登录双平台可用：Windows 用 ShellExecute 打开默认浏览器，
+// macOS 用 `open`。登录会话由各平台安全存储（DPAPI / 钥匙串）保存。
 #[path="workbuddy_login.rs"]
 mod login;
 
@@ -192,13 +193,12 @@ impl Connect {
         let worker_cancel=cancel.clone();
         std::thread::spawn(move||{let result=(||{
             let local=local_snapshot(&super::http_agent(),expected.as_deref());
-            #[cfg(windows)]
+            // Windows：本机 WorkBuddy 客户端登录文件明文可读，优先直取；
+            // macOS：客户端令牌经 $wbEncrypted 加密，直取必然失败，走官网浏览器授权。
             let (slot,snapshot)=match local{
                 Ok(result)=>result,
                 Err(_)=>login::connect(expected.as_deref(),worker_cancel)?,
             };
-            #[cfg(not(windows))]
-            let (slot,snapshot):(String,Snapshot)=return Err("WorkBuddy 登录暂仅支持 Windows".into());
             Ok(Connected{slot,label:if alias.trim().is_empty(){"WorkBuddy".into()}else{alias.trim().into()},snapshot})
         })();let _=tx.send(result);});Self{rx,cancel}
     }

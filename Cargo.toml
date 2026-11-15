@@ -7,13 +7,13 @@ exclude = ["vendor"]
 
 [workspace.package]
 # 与 [package] version 保持一致：scripts/package.ps1 用「第一个 ^version =」正则取版本号。
-version = "0.6.73"
+version = "0.6.74"
 edition = "2021"
 license = "MIT"
 
 [package]
 name = "daozai"
-version = "0.6.73"
+version = "0.6.74"
 edition = "2021"
 license = "MIT"
 description = "IslandHop：全量派生自岛仔的桌面岛，集成 OpenHop 局域网键鼠共享与剪贴板同步"

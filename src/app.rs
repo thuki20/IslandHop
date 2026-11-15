@@ -1771,8 +1771,8 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠，
-        // 右=AI额度+天气（+音乐/专注/铃铛）；时钟隐藏。刘海机型中间留物理空洞，
+        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠+天气，
+        // 右=AI额度（+音乐/专注/铃铛）；时钟隐藏。刘海机型中间留物理空洞，
         // 胶囊机型用固定间距替代。Windows 与测试环境（menu_bar_height=None）不启用。
         if !self.side() && !self.effective_minimal() && !self.island_lyrics_active()
             && crate::mac_window::menu_bar_height().is_some() {

@@ -84,7 +84,49 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
         let bytes=std::slice::from_raw_parts(output.pbData,output.cbData as usize).to_vec();let _=LocalFree(HLOCAL(output.pbData.cast()));Ok(bytes)
     }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
+    // macOS：密钥存钥匙串（Daozai.SessionKey），数据用 AES-256-GCM 落盘——
+    // 与 Windows DPAPI 同级：凭据绑定本机钥匙串，文件本身不可读。
+    use base64::Engine;
+    use ring::aead::{Aad,LessSafeKey,Nonce,UnboundKey,AES_256_GCM};
+    use ring::rand::SecureRandom;
+    use std::sync::OnceLock;
+    const MAGIC:&[u8;6]=b"WBMAC1";
+    static KEY:OnceLock<Result<[u8;32],String>>=OnceLock::new();
+    let key=KEY.get_or_init(||{
+        let entry=keyring::Entry::new("Daozai.SessionKey","v1").map_err(|e|format!("无法访问钥匙串：{e}"))?;
+        match entry.get_password(){
+            Ok(stored)=>{
+                let bytes=base64::engine::general_purpose::STANDARD.decode(stored).map_err(|_|"钥匙串会话密钥无效".to_string())?;
+                if bytes.len()!=32 {return Err("钥匙串会话密钥无效".into());}
+                let mut key=[0u8;32];key.copy_from_slice(&bytes);Ok(key)
+            },
+            Err(keyring::Error::NoEntry)=>{
+                let mut key=[0u8;32];ring::rand::SystemRandom::new().fill(&mut key).map_err(|_|"无法生成会话密钥".to_string())?;
+                entry.set_password(&base64::engine::general_purpose::STANDARD.encode(key)).map_err(|e|format!("无法保存会话密钥：{e}"))?;
+                Ok(key)
+            },
+            Err(e)=>Err(format!("无法读取会话密钥：{e}")),
+        }
+    }).clone()?;
+    let unbound=UnboundKey::new(&AES_256_GCM,&key).map_err(|_|"会话密钥无效".to_string())?;
+    if encrypt{
+        let mut nonce=[0u8;12];ring::rand::SystemRandom::new().fill(&mut nonce).map_err(|_|"无法加密登录会话".to_string())?;
+        let mut data=raw.to_vec();
+        LessSafeKey::new(unbound).seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce),Aad::empty(),&mut data).map_err(|_|"无法加密登录会话".to_string())?;
+        let mut out=MAGIC.to_vec();out.extend_from_slice(&nonce);out.extend_from_slice(&data);
+        Ok(out)
+    }else{
+        if raw.len()<MAGIC.len()+12+16||!raw.starts_with(MAGIC){return Err("本机登录会话格式无效，请重新连接".into());}
+        let mut nonce=[0u8;12];nonce.copy_from_slice(&raw[MAGIC.len()..MAGIC.len()+12]);
+        let mut data=raw[MAGIC.len()+12..].to_vec();
+        let plain=LessSafeKey::new(unbound).open_in_place(Nonce::assume_unique_for_key(nonce),Aad::empty(),&mut data).map_err(|_|"无法读取本机安全保存的登录会话".to_string())?;
+        Ok(plain.to_vec())
+    }
+}
+// Linux 只用于开发/录制，没有钥匙串依赖，保留占位实现。
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn protect(_raw:&[u8],_encrypt:bool)->Result<Vec<u8>,String>{Err("当前系统暂不支持安全保存登录会话".into())}
 fn save(session:&Session)->Result<String,String>{
     let slot=slot(&session.email);let path=session_path(&slot)?;
@@ -146,7 +188,7 @@ mod tests {
     #[test] fn gemini_unknown_plan_and_reset_stay_unknown(){let mut v=response(json!(0.1),Value::Null);let usage=&mut v[0]["data"]["viewer"]["rpcs"]["getUsageInfo"];usage["subscriptionTier"]=json!("NEW_TIER");usage["pools"][0]["gxu"]["windowRefreshesAt"]=json!("unknown");let s=parse(&v).unwrap();assert!(s.plan.is_empty());assert!(s.windows[0].reset.is_none());}
     #[test] fn gemini_account_selection_and_cookie_validation(){let e=email(" Personal@Example.COM ").unwrap();assert_eq!(e,"personal@example.com");let u=url::Url::parse(&request_url(&e)).unwrap();let pairs=u.query_pairs().collect::<std::collections::HashMap<_,_>>();assert_eq!(pairs["authuser"],e);assert_eq!(pairs["query_signature"],SIGNATURE);assert_eq!(u.host_str(),Some("gemini.google.com"));assert_ne!(slot(&e),slot("work@example.com"));for bad in ["", "test", "a@b\r\nInjected: yes"]{assert!(email(bad).is_err());}assert_eq!(cookie("Cookie: SID=test; SAPISID=other").unwrap(),"SID=test; SAPISID=other");for bad in ["", "SID=test\r\nX: bad", "foo=bar"]{assert!(cookie(bad).is_err());}assert!(session_path("../../other").is_err());}
     #[test] fn gemini_account_redirects_never_forward_cookies_to_another_site(){let url=request_url("personal@example.com");let target=redirect_target(&url,"?authuser=0").unwrap();assert_eq!(url::Url::parse(&target).unwrap().query(),Some("authuser=0"));for to in ["https://accounts.google.com/signin","https://gemini.google.com.evil.invalid/","http://gemini.google.com/","https://gemini.google.com:444/","https://user@gemini.google.com/","/app"]{assert!(redirect_target(&url,to).is_none());}}
-    #[cfg(windows)] #[test] fn gemini_windows_storage_is_encrypted_and_roundtrips(){let raw=b"{\"email\":\"synthetic@example.com\",\"cookie\":\"SID=synthetic-secret\"}";let sealed=protect(raw,true).unwrap();assert!(!sealed.windows(16).any(|w|w==b"synthetic-secret"));assert_eq!(protect(&sealed,false).unwrap(),raw);let mut corrupt=sealed;corrupt[24]^=1;assert!(protect(&corrupt,false).is_err());}
+    #[cfg(any(windows, target_os = "macos"))] #[test] fn gemini_windows_storage_is_encrypted_and_roundtrips(){let raw=b"{\"email\":\"synthetic@example.com\",\"cookie\":\"SID=synthetic-secret\"}";let sealed=protect(raw,true).unwrap();assert!(!sealed.windows(16).any(|w|w==b"synthetic-secret"));assert_eq!(protect(&sealed,false).unwrap(),raw);let mut corrupt=sealed;corrupt[24]^=1;assert!(protect(&corrupt,false).is_err());}
     #[test] fn gemini_read_only_request_does_not_echo_private_errors(){
         use std::net::TcpListener;let server=TcpListener::bind("127.0.0.1:0").unwrap();let url=format!("http://{}/quota",server.local_addr().unwrap());
         let task=std::thread::spawn(move||{let(mut stream,_)=server.accept().unwrap();let mut bytes=[0u8;4096];let n=stream.read(&mut bytes).unwrap();let raw=String::from_utf8_lossy(&bytes[..n]);assert!(raw.starts_with("GET /quota HTTP/1.1"));assert!(raw.to_ascii_lowercase().contains("cookie: sid=synthetic"));use std::io::Write;stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\nConnection: close\r\n\r\nprivate-secret").unwrap();});

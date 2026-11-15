@@ -32,7 +32,11 @@ fn open_browser(url:&str)->Result<(),String>{
     Ok(())
 }
 #[cfg(not(windows))]
-fn open_browser(_url:&str)->Result<(),String>{Err("WorkBuddy 登录暂仅支持 Windows".into())}
+fn open_browser(url:&str)->Result<(),String>{
+    // macOS：`open` 调默认浏览器；命令存在但退出非 0 视为打开失败。
+    let status=std::process::Command::new("open").arg(url).status().map_err(|_|"无法打开默认浏览器，请检查系统设置".to_string())?;
+    if status.success(){Ok(())}else{Err("无法打开默认浏览器".into())}
+}
 
 pub(super) fn connect(expected:Option<&str>,cancel:Arc<AtomicBool>)->Result<(String,Snapshot),String>{
     let agent=super::super::http_agent();

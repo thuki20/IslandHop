@@ -87,8 +87,11 @@ impl Layout {
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
     /// **macOS 专用**（刘海与胶囊两种岛形共用）：常驻行按固定槽位左右分列——
-    /// **左组＝电源 + 吉祥宠；右组＝AI 额度环 + 天气 + 音乐 + 专注 + 铃铛**。
+    /// **左组＝电源 + 吉祥宠 + 天气；右组＝AI 额度环 + 音乐 + 专注 + 铃铛**。
     /// 时钟隐藏（macOS 右上角系统菜单栏本来就有时间，岛里不重复显示）。
+    ///
+    /// 左组整体右对齐到空洞左缘，天气排在最右（紧贴刘海）；新增组件时
+    /// 电源/宠物自动向岛体左缘方向让位。右组只挂额度环等状态件。
     ///
     /// 有刘海机型在中间留出物理刘海空洞（gap=刘海宽+呼吸位）；胶囊模式
     /// gap=0，两组之间用固定视觉间距替代。弹窗类（歌词 / 充放电 / 实时状态）
@@ -101,9 +104,9 @@ impl Layout {
         const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
         // 胶囊模式没有物理刘海，两组之间留固定视觉间距。
         let hole = if gap > 0.0 { gap } else { 48.0 };
-        let left: Vec<usize> = [BATTERY, PET].iter().copied().filter(|&i| self.x[i].is_some()).collect();
+        let left: Vec<usize> = [BATTERY, PET, WEATHER].iter().copied().filter(|&i| self.x[i].is_some()).collect();
         let right: Vec<usize> = self.quota_slots()
-            .chain([WEATHER, MUSIC, FOCUS, BELL])
+            .chain([MUSIC, FOCUS, BELL])
             .filter(|&i| self.x[i].is_some()).collect();
         if left.is_empty() && right.is_empty() { return; }
         let group_width = |slots: &[usize]| -> f32 {
@@ -113,13 +116,13 @@ impl Layout {
         let left_w = group_width(&left);
         let right_w = group_width(&right);
         let half = hole / 2.0;
-        // 左组右对齐到空洞左缘，按 [电源, 吉祥宠] 顺序向左排。
+        // 左组右对齐到空洞左缘，按 [电源, 吉祥宠, 天气] 顺序向左排。
         let mut cursor = -half - PAD - left_w;
         for &i in &left {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
             cursor += self.widths[i] + SPACE;
         }
-        // 右组左对齐到空洞右缘，按 [额度环…, 天气, …] 顺序向右排。
+        // 右组左对齐到空洞右缘，按 [额度环…, 音乐, 专注, 铃铛] 顺序向右排。
         let mut cursor = half + PAD;
         for &i in &right {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
@@ -282,6 +285,22 @@ mod tests {
         let mut empty=Layout::new(true,0,true,true,false,true,false);
         let width=empty.width;empty.widen(WEATHER,20.0);
         assert_eq!(empty.width,width);
+    }
+    #[test]
+    fn notch_layout_keeps_weather_left_and_quotas_right_of_the_hole(){
+        let mut layout=Layout::new(true,2,true,false,false,true,true);
+        layout.notch_slots(200.0);
+        let get=|i:usize|layout.x[i].unwrap();
+        // 左组 [电源, 宠物, 天气] 整体在刘海空洞（±100）左侧，天气最靠右（紧贴空洞）。
+        assert!(get(BATTERY)<get(PET)&&get(PET)<get(WEATHER)&&get(WEATHER)< -100.0-13.0);
+        // 右组从额度环开始，天气不再出现在右侧。
+        let quotas:Vec<_>=layout.quota_slots().map(get).collect();
+        assert!(quotas.iter().all(|&x|x>100.0+13.0));
+        assert!(quotas[0]<quotas[1]);
+        // 天气右缘到空洞中心留出 PAD+半径的呼吸位，不越过空洞。
+        assert!(get(WEATHER)+38.0/2.0<=-100.0-14.0+0.01);
+        // 岛体总宽按两组实占计算，不小于空洞与边距之和。
+        assert!(layout.width>=200.0+2.0*(14.0+16.0));
     }
     #[test]
     fn replacing_battery_moves_continuously_and_supports_an_instant_state(){
