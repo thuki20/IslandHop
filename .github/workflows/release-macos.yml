@@ -98,19 +98,30 @@ jobs:
             -T /usr/bin/codesign -T /usr/bin/security
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" > /dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
-          security find-identity -v -p codesigning "$KC"
-          rm -f "$RUNNER_TEMP/signing.p12"
+          # 自签名证书导出再导入后，TrustSettings 不随 p12 走，默认不被信任；
+          # 而 macos-app.sh 用 `find-identity -v`（仅有效身份）检测，会把不受信的身份滤掉
+          # → 静默退回 ad-hoc 签名。这里显式把它设为信任根。
+          security find-certificate -c "OpenHopSign" -p "$KC" > "$RUNNER_TEMP/openhopsign.pem"
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain "$RUNNER_TEMP/openhopsign.pem"
+          rm -f "$RUNNER_TEMP/openhopsign.pem" "$RUNNER_TEMP/signing.p12"
+          echo "--- 可用签名身份 ---"
+          security find-identity -v -p codesigning | tee "$RUNNER_TEMP/ids.txt"
+          grep -q "OpenHopSign" "$RUNNER_TEMP/ids.txt" \
+            || { echo "::error title=签名证书不可用::导入后仍看不到 OpenHopSign，请检查 MACOS_CERT_P12 / MACOS_CERT_PASSWORD"; exit 1; }
 
       - name: 单元测试（不阻塞发版）
         continue-on-error: true
         run: cargo test --release --lib
 
       - name: 配置部署 SSH
+        id: ssh
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
           if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
             echo "::warning::未配置 DEPLOY_SSH_KEY，本次只出包不推云端（产物见 Actions artifact）"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
@@ -118,8 +129,20 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -H 203.195.201.85 >> ~/.ssh/known_hosts 2>/dev/null
           ssh -o BatchMode=yes -o ConnectTimeout=15 ubuntu@203.195.201.85 'echo ssh-ok'
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: 仅构建出包（未配置部署密钥）
+        if: steps.ssh.outputs.ready != 'true'
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          cargo build --release --bin IslandHop
+          bash packaging/macos-app.sh --app-only
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent IslandHop.app "dist/IslandHop-v$VERSION-macos.zip"
 
       - name: 构建 + 打包 + 推送 OTA
+        if: steps.ssh.outputs.ready == 'true'
         env:
           ISLANDHOP_UPDATE_SERVER: ubuntu@203.195.201.85
           INPUT_NOTES: ${{ inputs.notes }}
