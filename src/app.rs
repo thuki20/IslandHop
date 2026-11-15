@@ -78,6 +78,11 @@ const MINIMAL_HOVER_INTENT: f64 = 0.40;
 /// 移开后等待多久开始收起；这段时间内回来不会收。
 const LEAVE_DELAY: f64 = 0.12;
 const SWELL: (f32, f32) = (1.075, 1.13);
+/// 防误触：收起态的悬停触发区比可见岛体下缘上提多少。
+/// 刘海正下方那一条必须留空——鼠标要再往上指一些、真正进入岛体才触发展开，
+/// 同时这条带在视觉上是透明的，命中区也不能覆盖它（否则吞掉下层点击/拖拽）。
+/// 极简线只有 4.5pt 高，谈不上误触，不内缩（否则触发带窄到无法唤出）。
+const HOVER_INSET_Y: f32 = 10.0;
 // 展开：欠阻尼，末段约 5% 过冲后回落；高度略软于宽度，像「垂落」下来。
 const OPEN_W: (f32, f32) = (330.0, 0.70);
 const OPEN_H: (f32, f32) = (290.0, 0.74);
@@ -644,6 +649,8 @@ pub struct App {
     pub(crate) open: bool,
     hover_since: Option<f64>,
     leave_since: Option<f64>,
+    /// 点击收起岛体触发的展开（绕过悬停意图缓冲，展开后即消费）。
+    tap_open: bool,
     /// 前台切换导致的强制收起：光标离开前不再自动展开。
     pub hover_lock: bool,
     pub(crate) reveal: f32,
@@ -838,6 +845,7 @@ impl App {
             open: false,
             hover_since: None,
             leave_since: None,
+            tap_open: false,
             hover_lock: false,
             reveal: 0.0,
             position_drag: None,
@@ -1757,7 +1765,18 @@ impl App {
         }
         self.update_island_lyric_layout(&ctx);
 
-        let cx = win.center().x;
+        let mut cx = win.center().x;
+        // 贴墙定位的展开保护：收起岛体贴到屏幕边缘后，展开面板（半宽 ~274pt）
+        // 必然超出屏幕。移动窗口会打断贴墙手感，这里在绘制层把岛体中心向屏内
+        // 收：收起时按可见半宽（贴墙不动），随展开进度渐变到面板半宽——效果是
+        // 面板展开时自动贴着屏幕边缘对齐，收起后回到贴墙位置。
+        if !self.side() {
+            let half=lerp(self.placement_half_visible(),self.placement_half_panel(),anim::clamp01(self.progress()));
+            if let Some(screen)=env.screen {
+                let (lo,hi)=(screen.min.x+half,screen.max.x-half);
+                if lo<=hi {cx=cx.clamp(lo,hi);}
+            }
+        }
         // 胶囊皮肤悬浮在屏幕顶边下方。
         let pill = self.settings.island_shape==model::IslandShape::Pill;
         let top = win.top() + if pill { PILL_GAP } else { 0.0 };
@@ -1792,8 +1811,18 @@ impl App {
         // ---------- 输入：悬停 ----------
         let p_prev = self.progress();
         let hit = if side {self.side_hit_rect(win,p_prev)} else {self.hit_rect(cx, top, p_prev)};
+        let hover = if side {hit} else {self.hover_rect(cx, top, p_prev)};
         let previous_menu=self.shelf_menu_rect.take();
-        let inside = env.cursor.is_some_and(|c| hit.contains(c) || previous_menu.is_some_and(|r|r.contains(c)));
+        // want（自动展开）用内缩的触发区；点击命中等仍用完整命中区。
+        let inside = env.cursor.is_some_and(|c| hover.contains(c) || previous_menu.is_some_and(|r|r.contains(c)));
+        // 点击可见岛体立即展开：悬停触发区收窄后，直接点岛体不能因为没进入
+        // 触发带而毫无反应（点在触发带外、命中区内时应视为明确意图）。
+        // 点击可见岛体立即展开：悬停触发区收窄后，直接点岛体不能因为没进入
+        // 触发带而毫无反应（点在触发带外、命中区内时应视为明确意图）。
+        // 有通知卡片时除外：卡片上的按钮有自己的交互，点击展开会把卡片顶掉。
+        let tap_on_island = !self.open && self.notice.is_none() && !self.position_drag.is_some()
+            && ctx.input(|i| i.pointer.primary_pressed())
+            && env.cursor.is_some_and(|c| hit.contains(c));
         let on_notice=env.cursor.is_some_and(|c|self.messenger_badge_rect(win,self.island_rect(win,self.w.pos,self.h.pos)).is_some_and(|r|r.contains(c)) || self.notice_rect(cx,top).is_some_and(|r|r.contains(c))||self.notice_details_rect(cx,top).is_some_and(|r|r.contains(c)));
         if !inside {
             self.hover_lock = false;
@@ -1861,8 +1890,11 @@ impl App {
             }
         } else {self.wheel_delta=0.0;}
         let volume_dragging=self.music_volume_open && ctx.is_being_dragged(egui::Id::new(("card-drag",true,"m-volume-track")));
-        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || (self.is_editing() && self.open);
+        let want = (inside && !self.hover_lock && (self.compact_notices()||self.notice.is_none()||self.open)) || self.open && on_notice || (self.open && self.t<self.forced_open_until) || self.drag_hot || volume_dragging || (self.is_editing() && self.open) || self.tap_open;
         self.morph(want, inside, env.t, dt);
+        // 点击命中收起岛体：本帧点击先按收起态交给常驻控件处理（直接 open 会让
+        // resident 行当帧消失、点击落空），下一帧再绕过悬停缓冲展开。
+        if tap_on_island { self.tap_open = true; }
         self.update_pet(env, cx);
 
         // ---------- 绘制 ----------
@@ -2153,16 +2185,31 @@ impl App {
             let (width,height)=self.base_size();
             let width=self.w.pos.min(width);
             let height=self.h.pos.min(height);
+            // 极简细线只有 4.5pt 高，命中必须精确贴合（多 1pt 都会吸住鼠标）。
             Rect::from_min_size(Pos2::new(cx-width/2.0,top),Vec2::new(width,height))
         } else if self.notice.is_some()&&!self.compact_notices()&&!self.open {
+            // 通知横幅是实心卡片，命中跟随可见外形（+6 圆角余量）；它不是透明带，
+            // 无需收紧。
             let (w,h)=self.base_size();Rect::from_min_size(Pos2::new(cx-(w+8.0)/2.0,top),Vec2::new(w+8.0,h+6.0))
         } else if p > 0.04 || self.open {
+            // 展开面板同理：可见面板边缘要能点。
             Rect::from_min_size(Pos2::new(cx - PW / 2.0 - 4.0, top), Vec2::new(PW + 8.0, self.expanded_height() + 2.0))
         } else {
             let (bw,bh)=self.base_size();
-            let (hit_w,hit_h)=(bw+12.0,bh+4.0);
-            Rect::from_min_size(Pos2::new(cx-hit_w/2.0,top),Vec2::new(hit_w,hit_h))
+            // 高度只 +1（不向下溢出到刘海正下方）；宽度留 4pt 圆角余量。
+            Rect::from_min_size(Pos2::new(cx-bw/2.0-4.0,top-0.5),Vec2::new(bw+8.0,bh+1.0))
         }
+    }
+
+    /// 悬停自动展开的触发区：比命中区更「挑剔」。
+    /// 收起时下缘上提 `HOVER_INSET_Y`——鼠标必须再往上指一些、真正进入岛体
+    /// 才开始展开计时，刘海正下方不再误触；展开后整块面板都算（否则一展开
+    /// 就判定离开、立即收起）。侧边停靠不内缩。
+    fn hover_rect(&self, cx: f32, top: f32, p: f32) -> Rect {
+        let hit=self.hit_rect(cx,top,p);
+        if self.side() || self.open || p > 0.04 || self.notice.is_some() && !self.compact_notices() {return hit;}
+        if self.effective_minimal() {return hit;}
+        Rect::from_min_max(hit.min,Pos2::new(hit.max.x,hit.max.y-HOVER_INSET_Y))
     }
 
     /// 展开后未读胶囊的出现程度：面板基本展开后从面板旁淡入。
@@ -2455,8 +2502,9 @@ impl App {
                 }
                 let switch=target.is_some();
                 if let Some(dock)=target {self.settings.dock=dock;}
+                // 拖动换算与贴墙定位用同一个「可见半宽」：拖到极限=岛体边缘贴屏幕边。
                 let (position,length,extent,start)=if self.side() {(cursor.y,screen.height(),crate::side_dock::SIDE_HALF_EXTENT,drag.start.y)}
-                    else {(cursor.x,screen.width(),crate::display_layout::ISLAND_HALF_EXTENT,drag.start.x)};
+                    else {(cursor.x,screen.width(),self.placement_half_visible(),drag.start.x)};
                 let travel=(length/2.0-extent).max(0.0);
                 let raw=if travel<=0.0 {0.0}else if switch {(position-length/2.0)/travel*limit}
                     else {drag.offset+(position-start)/travel*limit};
@@ -2501,9 +2549,23 @@ impl App {
     }
 
     /// 拖动中和落位期间窗口使用的位置（-1 … 1，不取整）；其余时候就是保存的位置。
+    /// 贴墙极限位按「可见岛体半宽」换算；展开面板超屏由绘制层把岛心向屏内收
+    /// （见 frame 里的 cx clamp），窗口位置保持贴墙不动。
     pub fn placement_offset(&self)->f32 {
         let limit=model::ISLAND_OFFSET_MAX as f32;
         self.drag_glide.map_or(self.settings.island_offset_ratio(),|g|(g.pos/limit).clamp(-1.0,1.0))
+    }
+
+    /// 收起态岛体的可见半宽（逻辑点）：水平贴墙极限按它算，极限位置时岛体边缘贴屏幕边。
+    /// 通知横幅比常驻岛宽时按横幅算（横幅也是可见内容，不能推出屏幕）。
+    pub fn placement_half_visible(&self)->f32 {
+        let notice=self.notice.as_ref().map(|a|self.notice_size(a).0/2.0+44.0).unwrap_or(0.0);
+        (self.resident.target.width/2.0+8.0).max(notice).max(24.0)
+    }
+
+    /// 展开安全半宽（逻辑点）：面板本体 + 未读胶囊/通知横幅的外挂余量。
+    pub fn placement_half_panel(&self)->f32 {
+        PW/2.0+64.0
     }
 
     /// 拿起与速度拉伸带来的外形缩放：(宽, 高)。
@@ -2533,6 +2595,7 @@ impl App {
             self.hover_lock=true;
             self.hover_since=None;
             self.leave_since=None;
+            self.tap_open=false;
             self.forced_open_until=0.0;
             self.music_volume_open=false;
             self.w.tune(CLOSE.0, CLOSE.1);
@@ -2543,8 +2606,10 @@ impl App {
             self.leave_since = None;
             let since = *self.hover_since.get_or_insert(t);
             let intent=if self.effective_minimal() {MINIMAL_HOVER_INTENT}else{HOVER_INTENT};
-            if !self.open && (self.drag_hot || t - since >= intent) {
-                self.open = true;
+            if !self.open && (self.drag_hot || self.tap_open || t - since >= intent) {
+            self.open = true;
+            if self.tap_open { self.forced_open_until = t + 2.0; }
+            self.tap_open = false;
                 self.w.tune(OPEN_W.0, OPEN_W.1);
                 self.h.tune(OPEN_H.0, OPEN_H.1);
                 self.w.target = PW;

@@ -62,16 +62,28 @@ pub const ISLAND_HALF_EXTENT: f32 = 240.0;
 
 /// 岛体中心能离开屏幕中线的最大距离（物理像素）。屏幕太窄时为 0，只能居中。
 pub fn island_travel(m:Bounds, scale:f32)->f64 {
-    if m.right<=m.left || !scale.is_finite() || scale<=0.0 {return 0.0;}
-    ((m.right as f64-m.left as f64)/2.0-ISLAND_HALF_EXTENT as f64*scale as f64).max(0.0)
+    island_travel_for(m, ISLAND_HALF_EXTENT, scale)
+}
+
+/// 按「岛体可见半宽」计算可移动范围：极限位置时可见岛体贴到屏幕边缘。
+/// `half` 是当前收起态岛体的实际半宽（逻辑点），比固定面板半宽小得多——
+/// 以前统一按面板半宽算，导致拖到最左/最右时岛体离墙还差一大截。
+pub fn island_travel_for(m:Bounds, half:f32, scale:f32)->f64 {
+    if m.right<=m.left || !scale.is_finite() || scale<=0.0 || !half.is_finite() || half<=0.0 {return 0.0;}
+    ((m.right as f64-m.left as f64)/2.0-half as f64*scale as f64).max(0.0)
 }
 
 /// 按水平偏移定位：`offset` 为 -1（最左）..0（居中）..1（最右），按可移动范围的比例换算，
 /// 所以换屏、改系统缩放或调整岛体大小后仍保持相同的相对位置。
 pub fn island_origin_offset(m:Bounds, island_width:f32, scale:f32, offset:f32)->Option<(i32,i32)> {
+    island_origin_offset_for(m,island_width,scale,offset,ISLAND_HALF_EXTENT)
+}
+
+/// 同上，但可移动范围按 `half`（当前岛体可见半宽，逻辑点）换算，极限位置贴墙。
+pub fn island_origin_offset_for(m:Bounds, island_width:f32, scale:f32, offset:f32, half:f32)->Option<(i32,i32)> {
     let (x,y)=island_origin(m,island_width,scale)?;
     let offset=if offset.is_finite(){offset.clamp(-1.0,1.0)}else{0.0};
-    let shift=(island_travel(m,scale)*offset as f64).round();
+    let shift=(island_travel_for(m,half,scale)*offset as f64).round();
     Some(((x as f64+shift).clamp(i32::MIN as f64,i32::MAX as f64) as i32,y))
 }
 
@@ -166,6 +178,24 @@ mod offset_tests {
         assert_eq!(island_origin_offset(narrow,640.0,1.5,1.0),island_origin(narrow,640.0,1.5));
         let m=Bounds{left:0,top:0,right:1920,bottom:1080};
         assert_eq!(island_origin_offset(m,640.0,1.0,f32::NAN),island_origin(m,640.0,1.0));
+    }
+    #[test]
+    fn visible_half_width_hugs_the_screen_edge_at_extreme_offsets(){
+        // MacBook Pro 14：屏 3024 物理像素、scale 2、刘海布局岛体半宽 250 逻辑点。
+        // 极限偏移时可见岛体边缘必须贴到屏幕边缘（以前按面板半宽 240 算，离墙差一截）。
+        let m=Bounds{left:0,top:0,right:3024,bottom:1964};
+        let (w,half,scale)=(640.0,250.0,2.0);
+        let (x_left,_) =island_origin_offset_for(m,w,scale,-1.0,half).unwrap();
+        let (x_right,_)=island_origin_offset_for(m,w,scale, 1.0,half).unwrap();
+        let left_center =x_left  as f64+w as f64*scale as f64/2.0;
+        let right_center=x_right as f64+w as f64*scale as f64/2.0;
+        assert!((left_center -half as f64*scale as f64-m.left  as f64).abs()<=1.0,"offset=-1 应贴左墙：{left_center}");
+        assert!((right_center+half as f64*scale as f64-m.right as f64).abs()<=1.0,"offset=1 应贴右墙：{right_center}");
+        // 屏幕太窄装不下岛体时保持居中，不出屏。
+        let narrow=Bounds{left:0,top:0,right:800,bottom:600};
+        assert_eq!(island_origin_offset_for(narrow,640.0,1.0,1.0,500.0),island_origin(narrow,640.0,1.0));
+        // 默认入口保持上游基线（面板半宽 240），老调用点行为不变。
+        assert_eq!(island_origin_offset(m,640.0,2.0,1.0),island_origin_offset_for(m,640.0,2.0,1.0,ISLAND_HALF_EXTENT));
     }
 }
 

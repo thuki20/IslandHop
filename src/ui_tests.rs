@@ -1124,7 +1124,7 @@ fn island_drag_frame(h:&mut H,bounds:crate::display_layout::Bounds,ppp:f32,point
     let (width,height)=if dock.is_side(){(side_dock::SIDE_W,side_dock::SIDE_H)}else{(WIN_W,WIN_H)};
     let offset=h.app.placement_offset();
     let (x,y)=if dock.is_side(){display_layout::side_origin(bounds,dock,(width,height),side_dock::SIDE_HALF_EXTENT,ppp,offset)}
-        else{display_layout::island_origin_offset(bounds,width,ppp,offset)}.unwrap();
+        else{display_layout::island_origin_offset_for(bounds,width,ppp,offset,h.app.placement_half_visible())}.unwrap();
     let screen=Rect::from_min_max(Pos2::new((bounds.left-x) as f32/ppp,(bounds.top-y) as f32/ppp),Pos2::new((bounds.right-x) as f32/ppp,(bounds.bottom-y) as f32/ppp));
     let cursor=pointer.map(|p|p+screen.min.to_vec2());
     let mut events=cursor.map(|p|vec![egui::Event::PointerMoved(p)]).unwrap_or_default();
@@ -1184,13 +1184,13 @@ fn island_position_drag_clamps_to_existing_limits_and_stays_resident(){
         let mut h=H::new();h.app.settings.dock=dock;h.app.settings.island_shape=shape;
         let start=island_drag_header(&mut h,bounds,1.0);
         island_drag_frame(&mut h,bounds,1.0,Some(start),Some(true));
-        let end=if dock.is_side(){Pos2::new(start.x,3000.0)}else{Pos2::new(1855.0,start.y)};
+        let end=if dock.is_side(){Pos2::new(start.x,3000.0)}else{Pos2::new(1880.0,start.y)};
         for _ in 0..120{island_drag_frame(&mut h,bounds,1.0,Some(end),None);}
         assert!(!h.app.open,"{dock:?} 拖动期间应保持常驻形态");
         assert!(h.app.progress()<0.01,"拖动期间不应保留展开面板");
         assert!(!h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()=="10月28日 周三")),"拖动期间不应显示展开顶栏");
         assert_eq!(h.app.settings.island_offset,crate::model::ISLAND_OFFSET_MAX);
-        let end=if dock.is_side(){Pos2::new(start.x,65.0)}else{Pos2::new(65.0,start.y)};
+        let end=if dock.is_side(){Pos2::new(start.x,65.0)}else{Pos2::new(40.0,start.y)};
         island_drag_frame(&mut h,bounds,1.0,Some(end),None);
         assert_eq!(h.app.settings.island_offset,-crate::model::ISLAND_OFFSET_MAX);
         assert_eq!(h.app.settings.dock,dock);
@@ -1294,7 +1294,8 @@ fn island_position_drag_lifts_on_hold_glides_smoothly_and_snaps_to_center(){
     assert!(!h.app.open && h.app.progress()<0.5,"按住不动也应拿起岛体");
     assert_eq!(h.app.settings.island_offset,-30);
     // 窗口平滑跟随：一帧跳过去的光标，窗口要分几帧追上，且不按整数刻度跳。
-    let travel=1920.0/2.0-crate::display_layout::ISLAND_HALF_EXTENT;
+    // 拖动换算与贴墙定位共用「可见半宽」（ IslandHop：极限位置=岛体边缘贴屏幕边）。
+    let travel=1920.0/2.0-h.app.placement_half_visible();
     let to=|units:f32|Pos2::new(start.x+(units+30.0)/100.0*travel,start.y);
     island_drag_frame(&mut h,bounds,1.0,Some(to(-10.0)),None);
     island_drag_frame(&mut h,bounds,1.0,Some(to(-10.0)),None);
@@ -1974,7 +1975,7 @@ fn island_lyrics_center_segments_in_a_fixed_height(){
         assert!((center-WIN_W/2.0-offset).abs()<1.5,"歌词应在内容区居中");
         assert!(!text.galley.elided,"显示段应完整显示");
         assert_eq!(text.galley.rows.len(),1,"每次只显示一段歌词");
-        assert!((h.hit.height()-(crate::app::BAR_H+4.0)).abs()<0.1,"岛应保持固定高度");
+        assert!((h.hit.height()-(crate::app::BAR_H+1.0)).abs()<0.1,"岛应保持固定高度");
         assert!(text.visual_bounding_rect().bottom()<=h.hit.bottom(),"文字应完整显示在岛内");
     }
 }
@@ -3976,7 +3977,7 @@ fn starting_timer_keeps_lyrics_album_and_mascot_with_a_compact_countdown(){
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.brush.as_ref().is_some_and(|b|b.fill_texture_id==texture))));
         let secs=h.app.pomo.remaining.ceil() as u32;let countdown=format!("{:02}:{:02}",secs/60,secs%60);
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()==countdown)),"歌词模式中也应显示计时");
-        assert!(h.app.current_width()<=PW+0.1);assert!((h.hit.height()-34.0).abs()<0.1);
+        assert!(h.app.current_width()<=PW+0.1);assert!((h.hit.height()-31.0).abs()<0.1);
     }
     h.app.pomo.running=false;for _ in 0..90 {h.frame(vec![]);}
     assert_eq!(h.app.island_lyric().map(|(_,line)|line),Some("晚风吹过了山岗"));
@@ -4048,7 +4049,7 @@ fn collapsed_focus_uses_tomato_and_rest_uses_a_white_cup(){
             assert!(!tomato,"休息时应替换番茄");
             assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.fill==egui::Color32::from_rgb(245,242,234) && (7.0..13.0).contains(&r.rect.width()) && (5.0..10.0).contains(&r.rect.height()))),"休息时应显示白瓷茶杯");
         }
-        assert!((h.hit.height()-34.0).abs()<0.1,"图标不能撑高常驻岛");
+        assert!((h.hit.height()-31.0).abs()<0.1,"图标不能撑高常驻岛");
     }
 }
 

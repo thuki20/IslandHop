@@ -44,7 +44,10 @@ pub fn cursor_local(_ppp: f32) -> Option<eframe::egui::Pos2> { None }
 /// 调用方据此提高重绘频率（穿透时窗口收不到 mousemove）。
 #[cfg(target_os = "macos")]
 pub fn sync_passthrough(cursor: Option<eframe::egui::Pos2>, hits: &[eframe::egui::Rect]) -> bool {
-    let inside = cursor.is_some_and(|p| hits.iter().any(|r| r.expand(10.0).contains(p)));
+    // 外扩只留 1pt 抗抖：以前外扩 10pt，加上 hit_rect 自身的外扩，岛体下方
+    // 会多出一条十几 pt 的隐形命中带——视觉透明却吞掉菜单栏正下方的点击/拖拽，
+    // 也是「刘海正下方误触」的来源。命中必须与可见形状对齐。
+    let inside = cursor.is_some_and(|p| hits.iter().any(|r| r.expand(1.0).contains(p)));
     if std::env::var_os("ISLANDHOP_PT_LOG").is_some() {
         static LAST: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
         let now = i8::from(inside);
@@ -274,6 +277,60 @@ mod imp {
         }
     }
 
+    /// `NSScreen*` 的边界（逻辑点，egui 左上原点）。
+    fn display_bounds(screen: *mut AnyObject) -> Option<crate::display_layout::Bounds> {
+        if screen.is_null() { return None }
+        unsafe {
+            let f: NSRect = msg_send![screen, frame];
+            let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            if main.is_null() { return None }
+            let mf: NSRect = msg_send![main, frame];
+            // AppKit 全局坐标原点在主屏左下；egui 用主屏左上。
+            let top = (mf.origin.y + mf.size.height - f.origin.y - f.size.height) as i32;
+            Some(crate::display_layout::Bounds {
+                left: f.origin.x as i32,
+                top,
+                right: (f.origin.x + f.size.width) as i32,
+                bottom: top + f.size.height as i32,
+            })
+        }
+    }
+
+    pub fn main_display_bounds() -> Option<crate::display_layout::Bounds> {
+        unsafe { display_bounds(msg_send![class!(NSScreen), mainScreen]) }
+    }
+
+    /// 窗口所在屏幕 → 窗口本地逻辑矩形。
+    pub fn screen_rect_local() -> Option<eframe::egui::Rect> {
+        let ns = window();
+        if ns.is_null() { return None }
+        unsafe {
+            let frame: NSRect = msg_send![ns, frame];
+            // 找包含窗口中心的屏（多屏时不是 mainScreen）。
+            let cx = frame.origin.x + frame.size.width / 2.0;
+            let cy = frame.origin.y + frame.size.height / 2.0;
+            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+            if screens.is_null() { return None }
+            let count: usize = msg_send![screens, count];
+            for i in 0..count {
+                let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+                let f: NSRect = msg_send![screen, frame];
+                let contains = cx >= f.origin.x && cx <= f.origin.x + f.size.width
+                    && cy >= f.origin.y && cy <= f.origin.y + f.size.height;
+                if !contains { continue }
+                let (ox, _oy) = window_origin_top_left()?;
+                // 窗口本地 = 屏幕 frame − 窗口原点（都是逻辑点，AppKit→egui 已换算）。
+                let left = f.origin.x as f32 - ox;
+                let top = (frame.origin.y + frame.size.height) - (f.origin.y + f.size.height);
+                return Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::new(left, top as f32),
+                    eframe::egui::Vec2::new(f.size.width as f32, f.size.height as f32),
+                ));
+            }
+            None
+        }
+    }
+
     /// 系统菜单栏高度：主屏顶部到 visibleFrame 顶部的距离。
     ///
     /// 必须用「frame 顶 − visibleFrame 顶」，不能直接拿两个高度相减：
@@ -310,3 +367,27 @@ pub fn window_origin_top_left() -> Option<(f32, f32)> { imp::window_origin_top_l
 
 #[cfg(not(target_os = "macos"))]
 pub fn window_origin_top_left() -> Option<(f32, f32)> { None }
+
+/// 主屏的边界（逻辑点，egui 左上原点）。
+/// Windows 端有 `display_layout::connected()`，macOS 一直缺——所以
+/// 「水平位置 / 左右停靠」在 Mac 上从未生效（窗口永远启动时居中一次）。
+///
+/// 测试构建返回 None：上游 600KB 录制/像素基线以「无屏幕信息」为基准，
+/// 真实屏幕矩形会让视口 640×270 的浮层避让断言随硬件变化（同 `notch_layout`）。
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn main_display_bounds() -> Option<crate::display_layout::Bounds> {
+    imp::main_display_bounds()
+}
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn main_display_bounds() -> Option<crate::display_layout::Bounds> { None }
+
+/// 窗口所在屏幕换算成窗口本地的逻辑矩形（egui 左上原点）。
+/// 供引擎的拖动换边、浮层避让使用（`Env.screen`）。测试构建同样返回 None。
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn screen_rect_local() -> Option<eframe::egui::Rect> {
+    imp::screen_rect_local()
+}
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn screen_rect_local() -> Option<eframe::egui::Rect> { None }

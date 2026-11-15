@@ -318,8 +318,10 @@ impl Shell {
             let b=daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar);
             egui::Rect::from_min_max(Pos2::new(b.left as f32/ppp-origin.x,b.top as f32/ppp-origin.y),Pos2::new(b.right as f32/ppp-origin.x,b.bottom as f32/ppp-origin.y))
         });
+        // IslandHop（macOS）：提供所在屏幕的窗口本地矩形。上游写死 None，
+        // 拖动换边、贴边定位与浮层避让在 Mac 上全部失效。
         #[cfg(not(windows))]
-        let screen=None;
+        let screen=daozai::mac_window::screen_rect_local();
         #[cfg(windows)]
         let (backdrop,glass_blur)=(self.backdrop.as_ref().and_then(|b|b.color()),self.native.as_ref().is_some_and(|w|w.blur_active()));
         #[cfg(not(windows))]
@@ -432,7 +434,7 @@ impl eframe::App for Shell {
             self.placement_scale=ctx.pixels_per_point();
             self.placement_key=placement_key;
             let display=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id);
-            if display.is_some_and(|d|self.native.as_ref().is_some_and(|w|w.place_on_display(self.placement_scale,daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar),offset,self.app.settings.dock))) {
+            if display.is_some_and(|d|self.native.as_ref().is_some_and(|w|w.place_on_display(self.placement_scale,daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar),offset,self.app.settings.dock,self.app.placement_half_visible()))) {
                 if !self.placed {diagnostics::startup("目标屏幕物理坐标定位完成，已请求显示");}
                 self.placed=true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -456,6 +458,32 @@ impl eframe::App for Shell {
             self.elevated = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(self.win_x, 0.0)));
             ctx.request_repaint();
+        }
+        // IslandHop（macOS）：水平位置 / 左右停靠跟随。Windows 有每帧的
+        // place_on_display 循环，macOS 一直缺——窗口只在启动时居中一次，
+        // 拖动和设置里的位置改了也没有任何效果。这里对齐同一行为：
+        // 位置或岛体大小变化时按「可见半宽」的可移动范围重新定位。
+        #[cfg(not(windows))]
+        {
+            let offset=self.app.placement_offset();
+            let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar);
+            if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.placement_key!=placement_key {
+                self.placement_scale=ctx.pixels_per_point();
+                self.placement_key=placement_key;
+                if let Some(bounds)=daozai::mac_window::main_display_bounds() {
+                    // macOS 坐标是逻辑点，缩放比 1:1；左右停靠与 Windows 共用 side_origin。
+                    let origin=if self.app.settings.dock.is_side() {
+                        daozai::display_layout::side_origin(bounds,self.app.settings.dock,(daozai::side_dock::SIDE_W,daozai::side_dock::SIDE_H),daozai::side_dock::SIDE_HALF_EXTENT,1.0,offset)
+                    } else {
+                        daozai::display_layout::island_origin_offset_for(bounds,app::WIN_W,1.0,offset,self.app.placement_half_visible())
+                    };
+                    if let Some((x,y))=origin {
+                        self.win_x=x as f32;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32,y as f32)));
+                        ctx.request_repaint();
+                    }
+                }
+            }
         }
         #[cfg(windows)]
         {
