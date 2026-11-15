@@ -45,6 +45,13 @@ pub fn cursor_local(_ppp: f32) -> Option<eframe::egui::Pos2> { None }
 #[cfg(target_os = "macos")]
 pub fn sync_passthrough(cursor: Option<eframe::egui::Pos2>, hits: &[eframe::egui::Rect]) -> bool {
     let inside = cursor.is_some_and(|p| hits.iter().any(|r| r.expand(10.0).contains(p)));
+    if std::env::var_os("ISLANDHOP_PT_LOG").is_some() {
+        static LAST: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+        let now = i8::from(inside);
+        if LAST.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
+            eprintln!("[PT] cursor={cursor:?} pass_through={}", !inside);
+        }
+    }
     let recovered = imp::set_passthrough(!inside);
     if recovered {
         // 穿透期间系统丢弃了全部 mouseMoved：恢复接收后 egui 没有指针位置，
@@ -116,12 +123,11 @@ mod imp {
     use objc2::{class, msg_send};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ffi::c_void;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicPtr, Ordering};
 
     /// `NSWindow*`。eframe 的 `Frame` 只在 `update()` 里可用，而光标换算每帧
     /// 都要做，所以在 `elevate()` 时缓存一次（窗口生命周期 = 应用生命周期）。
     static WINDOW: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-    static IGNORING: AtomicBool = AtomicBool::new(false);
 
     type CGFloat = f64;
 
@@ -212,11 +218,17 @@ mod imp {
     pub fn set_passthrough(ignore: bool) -> bool {
         let ns = window();
         if ns.is_null() { return false }
-        // 返回是否发生了「穿透 → 接收」切换（调用方需要补发 mouseMoved）。
-        let was_ignoring = IGNORING.swap(ignore, Ordering::Relaxed);
+        // 以 NSWindow 的真实值为准，不信任本地缓存：系统/其他代码可能已把它
+        // 改回 NO（例如窗口重新成为 key），缓存不同步会让透明画布永久吃掉点击，
+        // 表现就是「岛下方那片区域点不动」。
+        let current: Bool = unsafe { msg_send![ns, ignoresMouseEvents] };
+        let was_ignoring = current.as_bool();
         if was_ignoring == ignore { return false }
         let value = if ignore { Bool::YES } else { Bool::NO };
         unsafe { let _: () = msg_send![ns, setIgnoresMouseEvents: value]; }
+        if std::env::var_os("ISLANDHOP_PT_LOG").is_some() {
+            eprintln!("[PT] apply ignoresMouseEvents={ignore}");
+        }
         was_ignoring && !ignore
     }
 

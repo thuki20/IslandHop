@@ -8,11 +8,12 @@ const RELEASES: &str = "https://github.com/thuki20/IslandHop/releases/latest";
 const BACKUP_DOWNLOAD: &str = "https://github.com/thuki20/IslandHop/releases/latest";
 /// 云端私有更新源（自有服务器）：迭代后把 `IslandHop-v*版本*-macos.zip` 与
 /// `manifest.json`（version/notes/url/sha256/size）用 packaging/push-update.sh
-/// 推上去，客户端启动即自动检查、应用内下载并覆盖安装，无需逐台手动替换。
-/// 路径借用 nginx 的 acme-challenge 静态目录（唯一无需 sudo 的可写出口），
-/// 走 http；完整性由 manifest 的 sha256 保证。可用环境变量
-/// `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用）。
-const FEED_URL: &str = "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json";
+/// 推到软件工作台 /home/updates/islandhop/，客户端启动即自动检查、
+/// 应用内下载并覆盖安装，无需逐台手动替换。
+/// 新版走域名 https；服务器同时保留旧 acme-challenge 路径的 http 兼容副本，
+/// 让已经装出去的旧客户端继续能更新。完整性由 manifest 的 sha256 保证。
+/// 可用环境变量 `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用）。
+const FEED_URL: &str = "https://ncsai.top/home/updates/islandhop/manifest.json";
 
 fn feed_url() -> String { std::env::var("ISLANDHOP_FEED_URL").unwrap_or_else(|_| FEED_URL.to_string()) }
 /// feed 的基地址（去 manifest.json），用于允许对自有源走 http 下载。

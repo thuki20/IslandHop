@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# IslandHop macOS 迭代一键推送：构建 → 打包 → 生成 manifest → rsync 到云端。
-# 客户端启动后自动检查 http://<server>/islandhop/manifest.json 并应用内覆盖安装。
+# IslandHop macOS 迭代一键推送：构建 → 打包 → 生成 manifest → 推送到软件工作台。
+# 一条命令同时更新三处消费方：
+#   1. 门户网页 /home/updates/islandhop/            （https 域名 manifest）
+#   2. 已装旧版客户端 http://IP/.well-known/...     （兼容副本，不必重新发版）
+#   3. 门户 index.json（网页版本卡片）              （调用云端同步器刷新）
 #
 # 用法：
 #   bash packaging/push-update.sh "更新说明第一行" ["更多说明"]...
 #
-# 可用环境变量覆盖服务器与目录：
-#   ISLANDHOP_UPDATE_SERVER   默认 ncsai（~/.ssh/config 里的别名）
-#   ISLANDHOP_UPDATE_DIR      默认 /var/www/letsencrypt/.well-known/acme-challenge/islandhop
-#                             （nginx 对该前缀直接出静态文件、无 301，ubuntu 可写，无需 sudo）
+# 可用环境变量覆盖：
+#   ISLANDHOP_UPDATE_SERVER   ssh 别名，默认 ncsai
+#   ISLANDHOP_PORTAL_DIR      门户更新目录，默认 /opt/ncsai-portal/data/updates/islandhop
+#   ISLANDHOP_LEGACY_DIR      旧客户端兼容目录
+#   ISLANDHOP_BASE_URL        新版 manifest 下载地址前缀
+#   ISLANDHOP_LEGACY_URL      旧版 manifest 下载地址前缀
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,7 +22,10 @@ cd "$ROOT"
 VERSION="$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")"
 ZIP_NAME="IslandHop-v${VERSION}-macos.zip"
 SERVER="${ISLANDHOP_UPDATE_SERVER:-ncsai}"
-REMOTE_DIR="${ISLANDHOP_UPDATE_DIR:-/var/www/letsencrypt/.well-known/acme-challenge/islandhop}"
+PORTAL_DIR="${ISLANDHOP_PORTAL_DIR:-/opt/ncsai-portal/data/updates/islandhop}"
+LEGACY_DIR="${ISLANDHOP_LEGACY_DIR:-/var/www/letsencrypt/.well-known/acme-challenge/islandhop}"
+BASE_URL="${ISLANDHOP_BASE_URL:-https://ncsai.top/home/updates/islandhop}"
+LEGACY_URL="${ISLANDHOP_LEGACY_URL:-http://203.195.201.85/.well-known/acme-challenge/islandhop}"
 
 [ $# -ge 1 ] || { echo "用法: $0 \"更新说明\" [\"更多说明\"]..." >&2; exit 1; }
 
@@ -33,27 +41,33 @@ ditto -c -k --sequesterRsrc --keepParent IslandHop.app "dist/$ZIP_NAME"
 SIZE=$(stat -f%z "dist/$ZIP_NAME")
 HASH=$(shasum -a 256 "dist/$ZIP_NAME" | awk '{print $1}')
 
-echo "==> 生成 manifest.json (v$VERSION)"
-python3 - "$VERSION" "$ZIP_NAME" "$SIZE" "$HASH" "$@" <<'PY'
+echo "==> 生成 manifest.json (v$VERSION) 与旧地址兼容副本"
+python3 - "$VERSION" "$ZIP_NAME" "$SIZE" "$HASH" "$BASE_URL" "$LEGACY_URL" "$@" <<'PY'
 import json, sys
-version, zip_name, size, sha = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-notes = "\n".join(sys.argv[5:])
-manifest = {
-    "version": version,
-    "notes": notes,
-    "url": f"http://203.195.201.85/.well-known/acme-challenge/islandhop/{zip_name}",
-    "sha256": sha,
-    "size": size,
-}
-open("dist/manifest.json", "w").write(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-print(json.dumps(manifest, ensure_ascii=False, indent=2))
+version, zip_name, size, sha, base, legacy = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], sys.argv[6]
+notes = "\n".join(sys.argv[7:])
+common = {"version": version, "notes": notes, "sha256": sha, "size": size}
+main = dict(common, url=f"{base.rstrip('/')}/{zip_name}")
+old = dict(common, url=f"{legacy.rstrip('/')}/{zip_name}")
+for path, data in (("dist/manifest.json", main), ("dist/manifest-legacy.json", old)):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+print(json.dumps(main, ensure_ascii=False, indent=2))
 PY
 
-echo "==> rsync 到 $SERVER:$REMOTE_DIR/"
-ssh "$SERVER" "mkdir -p '$REMOTE_DIR'"
-rsync -avz --checksum "dist/$ZIP_NAME" "dist/manifest.json" "$SERVER:$REMOTE_DIR/"
+echo "==> 推送到 $SERVER:$PORTAL_DIR/（门户）与旧兼容目录"
+ssh "$SERVER" "mkdir -p '$PORTAL_DIR' '$LEGACY_DIR'"
+rsync -avz --checksum "dist/$ZIP_NAME" "dist/manifest.json" "$SERVER:$PORTAL_DIR/"
+rsync -avz --checksum "dist/$ZIP_NAME" "$SERVER:$LEGACY_DIR/"
+rsync -avz --checksum "dist/manifest-legacy.json" "$SERVER:$LEGACY_DIR/manifest.json"
+
+echo "==> 刷新门户网页版本卡片（云端同步器；失败不影响客户端更新）"
+ssh "$SERVER" "timeout 120 python3 /opt/ncsai-portal/deploy/sync_github.py --quiet" || \
+  echo "!! 同步器本次未成功（timer 会重试），客户端 manifest 已生效"
 
 echo "==> 验证线上可访问"
-curl --noproxy '*' -fsS "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json" || \
-  echo "!! manifest 还不可访问：请检查 $REMOTE_DIR"
-echo "✔ 推送完成：v${VERSION}（客户端下次启动/检查更新即收到）"
+curl --noproxy '*' -sk -fsS "https://203.195.201.85/home/updates/islandhop/manifest.json" || \
+  echo "!! 门户 manifest 还不可访问，请检查 $PORTAL_DIR"
+curl --noproxy '*' -fsS "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json" >/dev/null || \
+  echo "!! 旧地址兼容 manifest 不可访问，请检查 $LEGACY_DIR"
+echo "✔ 推送完成：v${VERSION}（网页与新旧客户端下次检查更新即收到）"

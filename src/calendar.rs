@@ -309,13 +309,29 @@ pub mod secrets {
 
 #[cfg(not(windows))]
 pub mod secrets {
-    pub fn save(_cfg: &super::Config, _password: &str) -> Result<(), String> {
-        Err("仅 Windows 支持凭据管理器".into())
+    /// 凭据进 macOS 钥匙串（keyring macos-native）；键是「平台:用户名」。
+    /// 上游岛仔只实现了 Windows；IslandHop 双端可用，Mac 端补齐。
+    pub fn save(cfg: &super::Config, password: &str) -> Result<(), String> {
+        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
+            .map_err(|e| format!("钥匙串不可用：{e}"))?;
+        entry.set_password(password).map_err(|e| format!("保存密码失败：{e}"))
     }
-    pub fn load(_cfg: &super::Config) -> Result<String, String> {
-        Err("仅 Windows 支持凭据管理器".into())
+
+    pub fn load(cfg: &super::Config) -> Result<String, String> {
+        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
+            .map_err(|e| format!("钥匙串不可用：{e}"))?;
+        entry.get_password().map_err(|_| "没有保存密码".to_string())
     }
-    pub fn delete(_cfg: &super::Config) {}
+
+    pub fn delete(cfg: &super::Config) {
+        if let Ok(entry) = keyring::Entry::new(super::SERVICE, &name(cfg)) {
+            let _ = entry.delete_credential();
+        }
+    }
+
+    fn name(cfg: &super::Config) -> String {
+        format!("{}:{}", cfg.provider.key(), cfg.username.trim().to_ascii_lowercase())
+    }
 }
 
 // ---------------------------------------------------------------- 粘贴拆分

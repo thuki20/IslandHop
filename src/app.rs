@@ -412,6 +412,9 @@ pub struct FrameOut {
     /// 鼠标命中区（相对 `win` 左上角），区域外点击穿透到下层窗口。
     pub hit: Rect,
     pub notice_hit: Option<Rect>,
+    /// macOS：HUD 下挂卡片区域。仅当卡片本帧可见时存在，此时该区域要能被点击
+    /// 命中（否则鼠标事件穿透到下层应用）；收起时为空，区域保持穿透。
+    pub hud_hit: Option<Rect>,
     /// 文件拖入感应区；独立于普通鼠标命中区。
     pub file_drop_zone: Option<Rect>,
     /// 展开状态立即生效，不等待展开动画结束。
@@ -751,6 +754,9 @@ pub struct App {
     pub(crate) notice: Option<Alert>,
     pub(crate) hud_notice: Option<Alert>,
     hud_alpha: f32,
+    /// macOS 菜单栏模式下 HUD 下挂卡片的矩形（本帧实际绘制位置）。
+    /// 只有它非空时才把这块区域算进鼠标命中区，收起状态下必须能点击穿透。
+    hud_drop: Option<Rect>,
     notice_width: Spring,
     notice_details: bool,
     pub pending_messengers:Vec<Unread>,
@@ -893,7 +899,7 @@ impl App {
             music_artwork: None,
             forced_open_until:0.0, settings_open:false, settings_window:std::sync::Arc::new(std::sync::Mutex::new(crate::settings_window::State::load())), displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, messenger_statuses:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
             listener_status: "尚未连接".into(),
-            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
+            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, hud_drop: None, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
             todo_first: 0, todo_choosing: false, pet: Default::default(), last_drink: None,
             toast: None, toast_below: false,
             last_input: 0.0, system_idle: None,
@@ -1682,6 +1688,8 @@ impl App {
         let elapsed = self.last_t.map(|at| (env.t - at).max(0.0) as f32).unwrap_or(0.0);
         self.last_t = Some(env.t);
         self.t = env.t;
+        // 每帧重建：只有本帧真正画出 HUD 卡片时才占用鼠标命中区。
+        self.hud_drop = None;
         self.quota_tick();
         self.weather_tick();
         self.current_hour=env.hour();
@@ -1941,6 +1949,8 @@ impl App {
                 if crate::mac_window::menu_bar_height().is_some() {
                     let (tw,th)=self.notice_size(&a);
                     let rect=Rect::from_min_size(Pos2::new(cx-tw/2.0,top+bar_h()+8.0),Vec2::new(tw,th));
+                    // 只在卡片真的在屏幕上时才登记命中区（本帧重绘即失效）。
+                    self.hud_drop=Some(rect);
                     let from=crate::skin_paint::shape_count(&ctx,layer);
                     shape::shadow(&painter,rect,0.0,0.0,12.0,0.5*shadow_k);
                     painter.rect_filled(rect,12.0,self.glass_fill());
@@ -2122,6 +2132,7 @@ impl App {
             glass: glass_region,
             hit: rel(if side {self.side_hit_rect(win,self.progress())} else {self.hit_rect(cx, top, self.progress())}),
             notice_hit:notice_shape.into_iter().chain(notice_details).chain(messenger_rect).chain(self.shelf_menu_rect).reduce(|a,b|a.union(b)).map(rel),
+            hud_hit: self.hud_drop.map(rel),
             file_drop_zone:self.settings.visible_pages[3].then(||rel(if side {self.island_rect(win,PW,self.expanded_height())} else {Rect::from_min_size(Pos2::new(cx-PW/2.0,top),Vec2::new(PW,96.0))})),
             expanded: self.open,
             editing: self.is_editing(),

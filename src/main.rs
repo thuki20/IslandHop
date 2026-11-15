@@ -648,7 +648,11 @@ impl eframe::App for Shell {
         let passthrough = {
             let mut hits = vec![out.hit];
             hits.extend(out.notice_hit);
-            hits.extend(out.file_drop_zone);
+            hits.extend(out.hud_hit);
+            // 注意：不要把 out.file_drop_zone 加进来。它是 Windows 专用的
+            // 拖放感应区（native.rs 用 SetWindowRgn 让它接 WM_DROPFILES），
+            // macOS 上没有拖放实现，加进来只会让岛下方 PW×96pt 那条透明带
+            // 永久吃掉鼠标点击 —— 「岛下弹窗位置点不动」的真正原因。
             // IslandHop：把这些命中区注册成引擎的「UI 排除区」——岛体/面板贴在
             // 跨屏边缘上，光标在其上不能被引擎当作跨屏意图 grab 输入。
             #[cfg(target_os = "macos")]

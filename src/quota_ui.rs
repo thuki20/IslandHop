@@ -200,11 +200,14 @@ fn ring(c:&Card,a:&Account,snapshot:Option<&Snapshot>,x:f32,y:f32,size:f32,color
     }
     if a.provider==Provider::Kiro{logo(c,a.provider,x,y,if size<35.0{if dual{10.0}else{12.0}}else if dual{24.0}else{34.0});}
     else if a.provider==Provider::ZCode && windows.is_empty(){logo(c,a.provider,x,y,if size<35.0{size-3.0}else{size*0.72});}
-    else if size<35.0 {logo(c,a.provider,x,y,if dual{10.0}else{12.0});}else if dual {logo(c,a.provider,x,y,24.0);}else if let Some(w)=windows.first(){
-        let value=format!("{:.0}",w.remaining);let large=if value.len()>2{22.0}else{28.0};
-        let number_width=c.text_w(&value,large,W::Bold);let width=number_width+c.text_w("%",11.0,W::Semibold)+2.0;
+    else if size<35.0 {logo(c,a.provider,x,y,if dual{10.0}else{12.0});}else if dual {logo(c,a.provider,x,y,24.0);    }else if let Some(w)=windows.first(){
+        // 三位数（100%）时整组收紧：数字 20 / 百分号 9.5 / 间距 1.5，
+        // 否则「%」右下角会顶到环内缘（可读性测试要求留 ≥0.5pt 余量）。
+        let value=format!("{:.0}",w.remaining);
+        let (large,pct,gap)=if value.len()>2{(20.0,9.5,1.5)}else{(28.0,11.0,2.0)};
+        let number_width=c.text_w(&value,large,W::Bold);let width=number_width+c.text_w("%",pct,W::Semibold)+gap;
         let left=x-width/2.0;c.centered_text(left,y,&value,large,W::Bold,theme::WHITE,H::Left);
-        c.centered_text(left+number_width+2.0,y+3.0,"%",11.0,W::Semibold,theme::GRAY,H::Left);
+        c.centered_text(left+number_width+gap,y+3.0,"%",pct,W::Semibold,theme::GRAY,H::Left);
     }else{c.centered_text(x,y,"—",24.0,W::Semibold,theme::DIM,H::Center);}
 }
 fn reset_text(at:Option<i64>,now:&chrono::DateTime<chrono::Local>)->String {

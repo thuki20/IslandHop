@@ -1808,7 +1808,7 @@ impl App {
                                     }
                                 }
                             });
-                            ui.label(egui::RichText::new("授权码存储在 Windows 凭据管理器中。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                            ui.label(egui::RichText::new(if cfg!(windows){"授权码存储在 Windows 凭据管理器中。"}else{"授权码存储在 macOS 钥匙串中。"}).size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             });
                             }
                             ui.label(egui::RichText::new("图片中的验证码请在邮箱查看。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
