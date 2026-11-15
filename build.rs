@@ -29,6 +29,22 @@ fn find_rc() -> Option<PathBuf> {
     found.pop()
 }
 
+/// 无 Windows SDK 时的兜底：GNU 工具链自带的 windres 也能编 RC。
+fn find_windres() -> Option<PathBuf> {
+    let names = ["windres.exe", "x86_64-w64-mingw32-windres.exe"];
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            for name in names {
+                let exe = dir.join(name);
+                if exe.exists() {
+                    return Some(exe);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=packaging/assets/AppIcon.ico");
@@ -37,8 +53,8 @@ fn main() {
         return;
     }
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("daozai.res");
-    let Some(rc) = find_rc() else {
-        println!("cargo:warning=rc.exe 未找到，跳过图标资源");
+    let Some(rc) = find_rc().or_else(find_windres) else {
+        println!("cargo:warning=rc.exe / windres 都未找到，跳过图标资源");
         return;
     };
     // 版本资源按 Cargo.toml 的版本号现生成：app.rc 里的版本是占位符，
@@ -60,14 +76,28 @@ fn main() {
         println!("cargo:warning=写入版本资源失败");
         return;
     }
-    let status = Command::new(&rc)
-        .arg("/nologo")
-        .arg("/fo")
-        .arg(&out)
-        .arg(&rc_source)
-        .status();
+    let is_windres = rc
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains("windres"));
+    let status = if is_windres {
+        // windres：输入 RC，输出 COFF 目标文件（GNU ld 直接链接）。
+        Command::new(&rc)
+            .arg("-O")
+            .arg("coff")
+            .arg(&rc_source)
+            .arg(&out)
+            .status()
+    } else {
+        Command::new(&rc)
+            .arg("/nologo")
+            .arg("/fo")
+            .arg(&out)
+            .arg(&rc_source)
+            .status()
+    };
     if !status.map(|s| s.success()).unwrap_or(false) {
-        println!("cargo:warning=rc.exe 编译 app.rc 失败");
+        println!("cargo:warning=资源编译器（{}）编译 app.rc 失败", rc.display());
         return;
     }
     println!("cargo:rustc-link-arg={}", out.display());
