@@ -28,6 +28,18 @@ cp "$BIN" "$APP/Contents/MacOS/IslandHop"
 chmod +x "$APP/Contents/MacOS/IslandHop"
 cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"
 
+# 歌词数据源：mediaremote-adapter（BSD-3，ungive/mediaremote-adapter v0.7.7）。
+# 借系统 /usr/bin/perl 的可信身份（com.apple.perl5）读 macOS 15.4+ 被封锁的 MediaRemote，
+# 运行时由 src/macos_sys.rs 以「Resources/mediaremote-adapter」相对自身定位并调用。
+MRA="packaging/mra"
+if [ -d "$MRA/MediaRemoteAdapter.framework" ]; then
+  mkdir -p "$APP/Contents/Resources/mediaremote-adapter"
+  cp -R "$MRA/MediaRemoteAdapter.framework" "$APP/Contents/Resources/mediaremote-adapter/"
+  cp "$MRA/mediaremote-adapter.pl" "$MRA/LICENSE" "$APP/Contents/Resources/mediaremote-adapter/"
+  # 先签嵌套框架，再签外层 app（--deep 会覆盖嵌套签名，保持顺序）
+  codesign --force --timestamp=none --sign - "$APP/Contents/Resources/mediaremote-adapter/MediaRemoteAdapter.framework" 2>/dev/null || true
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

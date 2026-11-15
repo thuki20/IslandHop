@@ -135,7 +135,59 @@ fn process_running(name: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// mediaremote-adapter 资源目录（.app/Contents/Resources/mediaremote-adapter）。
+/// 开发机直跑二进制时不存在，返回 None 走 AppleScript 兜底。
+fn adapter_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("Resources").join("mediaremote-adapter");
+    let script = dir.join("mediaremote-adapter.pl");
+    let framework = dir.join("MediaRemoteAdapter.framework");
+    (script.is_file() && framework.is_dir()).then(|| (script, framework))
+}
+
+/// 用 mediaremote-adapter 读系统「正在播放」（macOS 15.4+ 对第三方封锁了
+/// MediaRemote；该工具借 /usr/bin/perl 的可信身份 com.apple.perl5 调用，
+/// 因此网易云、QQ音乐等任意播放器都能读到，含播放位置）。
+fn adapter_now_playing() -> Option<crate::smtc::NowPlaying> {
+    let (script, framework) = adapter_paths()?;
+    let out = Command::new("/usr/bin/perl").arg(&script).arg(&framework)
+        .args(["get", "--now", "--no-artwork"]).output().ok()?;
+    if !out.status.success() { return None; }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    adapter_json_to_now_playing(value)
+}
+
+/// 适配器 JSON → NowPlaying。键名来自上游 v0.7.7（packaging/mra/LICENSE）。
+fn adapter_json_to_now_playing(value: serde_json::Value) -> Option<crate::smtc::NowPlaying> {
+    use serde_json::Value;
+    let object = value.as_object()?; // 无媒体播放时输出 null
+    let title = object.get("title").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    if title.is_empty() { return None; }
+    let text = |key: &str| object.get(key).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    let num = |key: &str| object.get(key).and_then(Value::as_f64).unwrap_or_default();
+    Some(crate::smtc::NowPlaying {
+        title,
+        artist: text("artist"),
+        album: text("album"),
+        // bundle id 形如 com.netease.163music / com.apple.Music；显示用取尾段。
+        source: object.get("bundleIdentifier").and_then(Value::as_str)
+            .and_then(|id|id.rsplit('.').next()).unwrap_or("MediaRemote").to_string(),
+        song_id: None,
+        playing: object.get("playing").and_then(Value::as_bool).unwrap_or(false),
+        position: num("elapsedTimeNow"),
+        sampled_at: Some(Instant::now()),
+        event_time_ms: None,
+        duration: num("duration"),
+        artwork: None,
+        playback_type: crate::smtc::MediaKind::Music,
+        volume: None,
+    })
+}
+
 fn query_media() -> Option<crate::smtc::NowPlaying> {
+    // 首选 mediaremote-adapter：覆盖全部播放器（含网易云/QQ 音乐），带实时进度；
+    // 适配器缺失（旧包/开发机直跑）或失败时退回 Music / Spotify 的 AppleScript。
+    if let Some(media) = adapter_now_playing() { return Some(media); }
     for app in ["Music", "Spotify"] {
         if !process_running(app) { continue; }
         let script = format!(
@@ -222,4 +274,36 @@ pub fn start(ctx: egui::Context) -> Receiver<Snapshot> {
         std::thread::sleep(Duration::from_millis(1500));
     });
     rx
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use serde_json::json;
+
+    // 用实机（macOS 15.8 / 网易云）抓到的真实输出截断 artwork 后构造。
+    #[test]
+    fn adapter_json_maps_netease_now_playing() {
+        let media = adapter_json_to_now_playing(json!({
+            "playbackRate": 0, "album": "Going Seventeen", "elapsedTimeNow": 206.88,
+            "elapsedTime": 206.88, "bundleIdentifier": "com.netease.163music",
+            "processIdentifier": 53005, "title": "글쎄", "duration": 231.899,
+            "artist": "SEVENTEEN", "playing": false
+        })).expect("网易云的正在播放必须能映射");
+        assert_eq!(media.title, "글쎄");
+        assert_eq!(media.artist, "SEVENTEEN");
+        assert_eq!(media.album, "Going Seventeen");
+        assert_eq!(media.source, "163music");
+        assert_eq!(media.duration, 231.899);
+        assert_eq!(media.position, 206.88);
+        assert!(!media.playing);
+        assert!(media.is_music());
+        assert!(media.sampled_at.is_some());
+    }
+
+    #[test]
+    fn adapter_json_rejects_null_and_empty_title() {
+        assert!(adapter_json_to_now_playing(serde_json::Value::Null).is_none(), "无媒体播放时适配器输出 null");
+        assert!(adapter_json_to_now_playing(json!({"title": "  "})).is_none(), "空标题不能当成有效媒体");
+    }
 }

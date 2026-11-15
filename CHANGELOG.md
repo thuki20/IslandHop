@@ -1,5 +1,10 @@
 # 更新记录
 
+## v0.6.71
+
+- macOS 歌词/正在播放支持所有播放器（网易云、QQ音乐等）：macOS 15.4 起 Apple 封锁了系统级「正在播放」API（MediaRemote），第三方应用读不到任何播放信息，歌词因此只对 Music/Spotify（AppleScript）生效。现集成开源 mediaremote-adapter v0.7.7（BSD-3）：借系统 /usr/bin/perl 的可信身份读取系统媒体会话，无需 sudo、不装系统组件，随 app 分发；歌词管线（匹配 QQ/网易云/LRCLIB + 进度同步）原样复用。
+- 适配器不可用时自动回退 Music/Spotify AppleScript 通道，行为与旧版一致。
+
 ## v0.6.70
 
 - 修复 macOS 上「运行中应用的 Dock 图标显示成黑底白 e」的问题：macOS（15.8 实测）对运行中的进程解析不出 bundle 图标，只有退出后钉选槽位才恢复正确。现在启动时由应用主动声明系统图标（内嵌与 .app 包同一份 AppIcon），Dock / 程序切换器与 Finder 显示一致，无需重启 Dock。
