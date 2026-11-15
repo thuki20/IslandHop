@@ -41,11 +41,30 @@ fn main() {
         println!("cargo:warning=rc.exe 未找到，跳过图标资源");
         return;
     };
+    // 版本资源按 Cargo.toml 的版本号现生成：app.rc 里的版本是占位符，
+    // 以前写死成 0.6.64，每次发版 Windows 包都会因为「Executable version
+    // mismatch」打不出来（scripts/package.ps1 会校验 FileVersion）。
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
+    // FILEVERSION 要四位：0.6.75 → 0,6,75,0
+    let mut parts: Vec<String> = version.split('.').map(str::to_owned).collect();
+    while parts.len() < 4 {
+        parts.push("0".into());
+    }
+    let comma = parts.join(",");
+    let template = fs::read_to_string("app.rc").unwrap_or_default();
+    let generated = template
+        .replace("@VERSION_COMMA@", &comma)
+        .replace("@VERSION_DOT@", &version);
+    let rc_source = PathBuf::from(env::var("OUT_DIR").unwrap()).join("app.versioned.rc");
+    if fs::write(&rc_source, generated).is_err() {
+        println!("cargo:warning=写入版本资源失败");
+        return;
+    }
     let status = Command::new(&rc)
         .arg("/nologo")
         .arg("/fo")
         .arg(&out)
-        .arg("app.rc")
+        .arg(&rc_source)
         .status();
     if !status.map(|s| s.success()).unwrap_or(false) {
         println!("cargo:warning=rc.exe 编译 app.rc 失败");

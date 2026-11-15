@@ -491,10 +491,12 @@ impl eframe::App for Shell {
             let scale=self.app.settings.island_scale();
             // OLED 像素偏移：与 Windows 同一套时间表，收起静止时逐像素挪；macOS 的
             // 定位是自己算 OuterPosition，所以这里把位移叠进坐标并纳入 placement_key。
-            let shift=if self.app.settings.oled_shift && self.app.oled_shift_idle(ctx) {
-                ctx.request_repaint_after(daozai::oled_shift::until_next_step(self.t0.elapsed()));
-                daozai::oled_shift::toward(self.mac_shift,daozai::oled_shift::shift(true,self.app.settings.dock,self.t0.elapsed()))
-            } else {self.mac_shift};
+            // 关掉开关时目标直接回 (0,0)，不会把上次的偏移永远留在屏幕上。
+            let shift=if !self.app.settings.oled_shift {(0,0)}
+                else if self.app.oled_shift_idle(ctx) {
+                    ctx.request_repaint_after(daozai::oled_shift::until_next_step(self.t0.elapsed()));
+                    daozai::oled_shift::toward(self.mac_shift,daozai::oled_shift::shift(true,self.app.settings.dock,self.t0.elapsed()))
+                } else {self.mac_shift};
             self.mac_shift=shift;
             let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar,shift);
             if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.mac_scale!=scale || self.placement_key!=placement_key {
