@@ -19,7 +19,8 @@ IslandHop 是把 Windows 版「岛仔（xiaotang-daozai）」全量 fork 到 mac
 | 本地目录 | `/Users/Tsuki/Downloads/IslandHop` |
 | 技术栈 | Rust 2021 · eframe/egui 0.31（vendored）· winit 0.30.13 · objc2 0.6 · keyring 3 |
 | 主产物 | `IslandHop.app`（macOS，ad-hoc 或 `OpenHopSign` 签名） |
-| 更新源 | `https://ncsai.top/home/updates/islandhop/manifest.json`（旧地址兼容 `http://203.195.201.85/.well-known/acme-challenge/islandhop/`） |
+| 版本 | v0.6.68 |
+| 更新源 | **多源自动回退**（`src/updates.rs: FEEDS`）：① `https://203.195.201.85/home/updates/islandhop/`（当前生效，LE **IP 证书**）② `http://203.195.201.85/.well-known/acme-challenge/islandhop/`（无证书兜底）③ `https://ncsai.top/home/updates/islandhop/`（**目前不可用**，见 §6 第 14 条） |
 | 测试基线 | `cargo test --release --lib` → 904 passed / 0 failed / 77 ignored |
 
 ---
@@ -42,6 +43,10 @@ open /Applications/IslandHop.app             # 或先 cp -R IslandHop.app /Appli
 ```
 
 **依赖前置**：Xcode Command Line Tools（`xcode-select --install`）。本机没有 Homebrew，也不需要。
+
+> **别整个文件夹拷过去**：本机仓库 12G，其中 `target/` 占 11G（编译产物，换机器必须重编）、
+> `.git` 只有 15M、`dist/` 是历史 zip 55M。走 `git clone` 拿到的是干净源码，几分钟就能编译好。
+> 只有一种情况需要拷文件：对方**没有 github 访问权限**——那就 `git bundle` 或打包源码目录并排除 `target/`。
 
 ---
 
@@ -70,7 +75,7 @@ bash packaging/push-update.sh "更新说明第一行" "第二行" "第三行"
 |---|---|---|
 | `ssh ncsai` 别名 | 脚本用 `ssh ncsai` 推 203.195.201.85，别名配在**本机** `~/.ssh/config` | 新机补 ssh 配置，或把 zip+manifest 拷给有权限的机器推；也可 `ISLANDHOP_UPDATE_SERVER=user@host` 覆盖 |
 | 签名证书 `OpenHopSign` | 本机钥匙串自建代码签名证书，TCC 按「签名身份 + bundle id」记授权 | 新机没有该证书会退回 ad-hoc → **每次重打包都要重新授权辅助功能**。要稳定就新建同名证书：钥匙串访问 → 证书助理 → 创建证书 → 类型「代码签名」 |
-| 客户端更新源 | 客户端硬编码 `https://ncsai.top/...`（`src/updates.rs: FEED_URL`） | 换源改这一处即可 |
+| 客户端更新源 | 已改为多源候选（`src/updates.rs: FEEDS`），按序自动回退，域名排最后 | 无需改；调试单个源用 `ISLANDHOP_FEED_URL=<url>` 覆盖 |
 
 ---
 
@@ -127,7 +132,7 @@ macOS 菜单栏模式下**下挂到岛体下方 8pt**，画成独立圆角卡片
 
 ---
 
-## 4. 已实现能力（v0.6.64 → v0.6.67）
+## 4. 已实现能力（v0.6.64 → v0.6.68）
 
 | 能力 | 实现要点 | 提交 |
 |---|---|---|
@@ -140,6 +145,7 @@ macOS 菜单栏模式下**下挂到岛体下方 8pt**，画成独立圆角卡片
 | HUD 下挂岛体下方 | `fading_hud` 分支独立卡片 + 投影 + `ISLANDHOP_HUD_DEMO` 演示钩子 | `61f7105` |
 | 岛下方点击被吞修复 | 排除 Windows 专用 `file_drop_zone`；`hud_hit` 仅可见时登记；穿透改读 NSWindow 真值 | `4aecb80` |
 | 测试基线全绿 | 月历间距 / macOS 钥匙串 / 额度环溢出 / 主题容差 | `4aecb80` |
+| 更新通道多源回退 | `FEEDS` 按序尝试 https+IP → http+IP → 域名，首个可用即用；manifest 的 url 与源自洽 | `76a166d` |
 
 ---
 
@@ -207,6 +213,16 @@ cargo test --release --lib settings_theme; pkill yes
     注入假的 `CursorMoved + CursorLeft`，删了补丁岛内按钮又会"点不动"。
 13. **命中区只登记"看得见的东西"** —— 任何"预留位置"都会被用户感知为"这里点不动"；
     本次 bug 就是 Windows 专用的 96pt 拖放区泄漏到 macOS 命中表。
+14. **`ncsai.top` 的 443 目前公网不通，别拿它当更新源** —— 症状：TCP 能连，但带
+    `SNI=ncsai.top` 的 ClientHello 一发出去就被 RST（Mac 和外部节点都复现）；而服务器本机
+    `curl --resolve ncsai.top:443:203.195.201.85` 返回 200，说明 nginx 完全正常，阻断在链路。
+    同时 nginx 用的是 Let's Encrypt **IP 证书**（`/etc/nginx/ssl/ncsai.crt`，SAN 只有
+    `IP Address:203.195.201.85`，无域名），域名访问必然证书不匹配。
+    → 所以 `FEEDS` 把域名排在最后，日常走 IP；域名要能用需先解决 443 阻断（备案/腾讯云接入），
+    再补域名证书 + nginx `server_name`。
+15. **IP 证书只有 6 天有效期** —— LE 短期 IP 证书，`acme.sh` cron 每 6 小时跑一次
+    （`Le_ReloadCmd = systemctl reload nginx`）。若某天 OTA 全面失效，先查
+    `openssl x509 -in /etc/nginx/ssl/ncsai.crt -noout -dates` 和 `~/.acme.sh/*/` 续期日志。
 
 ---
 
@@ -244,9 +260,9 @@ pkill -f IslandHop; sleep 2
 rm -rf /Applications/IslandHop.app && cp -R IslandHop.app /Applications/
 open /Applications/IslandHop.app
 
-# 校验线上包
-curl --noproxy '*' -fsS https://ncsai.top/home/updates/islandhop/manifest.json
-shasum -a 256 dist/IslandHop-v0.6.67-macos.zip
+# 校验线上包（走 IP，域名当前不通）
+curl --noproxy '*' -fsS https://203.195.201.85/home/updates/islandhop/manifest.json
+shasum -a 256 dist/IslandHop-v0.6.68-macos.zip
 ```
 
 ---
