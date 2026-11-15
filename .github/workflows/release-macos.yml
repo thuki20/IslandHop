@@ -43,8 +43,10 @@ concurrency:
 
 jobs:
   release:
-    # macos-14 = Apple Silicon (arm64)，与目标机型一致；公开仓库的 macOS runner 免费
-    runs-on: macos-14
+    # macos-15 = Apple Silicon (arm64)，与目标机型一致；公开仓库的 macOS runner 免费。
+    # 不要用 macos-14：本仓库实测该标签 1 秒内 cancelled（0 steps，runner 未分配），
+    # 同一次探针里 macos-15 正常跑通、macos-13 长期 queued。可用仓库变量覆盖。
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-15' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
