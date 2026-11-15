@@ -262,15 +262,21 @@ mod imp {
         }
     }
 
-    /// 系统菜单栏高度：主屏 frame 与 visibleFrame（去掉菜单栏/程序坞后的可见区）之差。
+    /// 系统菜单栏高度：主屏顶部到 visibleFrame 顶部的距离。
+    ///
+    /// 必须用「frame 顶 − visibleFrame 顶」，不能直接拿两个高度相减：
+    /// Dock 在底部时 visibleFrame 同时缩小了菜单栏和 Dock 两段，
+    /// 高度差 = 菜单栏 + Dock（本机实测 103pt），护栏直接把它拒掉、
+    /// 返回 None，刘海左右分列布局（notch_slots）就永远不会生效，
+    /// 常驻内容会整排压在摄像头刘海死区上。
     pub fn menu_bar_height() -> Option<f32> {
         unsafe {
             let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
             if screen.is_null() { return None }
             let frame: NSRect = msg_send![screen, frame];
             let visible: NSRect = msg_send![screen, visibleFrame];
-            let h = frame.size.height - visible.size.height;
-            // 合理性护栏：菜单栏高度只可能是几十个点；Dock 在左侧时差值会异常大。
+            let h = (frame.origin.y + frame.size.height) - (visible.origin.y + visible.size.height);
+            // 合理性护栏：菜单栏高度只可能是几十个点（刘海机 37-38 / 普通机 24-25）。
             (h > 10.0 && h < 64.0).then(|| h as f32)
         }
     }
