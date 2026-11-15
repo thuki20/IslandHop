@@ -1781,13 +1781,17 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠+天气，
-        // 右=AI额度（+音乐/专注/铃铛）；时钟隐藏。刘海机型中间留物理空洞，
-        // 胶囊机型用固定间距替代。Windows 与测试环境（menu_bar_height=None）不启用。
+        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠，
+        // 右=天气(温度)（+音乐/专注/铃铛）；AI 额度环不进常驻行（避免撑宽岛体），
+        // 时钟隐藏。刘海机型中间留物理空洞，整行再下挂到刘海下缘之下，
+        // 胶囊机型用固定间距替代且不下挂。Windows 与测试环境不启用。
         if !self.side() && !self.effective_minimal() && !self.island_lyrics_active()
             && crate::mac_window::menu_bar_height().is_some() {
-            let gap = crate::mac_window::notch_layout().map(|(gap, _)| gap).unwrap_or(0.0);
-            layout.notch_slots(gap);
+            let (gap,drop)=match crate::mac_window::notch_layout(){
+                Some((gap,_))=>(gap,notch_shelf()),
+                None=>(0.0,0.0),
+            };
+            layout.notch_slots(gap,drop);
         }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {
@@ -2864,7 +2868,7 @@ impl App {
             if let Some(x)=layout.x[bar::WEATHER] { self.draw_pill_weather(&c,local_cx+x,&layout); }
         }
         if self.pomo.running && compact_alpha>0.004 {
-            crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
+            if let Some(x)=layout.x[bar::FOCUS] {crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+x,15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);}
         }
     }
 

@@ -15,7 +15,10 @@
 //!   DPAPI / 登录文件路径绑定的凭据文件 `credentials/*.bin`（豆包等需要各自重登）。
 //! * **冲突口径**：`rev` 大者胜；`rev` 相同比 `updated_at`；仍相同则 **Mac 胜出**
 //!   （「所有数据以 mac 为主」——OpenHop 的 Role::Server 是键鼠主控端，与数据
-//!   主设备无关）。收到并应用后立刻重算本地指纹，避免两台互推回环。
+//!   主设备无关）。注意：**账号 / 日历 / 邮件 / 凭据是并集型数据，不参与 LWW
+//!   裁决**，任何快照都无条件求并集，否则 Mac 会把 Windows 整包拒收，
+//!   邮箱与飞书/钉钉账号永远克隆不过来。收到并应用后立刻重算本地指纹，
+//!   避免两台互推回环。
 //! * **落盘**：一律「先写盘、再刷新内存」。上游 `App::new()` 与跨天 `tick()` 都会
 //!   用磁盘文件覆盖内存，不落盘会在重启/跨天后回退。
 
@@ -38,6 +41,12 @@ const SYNC_SETTING_KEYS: &[&str] = &[
     "clock_12h", "clock_period", "show_battery", "pet", "minimal",
     "skin", "island_shape", "settings_theme", "visible_pages", "page_order",
     "resident_order", "notifications", "sound", "lyrics_enabled", "system_hud",
+    // 消息 / 会议提醒开关（企业微信、飞书、钉钉等）
+    "read_notifications", "wechat_notifications", "wecom_notifications",
+    "feishu_notifications", "dingtalk_notifications", "bluetooth_notifications",
+    // 邮箱与日程偏好（账号清单本身走下面的 mail / calendar 通道）
+    "mail_enabled", "mail_sync_operations", "mail_code", "mail_interval",
+    "calendar_prompt", "calendar_auto_sync",
     // 岛上歌词（桌面歌词）：开关与时间偏移、通知预览
     "island_lyrics", "lyric_delay_ms", "notification_preview",
 ];
@@ -62,6 +71,11 @@ pub struct SyncPayload {
     /// 值是明文密码 / 授权码 / API Key。只走 OpenHop 的加密 TCP 通道，
     /// 不落任何明文文件；两端都用本机 keyring 存储。
     pub secrets: Vec<(String, String)>,
+    /// 发送端版本。旧客户端（v0.6.72 及以前）没有这个字段，反序列化后为空串，
+    /// 设置页会显示「旧版（未上报版本）」——这也是「账号/凭据没同步过来」最常见
+    /// 的根因：对端根本不会发送 mail / calendar / secrets 这些字段。
+    #[serde(default)]
+    pub version: String,
 }
 
 fn read_text(path: &Path) -> Option<String> {
@@ -168,6 +182,7 @@ pub fn snapshot() -> String {
         calendar: read_text(&dir.join("calendar.json")),
         local_calendar: read_text(&dir.join("local-calendar.json")),
         secrets: collect_secrets(),
+        version: env!("CARGO_PKG_VERSION").into(),
     };
     serde_json::to_string(&payload).unwrap_or_default()
 }
@@ -187,7 +202,8 @@ fn collect_secrets() -> Vec<(String, String)> {
     // 指纹只含账号身份（不含内容），清单稳定时不在每次快照都读 keyring。
     let fingerprint = format!("{}|{}|{}",
         mail.split('"').filter(|s|s.contains('@')).collect::<Vec<_>>().join(","),
-        calendar.len(),
+        // 用日历配置原文而不是长度：新增/删除账号但字节数巧合相同时也要重新收集凭据。
+        calendar,
         quota.accounts.iter().filter(|a|a.provider.api_key()).map(|a|a.slot.clone().unwrap_or_default()).collect::<Vec<_>>().join(","));
     if let Ok(cache)=secret_cache().lock() {
         if cache.0==fingerprint { return cache.1.clone(); }
@@ -245,55 +261,75 @@ fn apply_secrets(secrets:&[(String,String)])->usize {
     saved
 }
 
+/// 账号类文件的合并指纹，用来判断「并集型数据」这次是否真的有写入。
+/// 避免每次心跳都重载内存状态、打断用户当前正在编辑的内容。
+fn union_fingerprint(dir: &Path) -> String {
+    ["ai-quota.json", "mail-accounts.json", "calendar.json", "local-calendar.json"]
+        .iter()
+        .map(|name| read_text(&dir.join(name)).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\u{1}")
+}
+
 /// 应用对端快照：先落盘、再刷新内存。`today` 来自 `Env`，保证当日饮水不跨天重置。
-pub fn apply(app: &mut App, payload: &str, today: &str, now: f64) -> bool {
+///
+/// `overwrite=true` 表示 LWW 裁决本机落败，覆盖型数据（设置 / 待办 / 饮水 / 便签）
+/// 整表接收；`overwrite=false` 时**只做账号类求并集**。
+///
+/// 账号 / 日历 / 邮件 / 凭据属于「并集型」数据，不受「Mac 为主」的 LWW 裁决影响：
+/// 否则两端 rev 相同时 Mac 会把整个 Windows 快照拒收，Windows 上的邮箱、
+/// 飞书 / 钉钉日历、AI 额度账号与授权码就永远克隆不过来。
+pub fn apply(app: &mut App, payload: &str, today: &str, now: f64, overwrite: bool) -> bool {
     let Ok(doc) = serde_json::from_str::<SyncPayload>(payload) else { return false; };
-    if doc.settings.is_empty() && doc.todo.is_none() && doc.water.is_none() {
-        return false; // 空快照不覆盖本机数据
-    }
+    let empty = doc.settings.is_empty() && doc.todo.is_none() && doc.water.is_none()
+        && doc.water_extra.is_none() && doc.shelf.is_none() && doc.accounts.is_none()
+        && doc.mail.is_none() && doc.calendar.is_none() && doc.local_calendar.is_none()
+        && doc.secrets.is_empty();
+    if empty { return false; } // 空快照不覆盖本机数据
     let dir: PathBuf = model::config_dir();
     let _ = std::fs::create_dir_all(&dir);
 
-    // settings.txt：白名单键合并，保留本机 display_id / dock / 路径等键。
-    let settings_path = dir.join("settings.txt");
-    let mut kv: Vec<(String, String)> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(&settings_path) {
-        for line in text.trim_start_matches('\u{feff}').lines() {
-            if let Some((k, v)) = line.split_once('=') {
-                kv.push((k.trim().to_owned(), v.trim().to_owned()));
+    if overwrite {
+        // settings.txt：白名单键合并，保留本机 display_id / dock / 路径等键。
+        let settings_path = dir.join("settings.txt");
+        let mut kv: Vec<(String, String)> = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(&settings_path) {
+            for line in text.trim_start_matches('\u{feff}').lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    kv.push((k.trim().to_owned(), v.trim().to_owned()));
+                }
             }
         }
-    }
-    for (k, v) in &doc.settings {
-        if !SYNC_SETTING_KEYS.contains(&k.as_str()) {
-            continue;
+        for (k, v) in &doc.settings {
+            if !SYNC_SETTING_KEYS.contains(&k.as_str()) { continue; }
+            kv.retain(|(existing, _)| existing != k);
+            kv.push((k.clone(), v.clone()));
         }
-        kv.retain(|(existing, _)| existing != k);
-        kv.push((k.clone(), v.clone()));
-    }
-    let body: String = kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    if model::atomic_write(&settings_path, body.as_bytes()).is_err() {
-        return false;
+        let body: String = kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+        if model::atomic_write(&settings_path, body.as_bytes()).is_err() { return false; }
+
+        let write = |name: &str, value: Option<&String>| {
+            if let Some(text) = value { let _ = model::atomic_write(&dir.join(name), text.as_bytes()); }
+        };
+        write("todo.txt", doc.todo.as_ref());
+        write("water.txt", doc.water.as_ref());
+        write("water-extra.txt", doc.water_extra.as_ref());
+        write("shelf.txt", doc.shelf.as_ref());
     }
 
-    let write = |name: &str, value: Option<&String>| {
-        if let Some(text) = value {
-            let _ = model::atomic_write(&dir.join(name), text.as_bytes());
-        }
-    };
-    write("todo.txt", doc.todo.as_ref());
-    write("water.txt", doc.water.as_ref());
-    write("water-extra.txt", doc.water_extra.as_ref());
-    write("shelf.txt", doc.shelf.as_ref());
+    // 账号类无条件求并集（幂等：内容没变就不写盘）。
+    let before = union_fingerprint(&dir);
     merge_accounts(&dir.join("ai-quota.json"), doc.accounts.as_deref());
     merge_mail(&dir.join("mail-accounts.json"), doc.mail.as_deref());
     merge_calendar(&dir.join("calendar.json"), doc.calendar.as_deref());
     merge_local_calendar(&dir.join("local-calendar.json"), doc.local_calendar.as_deref());
-    let secrets=apply_secrets(&doc.secrets);
-    if secrets>0 { set_status(format!("已从对端克隆 {secrets} 个账号凭据")); }
+    let secrets = apply_secrets(&doc.secrets);
+    let union_changed = secrets > 0 || union_fingerprint(&dir) != before;
+    if secrets > 0 { set_status(format!("已从对端克隆 {secrets} 个账号凭据")); }
 
-    app.apply_synced_state(today, now);
-    true
+    // 只在确实有变化时刷新内存，避免 15 秒心跳反复重载打断编辑。
+    if overwrite || union_changed { app.apply_synced_state(today, now); }
+    overwrite || union_changed
 }
 
 /// 邮件账号求并集（按 email 去重）：对端账号补进本机清单，本机同名账号保留。
@@ -431,6 +467,8 @@ pub struct SyncManager {
     updated_at: i64,
     last: String,
     device: String,
+    /// 对端客户端版本（诊断用）：空 = 还没收到对端数据；「旧版」= 对端没上报版本。
+    peer_version: String,
     last_peers: usize,
     last_push: Instant,
     clock: Option<Instant>,
@@ -447,6 +485,7 @@ impl SyncManager {
             updated_at: 0,
             last: snapshot(),
             device: crate::cross_screen::sync_device(),
+            peer_version: String::new(),
             last_peers: 0,
             last_push: Instant::now() - Duration::from_secs(60),
             clock: None,
@@ -469,14 +508,22 @@ impl SyncManager {
         let mut applied = 0usize;
         for msg in crate::cross_screen::sync_inbox() {
             if msg.device == self.device { continue; }
+            // 版本诊断：旧客户端没有 version 字段（serde default 为空串），
+            // 设置页会提示「旧版（未上报版本）」——这是账号没同步过来的头号根因。
+            if let Ok(doc) = serde_json::from_str::<SyncPayload>(&msg.payload) {
+                self.peer_version = if doc.version.is_empty() { "旧版（未上报版本）".into() } else { doc.version };
+            }
             if msg.payload == self.last && msg.rev == self.rev { continue; }
             let accept = msg.rev > self.rev
                 || (msg.rev == self.rev && msg.updated_at > self.updated_at)
                 || (msg.rev == self.rev && msg.updated_at == self.updated_at && !cfg!(target_os = "macos"));
-            if !accept { continue; }
-            if apply(app, &msg.payload, today, now) {
-                self.rev = msg.rev;
-                self.updated_at = msg.updated_at;
+            // accept=false 也要跑一遍：账号/日历/邮件/凭据无条件求并集，
+            // 否则「Mac 为主」会把 Windows 的整包拒掉，账号永远克隆不过来。
+            if apply(app, &msg.payload, today, now, accept) {
+                if accept {
+                    self.rev = msg.rev;
+                    self.updated_at = msg.updated_at;
+                }
                 // 关键：重算本地指纹，否则会把刚收到的数据原样回推造成无限互推。
                 self.last = snapshot();
                 applied += 1;
@@ -500,12 +547,14 @@ impl SyncManager {
         }
         self.last_peers = peers;
 
+        let peer = if self.peer_version.is_empty() { "等待对端数据".to_string() }
+            else { format!("对端 {}", self.peer_version) };
         set_status(if !connected {
             "未连接对端 · 本地数据保持独立".into()
         } else if applied > 0 {
-            format!("已从对端同步 · rev {} · {}", self.rev, describe(&self.last))
+            format!("已从对端同步 · rev {} · {} · {}", self.rev, describe(&self.last), peer)
         } else {
-            format!("已连接 {} 台 · 数据一致 · rev {} · {}", peers, self.rev, describe(&self.last))
+            format!("已连接 {} 台 · 数据一致 · rev {} · {} · {}", peers, self.rev, describe(&self.last), peer)
         });
     }
 }
@@ -584,5 +633,33 @@ mod merge_tests {
         for key in ["island_lyrics","lyric_delay_ms","notification_preview"] {
             assert!(SYNC_SETTING_KEYS.contains(&key),"桌面歌词相关键 {key} 必须在同步白名单里");
         }
+    }
+
+    #[test]
+    fn sync_setting_keys_cover_mail_calendar_and_messengers(){
+        for key in ["wecom_notifications","feishu_notifications","dingtalk_notifications",
+                    "read_notifications","wechat_notifications","bluetooth_notifications",
+                    "mail_enabled","mail_sync_operations","mail_code","mail_interval",
+                    "calendar_prompt","calendar_auto_sync"] {
+            assert!(SYNC_SETTING_KEYS.contains(&key),"{key} 必须在同步白名单里");
+        }
+    }
+
+    #[test]
+    fn legacy_payload_without_version_still_deserializes(){
+        // Windows 端若仍是旧版，payload 没有 version / mail / calendar / secrets；
+        // 新版必须能解析并在设置页提示「旧版（未上报版本）」。
+        let doc:SyncPayload=serde_json::from_str(r#"{"settings":[],"secrets":[]}"#).unwrap();
+        assert_eq!(doc.version,"");
+        assert!(doc.mail.is_none()&&doc.calendar.is_none()&&doc.secrets.is_empty());
+    }
+
+    #[test]
+    fn union_fingerprint_detects_cloned_accounts(){
+        let dir=tmpdir("fp");
+        let before=union_fingerprint(&dir);
+        merge_mail(&dir.join("mail-accounts.json"),Some(r#"[{"email":"a@b.com","provider":"qq","enabled":true}]"#));
+        assert_ne!(union_fingerprint(&dir),before,"账号新增后指纹必须变化，才会刷新内存");
+        let _=std::fs::remove_dir_all(&dir);
     }
 }

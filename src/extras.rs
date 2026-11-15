@@ -1404,13 +1404,13 @@ impl App {
                         settings_label(ui,"启动");
                         settings_card(ui,|ui|{
                             let mut a=autostart;
-                            setting_row(ui,"开机启动","登录 Windows 时自动打开IslandHop",&mut a);
+                            setting_row(ui,"开机启动","登录系统后自动打开 IslandHop",&mut a);
                             if a!=autostart{self.pending.push(Cmd::ToggleAutostart);}
                         });
                         settings_label(ui,"图形渲染");
                         settings_card(ui,|ui|{
                             let before=self.settings.render_compat;
-                            setting_row(ui,"兼容渲染（Direct3D 12）","岛周围出现黑框、画面闪烁或错乱，或打开设置后崩溃退出时开启；切换后重启IslandHop生效",&mut self.settings.render_compat);
+                            setting_row(ui,"兼容渲染","岛周围出现黑框、画面闪烁或错乱，或打开设置后崩溃退出时开启；切换后重启 IslandHop 生效",&mut self.settings.render_compat);
                             // 手动关闭后不再显示自动切换的原因；再次开启视为手动开启。
                             if before!=self.settings.render_compat {self.settings.render_compat_reason.clear();}
                             if !self.settings.render_compat_reason.is_empty() {settings_hint(ui,&self.settings.render_compat_reason);}

@@ -106,6 +106,15 @@ fn with_transport_retry<T>(agent:&ureq::Agent,origin:&str,request:impl Fn(&ureq:
     request(&direct)
 }
 // 只读取客户端当前会话；未知加密格式交给独立官网登录，不改写客户端文件。
+// Windows 客户端 workbuddy-desktop-ai.info 里 accessToken 是明文，可直接读；
+// macOS 客户端把令牌封在 $wbEncrypted 加密信封里（且没有 LOCALAPPDATA 目录），
+// 直读必然失败。所以 macOS 直接走官网浏览器授权，不做无谓的路径探测，
+// 也不会把「未找到本机用户目录」这类误导信息抛给用户。
+#[cfg(not(windows))]
+fn local_snapshot(_agent:&ureq::Agent,_expected:Option<&str>)->Result<(String,Snapshot),String>{
+    Err("macOS 客户端会话已加密，请通过官网登录并连接".into())
+}
+#[cfg(windows)]
 fn local_snapshot(agent:&ureq::Agent,expected:Option<&str>)->Result<(String,Snapshot),String>{
     let base=std::env::var_os("LOCALAPPDATA").ok_or("未找到本机用户目录")?;
     let path=std::path::PathBuf::from(base).join("CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info");
@@ -213,8 +222,8 @@ impl Connect {
         assert_eq!(session.cookie,"session=test");
     }
     #[test]
-    // `mod login` 只有 Windows 实现（#[cfg(windows)]），macOS 上跑回归测试时
-    // 这个手动验证用例不参与编译，否则整个 lib test 目标无法构建。
+    // 手动验证用例需要真实官网账号与浏览器交互，且不参与日常回归；
+    // 保留 Windows 门控是因为它还要读 Windows 客户端的登录文件。
     #[cfg(windows)]
     #[ignore="手动验证默认浏览器官网登录，需用户完成登录"]
     fn workbuddy_login_without_extension(){

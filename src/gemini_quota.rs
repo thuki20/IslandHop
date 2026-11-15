@@ -94,20 +94,32 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
     use std::sync::OnceLock;
     const MAGIC:&[u8;6]=b"WBMAC1";
     static KEY:OnceLock<Result<[u8;32],String>>=OnceLock::new();
-    let key=KEY.get_or_init(||{
-        let entry=keyring::Entry::new("Daozai.SessionKey","v1").map_err(|e|format!("无法访问钥匙串：{e}"))?;
-        match entry.get_password(){
-            Ok(stored)=>{
-                let bytes=base64::engine::general_purpose::STANDARD.decode(stored).map_err(|_|"钥匙串会话密钥无效".to_string())?;
-                if bytes.len()!=32 {return Err("钥匙串会话密钥无效".into());}
-                let mut key=[0u8;32];key.copy_from_slice(&bytes);Ok(key)
-            },
-            Err(keyring::Error::NoEntry)=>{
-                let mut key=[0u8;32];ring::rand::SystemRandom::new().fill(&mut key).map_err(|_|"无法生成会话密钥".to_string())?;
-                entry.set_password(&base64::engine::general_purpose::STANDARD.encode(key)).map_err(|e|format!("无法保存会话密钥：{e}"))?;
-                Ok(key)
-            },
-            Err(e)=>Err(format!("无法读取会话密钥：{e}")),
+    let key=KEY.get_or_init(|| -> Result<[u8;32],String> {
+        // 测试跑在 adhoc 签名的测试二进制里，访问系统钥匙串会触发授权对话框并
+        // 长时间阻塞（实测让整个 lib test 进程挂死、被系统回收）。测试构建
+        // 用固定密钥，只验证 AES-GCM 往返与密文不可读，不触碰真实凭据。
+        #[cfg(test)]
+        {
+            let mut key=[0u8;32];
+            for (i,b) in key.iter_mut().enumerate(){*b=(i as u8).wrapping_mul(7).wrapping_add(41);}
+            Ok(key)
+        }
+        #[cfg(not(test))]
+        {
+            let entry=keyring::Entry::new("Daozai.SessionKey","v1").map_err(|e|format!("无法访问钥匙串：{e}"))?;
+            match entry.get_password(){
+                Ok(stored)=>{
+                    let bytes=base64::engine::general_purpose::STANDARD.decode(stored).map_err(|_|"钥匙串会话密钥无效".to_string())?;
+                    if bytes.len()!=32 {return Err("钥匙串会话密钥无效".into());}
+                    let mut key=[0u8;32];key.copy_from_slice(&bytes);Ok(key)
+                },
+                Err(keyring::Error::NoEntry)=>{
+                    let mut key=[0u8;32];ring::rand::SystemRandom::new().fill(&mut key).map_err(|_|"无法生成会话密钥".to_string())?;
+                    entry.set_password(&base64::engine::general_purpose::STANDARD.encode(key)).map_err(|e|format!("无法保存会话密钥：{e}"))?;
+                    Ok(key)
+                },
+                Err(e)=>Err(format!("无法读取会话密钥：{e}")),
+            }
         }
     }).clone()?;
     let unbound=UnboundKey::new(&AES_256_GCM,&key).map_err(|_|"会话密钥无效".to_string())?;
@@ -156,7 +168,7 @@ impl Connect {
         std::thread::spawn(move||{let result=(||{
             let session=if let Some(header)=header{Session{email:email(&address)?,cookie:cookie(&header)?}}else{
                 #[cfg(windows)]{browser::login(&address,&stopped)?}
-                #[cfg(not(windows))]{return Err("Chrome 原生连接暂仅支持 Windows，可使用手动 Cookie 连接".into());}
+                #[cfg(not(windows))]{return Err("当前系统不支持 Chrome 原生连接，请使用手动 Cookie 连接".into());}
             };
             if stopped.load(Ordering::Relaxed){return Err("已取消 Gemini 连接".into());}
             if expected.as_deref().is_some_and(|s|s!=slot(&session.email)){return Err("当前浏览器是另一个 Google 账号，请切回原账号后重新连接".into());}

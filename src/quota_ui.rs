@@ -370,9 +370,12 @@ impl App {
     pub(crate) fn draw_quota_bar(&mut self,c:&Card,cx:f32,layout:&crate::bar_layout::Layout){
         let indices=self.quota_bar_indices();let mut chosen=None;
         for (position,i)in indices.iter().enumerate(){
+            // macOS 刘海常驻行不放额度环：notch_slots 会把这些槽位清空，
+            // 直接跳过（额度仍在展开后的额度页可见）。
+            let Some(slot_x)=layout.x[crate::bar_layout::quota_slot(position)] else {continue};
             let alpha=layout.pet_clearance(crate::bar_layout::quota_slot(position));
             let faded=c.faded(alpha);let faded=if alpha<0.8{faded.ghost()}else{faded};let c=&faded;
-            let a=&self.quota.config.accounts[*i];let x=cx+layout.x[crate::bar_layout::quota_slot(position)].unwrap();
+            let a=&self.quota.config.accounts[*i];let x=cx+slot_x;
             let snapshot=self.quota.rows.get(&a.id).and_then(|r|r.as_ref().ok());
             if a.provider.balance(){
                 let wide=true;let extra=if wide{layout.widths[crate::bar_layout::quota_slot(position)]-27.0}else{0.0};let icon_x=x-extra/2.0;
@@ -692,7 +695,7 @@ impl App {
             settings_control_row(ui,"备注",56.0,|ui|{ui.add_sized([ui.available_width(),27.0],egui::TextEdit::singleline(&mut self.quota.alias).vertical_align(egui::Align::Center).hint_text("例如：个人、工作、备用"))});
             if self.quota.provider.api_key(){
                 let provider=self.quota.provider;
-                ui.label("仅查询额度；API Key 保存在 Windows 凭据管理器，不写入配置或缓存。");
+                ui.label("仅查询额度；API Key 加密保存在本机系统凭据（Windows 凭据管理器 / macOS 钥匙串），不写入配置或缓存。");
                 ui.add_enabled_ui(self.quota.api_connecting.is_none(),|ui|{
                     if provider.relay(){
                         if self.quota.connect_target.is_some(){ui.label(format!("使用已保存的 {} 接口",provider.name()));}

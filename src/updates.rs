@@ -149,11 +149,16 @@ impl State {
         #[allow(unused_mut)]
         let mut builder=egui::ViewportBuilder::default().with_title("IslandHop 更新")
                 .with_inner_size([520.0, 416.0]).with_resizable(false).with_decorations(false)
-                .with_transparent(true).with_active(true);
+                .with_transparent(true).with_active(true)
+                .with_window_level(egui::WindowLevel::AlwaysOnTop);
         // macOS 不设窗口图标：eframe 会用它替换 Dock 图标，导致与 bundle 图标不一致。
         #[cfg(not(target_os="macos"))] { builder=builder.with_icon(theme::app_icon()); }
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("daozai-update"), builder, |ctx, _| {
+                // ROOT 岛体在 NSStatusWindowLevel(25)，普通 viewport 默认 Normal(0)。
+                // 每帧把更新窗固定在 26 层并激活应用，避免「闪到最底层 / 一点就掉下去」。
+                crate::mac_window::raise_window("IslandHop 更新", 26);
                 if focus {
+                    crate::mac_window::activate_app();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }

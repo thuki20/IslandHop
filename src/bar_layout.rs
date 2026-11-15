@@ -87,28 +87,27 @@ impl Layout {
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
     /// **macOS 专用**（刘海与胶囊两种岛形共用）：常驻行按固定槽位左右分列——
-    /// **左组＝电源 + 吉祥宠 + 天气；右组＝AI 额度环 + 音乐 + 专注 + 铃铛**。
-    /// 时钟隐藏（macOS 右上角系统菜单栏本来就有时间，岛里不重复显示）。
+    /// **左组＝电源 + 吉祥宠；右组＝天气(温度) + 音乐 + 专注 + 铃铛**。
+    /// AI 额度环**不进刘海常驻行**：多个环会把岛体横向撑宽又挤又难看，
+    /// 额度仍可在展开后的额度页查看。时钟隐藏（系统菜单栏右上角已有时间）。
     ///
-    /// 左组整体右对齐到空洞左缘，天气排在最右（紧贴刘海）；新增组件时
-    /// 电源/宠物自动向岛体左缘方向让位。右组只挂额度环等状态件。
-    ///
-    /// 有刘海机型在中间留出物理刘海空洞（gap=刘海宽+呼吸位）；胶囊模式
-    /// gap=0，两组之间用固定视觉间距替代。弹窗类（歌词 / 充放电 / 实时状态）
-    /// 仍在岛体下方延伸弹出，不受本布局影响。
-    pub fn notch_slots(&mut self, gap: f32) {
+    /// 两组分别贴在空洞两侧，整行再整体下挂 `drop`（刘海机型的
+    /// `notch_shelf()`），让所有内容落到物理刘海**下缘之下**的可见区；
+    /// 胶囊机型 drop=0，靠固定视觉间距分隔两组。
+    pub fn notch_slots(&mut self, gap: f32, drop: f32) {
         // 时间交给系统菜单栏，时钟槽位撤掉；天气槽位独立保留（原与时钟成组）。
         self.x[CLOCK] = None;
+        // 刘海常驻行不显示额度环：清掉槽位，绘制层遇到 None 会跳过（见 draw_quota_bar）。
+        let quota_slots: Vec<usize> = self.quota_slots().collect();
+        for slot in quota_slots { self.x[slot] = None; }
         const PAD: f32 = 14.0;   // 空洞边缘到第一个图标
         const EDGE: f32 = 16.0;  // 图标组到岛体圆角
         const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
         // 胶囊模式没有物理刘海，两组之间留固定视觉间距。
         let hole = if gap > 0.0 { gap } else { 48.0 };
-        let left: Vec<usize> = [BATTERY, PET, WEATHER].iter().copied().filter(|&i| self.x[i].is_some()).collect();
-        let right: Vec<usize> = self.quota_slots()
-            .chain([MUSIC, FOCUS, BELL])
-            .filter(|&i| self.x[i].is_some()).collect();
-        if left.is_empty() && right.is_empty() { return; }
+        let left: Vec<usize> = [BATTERY, PET].iter().copied().filter(|&i| self.x[i].is_some()).collect();
+        let right: Vec<usize> = [WEATHER, MUSIC, FOCUS, BELL].iter().copied().filter(|&i| self.x[i].is_some()).collect();
+        if left.is_empty() && right.is_empty() { self.notch_y = drop; return; }
         let group_width = |slots: &[usize]| -> f32 {
             slots.iter().map(|&i| self.widths[i]).sum::<f32>()
                 + SPACE * slots.len().saturating_sub(1) as f32
@@ -116,21 +115,22 @@ impl Layout {
         let left_w = group_width(&left);
         let right_w = group_width(&right);
         let half = hole / 2.0;
-        // 左组右对齐到空洞左缘，按 [电源, 吉祥宠, 天气] 顺序向左排。
+        // 左组右对齐到空洞左缘，按 [电源, 吉祥宠] 顺序向左排。
         let mut cursor = -half - PAD - left_w;
         for &i in &left {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
             cursor += self.widths[i] + SPACE;
         }
-        // 右组左对齐到空洞右缘，按 [额度环…, 音乐, 专注, 铃铛] 顺序向右排。
+        // 右组左对齐到空洞右缘，按 [天气(温度), 音乐, 专注, 铃铛] 顺序向右排。
         let mut cursor = half + PAD;
         for &i in &right {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
             cursor += self.widths[i] + SPACE;
         }
         self.width = (hole + 2.0 * (PAD + EDGE) + left_w + right_w).max(96.0);
-        // 常驻行保持在菜单栏高度内，不再下挂（下挂方案已废弃）。
-        self.notch_y = 0.0;
+        // 常驻行整体下挂：base_size() 会把岛体高度延长到 bar_h()+notch_y，
+        // shared_header()/resident_header() 按展开进度把整行平滑收回顶栏。
+        self.notch_y = drop;
     }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
@@ -287,18 +287,19 @@ mod tests {
         assert_eq!(empty.width,width);
     }
     #[test]
-    fn notch_layout_keeps_weather_left_and_quotas_right_of_the_hole(){
+    fn notch_layout_puts_battery_pet_left_weather_right_and_hides_quotas(){
         let mut layout=Layout::new(true,2,true,false,false,true,true);
-        layout.notch_slots(200.0);
+        layout.notch_slots(200.0,28.0);
         let get=|i:usize|layout.x[i].unwrap();
-        // 左组 [电源, 宠物, 天气] 整体在刘海空洞（±100）左侧，天气最靠右（紧贴空洞）。
-        assert!(get(BATTERY)<get(PET)&&get(PET)<get(WEATHER)&&get(WEATHER)< -100.0-13.0);
-        // 右组从额度环开始，天气不再出现在右侧。
-        let quotas:Vec<_>=layout.quota_slots().map(get).collect();
-        assert!(quotas.iter().all(|&x|x>100.0+13.0));
-        assert!(quotas[0]<quotas[1]);
-        // 天气右缘到空洞中心留出 PAD+半径的呼吸位，不越过空洞。
-        assert!(get(WEATHER)+38.0/2.0<=-100.0-14.0+0.01);
+        // 左组只有 [电源, 宠物]，整体在刘海空洞（±100）左侧。
+        assert!(get(BATTERY)<get(PET)&&get(PET)< -100.0-13.0);
+        // 天气（温度）回到右组，紧贴空洞右缘。
+        assert!(get(WEATHER)>100.0+13.0);
+        assert!(get(WEATHER)-38.0/2.0>=100.0+14.0-0.01);
+        // AI 额度环不进刘海常驻行：槽位全部清空，绘制层据此跳过。
+        assert!(layout.quota_slots().all(|i|layout.x[i].is_none()),"刘海常驻行不放额度环");
+        // 整行下挂到物理刘海下方，岛体高度由 base_size() 同步延长。
+        assert_eq!(layout.notch_y,28.0);
         // 岛体总宽按两组实占计算，不小于空洞与边距之和。
         assert!(layout.width>=200.0+2.0*(14.0+16.0));
     }

@@ -98,6 +98,18 @@ pub fn activate_app() { imp::activate_app(); }
 #[cfg(not(target_os = "macos"))]
 pub fn activate_app() {}
 
+/// 把指定标题的辅助窗口固定在 `NSStatusWindowLevel+1`（26），高于 ROOT 岛体（25）。
+///
+/// ROOT 常驻 25 层，而 eframe 的独立 viewport 默认只有 `Normal(0)`：更新弹窗
+/// 会被岛体和所有前台应用窗口压在最底下，点它也不会改变 NSWindow 的 level，
+/// 表现就是「弹窗闪到底层 / 一点就掉下去」。每帧校验一次，只在 level 不符时
+/// 才 setLevel，成本可忽略；点击、切换应用都不会再改变窗口层级。
+#[cfg(target_os = "macos")]
+pub fn raise_window(title: &str, level: isize) { imp::raise_window(title, level); }
+
+#[cfg(not(target_os = "macos"))]
+pub fn raise_window(_title: &str, _level: isize) {}
+
 #[cfg(target_os = "macos")]
 pub fn notch_gap() -> Option<f32> {
     use std::sync::OnceLock;
@@ -178,6 +190,29 @@ mod imp {
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             if !app.is_null() {
                 let _: () = msg_send![app, activateIgnoringOtherApps: Bool::YES];
+            }
+        }
+    }
+
+    /// 按标题找到辅助窗口并固定 level。ROOT 是 25，更新窗用 26。
+    pub fn raise_window(title: &str, level: isize) {
+        unsafe {
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            if app.is_null() { return; }
+            let windows: *mut AnyObject = msg_send![app, windows];
+            if windows.is_null() { return; }
+            let count: usize = msg_send![windows, count];
+            for i in 0..count {
+                let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                if w.is_null() { continue; }
+                let t: *mut AnyObject = msg_send![w, title];
+                if t.is_null() { continue; }
+                let utf8: *const std::ffi::c_char = msg_send![t, UTF8String];
+                if utf8.is_null() { continue; }
+                if std::ffi::CStr::from_ptr(utf8).to_bytes() != title.as_bytes() { continue; }
+                let current: isize = msg_send![w, level];
+                if current != level { let _: () = msg_send![w, setLevel: level]; }
+                break;
             }
         }
     }

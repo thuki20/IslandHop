@@ -13,7 +13,7 @@ fn value(root:&Value,name:&str)->Result<String,String>{
     let secret=std::env::var("ZCODE_CREDENTIAL_SECRET").ok().filter(|s|!s.trim().is_empty()).unwrap_or_else(||format!(
         "zcode-credential-fallback:win32:{}:{}",std::env::var("USERPROFILE").unwrap_or_default(),std::env::var("USERNAME").unwrap_or_default()));
     let key=digest::digest(&digest::SHA256,secret.trim().as_bytes());
-    let error="无法读取当前 Windows 用户的 ZCode 登录，请在客户端重新登录";
+    let error="无法读取当前用户的 ZCode 登录，请在客户端重新登录";
     let parts=encoded.split('.').map(|s|URL_SAFE_NO_PAD.decode(s)).collect::<Result<Vec<_>,_>>().map_err(|_|error)?;
     let [iv,tag,cipher]=parts.as_slice() else{return Err(error.into());};
     if tag.len()!=16{return Err(error.into());}

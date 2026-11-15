@@ -240,7 +240,7 @@ impl Connect {
                     #[cfg(windows)]
                     LoginSource::Local => login::local()?,
                     #[cfg(not(windows))]
-                    _ => return Err("豆包官网登录暂仅支持 Windows，也可使用 Cookie 连接".into()),
+                    _ => return Err("当前系统不支持导入本机客户端登录，请在上方使用 Cookie 连接".into()),
                 };
                 if let Some(expected) = &expected {
                     if !same_login(&load_slot(expected)?, &header) { return Err("无法确认原豆包账号，请复制完整 Cookie，或切回原账号后重试".into()); }
