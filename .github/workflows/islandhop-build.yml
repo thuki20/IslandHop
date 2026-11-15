@@ -1,20 +1,51 @@
-# IslandHop 构建流水线。
-# 上游 .github/workflows/ci.yml 保持原样（测试与 NSIS 安装包），本文件只负责出可运行包。
-# macOS runner 在此账号下 push 时拿不到（两次 0-step cancelled），macOS 包固定本机出。
-name: IslandHop Build
+# IslandHop 构建流水线（Windows）。
+# 目标：push 到 main 即自动产出可安装的 Win 包，并挂到与 macOS 同一个 GitHub Release。
+#
+# 产物（dist/）：
+#   Daozai-Setup-v<版本>-x64.exe        安装版（NSIS，日常下载这个）
+#   IslandHop-v<版本>-windows-x64.zip   便携版（解压即用，应用内更新也认这个包）
+#   SHA256SUMS.txt                      校验和
+#
+# 与 release-macos.yml 交替上传同一个 tag（v<版本>）的资产：谁先跑完谁先建
+# Release，后到的只补自己的文件，不会清掉对方的更新说明（这里不写 body）。
+#
+# 上游 .github/workflows/ci.yml 保持原样（完整测试 + 安装/升级/卸载回归）。
+name: IslandHop Build (Windows)
 
 on:
   push:
     branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "vendor/**"
+      - "installer/**"
+      - "scripts/**"
+      - "build.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/islandhop-build.yml"
   workflow_dispatch:
+    inputs:
+      notes:
+        description: "更新说明（留空则用默认文案；仅手动触发时生效）"
+        required: false
+        default: ""
 
 permissions:
-  contents: read
+  contents: write   # 需要创建/更新 Release 并上传资产
+
+# 同一时刻只跑一个 Windows 打包，避免两次运行同时写同一批资产
+concurrency:
+  group: build-windows
+  cancel-in-progress: false
 
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 90
     env:
+      # windows-latest 内存有限，上游 ci.yml 同样限到 1 个并行编译单元
       CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
@@ -22,31 +53,63 @@ jobs:
       - name: Rust stable (msvc)
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-msvc
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64
 
-      - name: Build release
-        run: cargo build --release --bin IslandHop --target x86_64-pc-windows-msvc
-
-      - name: Verify PE icon resource
+      - name: 读取版本号
+        id: meta
         shell: pwsh
         run: |
-          $exe = "target/x86_64-pc-windows-msvc/release/IslandHop.exe"
-          if (-not (Test-Path $exe)) { throw "missing $exe" }
-          $bytes = [System.IO.File]::ReadAllBytes($exe)
-          Write-Output "PE size: $($bytes.Length) bytes"
-          if ($bytes.Length -lt 1MB) { throw "binary suspiciously small" }
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          if (-not $version) { throw "Cargo.toml 里没读到 version" }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Output "本次出包版本：v$version"
 
-      - name: Package zip
+      - name: 构建 + 打包（安装包 + 便携 zip + 校验和）
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/x86_64-pc-windows-msvc/release/IslandHop.exe" dist/
-          Compress-Archive -Path "dist/IslandHop.exe" -DestinationPath "dist/IslandHop-Windows-x64.zip" -Force
+          $compiler = ./scripts/get-nsis.ps1 -Directory $env:RUNNER_TEMP
+          ./scripts/package.ps1 -NsisCompiler $compiler
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 校验产物
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          $setup = "dist/Daozai-Setup-v$env:VERSION-x64.exe"
+          $zip = "dist/IslandHop-v$env:VERSION-windows-x64.zip"
+          foreach ($f in @($setup, $zip, "dist/SHA256SUMS.txt")) {
+            if (-not (Test-Path $f)) { throw "缺少产物：$f" }
+            $size = (Get-Item $f).Length
+            if ($size -lt 1MB -and $f -ne "dist/SHA256SUMS.txt") { throw "产物过小，疑似构建失败：$f ($size bytes)" }
+            Write-Output ("{0}  {1:N1} MB" -f $f, ($size / 1MB))
+          }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: IslandHop-Windows-x64
-          path: dist/IslandHop-Windows-x64.zip
+          name: IslandHop-windows-${{ github.run_number }}
+          path: |
+            dist/Daozai-Setup-*.exe
+            dist/IslandHop-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+          retention-days: 30
           if-no-files-found: error
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: v${{ steps.meta.outputs.version }}
+          # 不写 body：更新说明由 macOS 工作流维护，这里只补 Windows 资产
+          files: |
+            dist/Daozai-Setup-*.exe
+            dist/IslandHop-*-windows-x64.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: false

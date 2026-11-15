@@ -14,3 +14,7 @@
 *.key
 .DS_Store
 Thumbs.db
+
+# 上游同步脚本的下载缓存与报告（不入库）
+.upstream-cache/
+upstream-report.md

@@ -51,7 +51,9 @@ name = "egui_winit"
 path = "src/lib.rs"
 
 # IslandHop：macOS 点击兜底需要 NSEvent（见 lib.rs islandhop_fallback_pointer_pos）。
-[dependencies.objc2]
+# 必须挂在 macOS target 下：无条件依赖会让 Windows 构建也去编 objc2，
+# 而 objc2 在非 Apple 平台是 `compile_error!`（CI 上 Windows job 因此全红）。
+[target.'cfg(target_os = "macos")'.dependencies.objc2]
 version = "0.6"
 default-features = false
 features = ["std"]
