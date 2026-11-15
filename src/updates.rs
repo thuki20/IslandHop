@@ -10,14 +10,29 @@ const BACKUP_DOWNLOAD: &str = "https://github.com/thuki20/IslandHop/releases/lat
 /// `manifest.json`（version/notes/url/sha256/size）用 packaging/push-update.sh
 /// 推到软件工作台 /home/updates/islandhop/，客户端启动即自动检查、
 /// 应用内下载并覆盖安装，无需逐台手动替换。
-/// 新版走域名 https；服务器同时保留旧 acme-challenge 路径的 http 兼容副本，
-/// 让已经装出去的旧客户端继续能更新。完整性由 manifest 的 sha256 保证。
-/// 可用环境变量 `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用）。
-const FEED_URL: &str = "https://ncsai.top/home/updates/islandhop/manifest.json";
+/// 更新源按顺序尝试，首个可用即用（单点故障会让整条 OTA 挂掉）：
+///   1. https + IP      —— Let's Encrypt IP 证书（SAN 就是 203.195.201.85），不依赖域名与 SNI；
+///   2. http  + IP      —— acme-challenge 兼容副本，连证书都不依赖的最后兜底（sha256 兜完整性）；
+///   3. https + 域名    —— ncsai.top 的 443 链路打通后自动接管，排在最后不影响现状。
+/// 完整性始终由 manifest 的 sha256 保证。
+/// 可用环境变量 `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用，覆盖后只用该单一源）。
+const FEEDS: &[&str] = &[
+    "https://203.195.201.85/home/updates/islandhop/manifest.json",
+    "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json",
+    "https://ncsai.top/home/updates/islandhop/manifest.json",
+];
 
-fn feed_url() -> String { std::env::var("ISLANDHOP_FEED_URL").unwrap_or_else(|_| FEED_URL.to_string()) }
-/// feed 的基地址（去 manifest.json），用于允许对自有源走 http 下载。
-fn feed_base() -> String { feed_url().split("manifest.json").next().unwrap_or("").to_string() }
+/// 自有服务器前缀：命中这些前缀的 http 下载才允许（GitHub 等外部源强制 https）。
+const SELF_HOSTED: &[&str] = &["http://203.195.201.85/", "https://203.195.201.85/", "https://ncsai.top/"];
+
+fn feed_urls() -> Vec<String> {
+    match std::env::var("ISLANDHOP_FEED_URL") {
+        Ok(value) if !value.trim().is_empty() => vec![value],
+        _ => FEEDS.iter().map(|url| (*url).to_owned()).collect(),
+    }
+}
+
+fn is_self_hosted(url: &str) -> bool { SELF_HOSTED.iter().any(|prefix| url.starts_with(prefix)) }
 
 #[derive(Clone, Debug)]
 struct Release { version: String, notes: String, page: String, package: Option<Package> }
@@ -348,12 +363,20 @@ fn check() -> Result<Option<Release>, String> {
 /// version 不比本地新返回 Ok(None)；url/sha256/size 齐全才允许应用内安装。
 #[cfg(target_os = "macos")]
 fn check_feed() -> Result<Option<Release>, String> {
-    let response = http_agent()?
-        .get(&feed_url()).set("User-Agent", concat!("IslandHop/", env!("CARGO_PKG_VERSION")))
-        .call().map_err(|_| "feed 不可达".to_owned())?;
-    let value: serde_json::Value = serde_json::from_reader(response.into_reader())
-        .map_err(|_| "feed 清单格式异常".to_owned())?;
-    parse_feed(&value, env!("CARGO_PKG_VERSION"))
+    let mut last = String::from("feed 不可达");
+    for url in feed_urls() {
+        let response = match http_agent()?.get(&url)
+            .set("User-Agent", concat!("IslandHop/", env!("CARGO_PKG_VERSION"))).call() {
+            Ok(response) => response,
+            Err(error) => { last = format!("feed 不可达（{url}）：{error}"); continue }
+        };
+        let value: serde_json::Value = match serde_json::from_reader(response.into_reader()) {
+            Ok(value) => value,
+            Err(_) => { last = format!("feed 清单格式异常（{url}）"); continue }
+        };
+        return parse_feed(&value, env!("CARGO_PKG_VERSION"));
+    }
+    Err(last)
 }
 
 /// feed 清单解析（纯函数，单测覆盖）：version 不比本地新返回 Ok(None)；
@@ -399,9 +422,9 @@ fn download(release: &Release, tx: &mpsc::Sender<Event>, cancel: &AtomicBool) ->
     let result = (|| {
         let response = http_agent()?
             .get(&package.url).call().map_err(|_| "连接下载服务器失败，请检查网络或代理，或使用网盘下载")?;
-        // GitHub 必须走 https；自有云端 feed（feed_base 前缀）允许 http（内网自托管）。
+        // GitHub 必须走 https；自有云端源允许 http（自托管 + sha256 校验完整性）。
         let url = response.get_url();
-        if !url.starts_with("https://") && !url.starts_with(&feed_base()) { return Err("更新下载未使用安全连接".into()); }
+        if !url.starts_with("https://") && !is_self_hosted(url) { return Err("更新下载未使用安全连接".into()); }
         let mut input = response.into_reader();
         let mut output = std::fs::File::create(work.join("update.zip")).map_err(|_| "无法保存更新包")?;
         transfer(&mut input, &mut output, package, cancel, |progress| { let _ = tx.send(Event::Progress(progress)); })?;

@@ -24,8 +24,13 @@ ZIP_NAME="IslandHop-v${VERSION}-macos.zip"
 SERVER="${ISLANDHOP_UPDATE_SERVER:-ncsai}"
 PORTAL_DIR="${ISLANDHOP_PORTAL_DIR:-/opt/ncsai-portal/data/updates/islandhop}"
 LEGACY_DIR="${ISLANDHOP_LEGACY_DIR:-/var/www/letsencrypt/.well-known/acme-challenge/islandhop}"
-BASE_URL="${ISLANDHOP_BASE_URL:-https://ncsai.top/home/updates/islandhop}"
+BASE_URL="${ISLANDHOP_BASE_URL:-https://203.195.201.85/home/updates/islandhop}"
 LEGACY_URL="${ISLANDHOP_LEGACY_URL:-http://203.195.201.85/.well-known/acme-challenge/islandhop}"
+# 注意：manifest 里的 url 必须指向「客户端连得上」的地址。ncsai.top 的 443
+# 目前被链路上的 SNI 阻断（服务器本机自测 200，公网 RST），且 nginx 用的是
+# Let's Encrypt **IP 证书**（SAN 只有 203.195.201.85），域名访问会证书不匹配。
+# 因此 BASE_URL 用 IP；等域名备案/证书就位、443 通了再把 ISLANDHOP_BASE_URL 换回
+# https://ncsai.top/home/updates/islandhop 即可，客户端多源回退会自动接管。
 
 [ $# -ge 1 ] || { echo "用法: $0 \"更新说明\" [\"更多说明\"]..." >&2; exit 1; }
 
