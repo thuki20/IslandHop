@@ -129,6 +129,8 @@ pub struct Env {
     pub date: String,
     pub battery: Option<u8>,
     pub charging: bool,
+    /// macOS：正在充电时的实时功率（瓦）。None = 未在充电（Windows 恒 None）。
+    pub battery_watts: Option<f32>,
     /// 互联网连接状态；未知时不触发表情提醒。
     pub network: Option<bool>,
     /// 光标位置（与 `frame` 传入的 `win` 同一坐标系）；不在窗口附近时为 None。
@@ -825,7 +827,7 @@ pub struct App {
     pub(crate) weather: crate::weather::State,
     pub(crate) updates: crate::updates::State,
     pub(crate) resident: bar::Motion,
-    pub(crate) resident_power: (Option<u8>,bool),
+    pub(crate) resident_power: (Option<u8>,bool,Option<f32>),
 }
 
 impl App {
@@ -946,7 +948,7 @@ impl App {
             quota: crate::quota_ui::State::load(),
             weather,
             updates: Default::default(),
-            resident: Default::default(), resident_power:(None,false),
+            resident: Default::default(), resident_power:(None,false,None),
         }
     }
 
@@ -1771,7 +1773,7 @@ impl App {
         if self.compact_notices(){self.notice_width.step(dt);}else{self.notice_width.snap(0.0);self.notice_details=false;}
         self.update_media(env,&ctx);
         let bell=self.t<self.notification_bell_until&&!self.compact_notices();
-        self.resident_power=(env.battery,env.charging);
+        self.resident_power=(env.battery,env.charging,env.battery_watts);
         let mut layout=Layout::new(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled(),self.weather_pill().is_some());
         layout.reorder(&self.settings.resident_order);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
@@ -2099,7 +2101,10 @@ impl App {
         }
         let pet_alpha=self.pet_a*(1.0-smoothstep(0.0,0.3,pc));
         if pet_alpha>0.004 && !minimal_pill {
-            let y=(h.min(self.base_size().1)-bar_h()).max(0.0)/2.0;
+            // 刘海机型：宠物与电量/天气同行下挂（shelf），不能再用「岛体拉高量的一半」
+            // 往下多挪 notch_y/2 —— 那正是下挂时宠物比电量、天气低一截、不在同一条
+            // 中线上的根因；非刘海的通知横幅模式保留原居中偏移。
+            let y=if crate::mac_window::notch_layout().is_some(){0.0}else{(h.min(self.base_size().1)-bar_h()).max(0.0)/2.0};
             // 吉祥物跟随皮肤换色：浅色底上变成深色版本，保持清晰。
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             // 吉祥物与常驻行一起下移到刘海下方，收起态才不会一半被物理刘海挡住。
@@ -2799,7 +2804,7 @@ impl App {
         // 电池：位置/大小连续插值
         let bk = lerp(1.0, 0.8, m);
         let bpos = (lerp(pb.0, hb.0, m), lerp(pb.1, hb.1, m));
-        if show_battery {paint::battery(&base.faded(lerp(layout.clearance(bar::BATTERY),1.0,m)), bpos.0, bpos.1, env.battery, env.charging, bk);}
+        if show_battery {paint::battery(&base.faded(lerp(layout.clearance(bar::BATTERY),1.0,m)), bpos.0, bpos.1, env.battery, env.charging, bk, env.battery_watts);}
 
         // 时钟：两个字号沿同一路径交叉淡化，避免逐帧换字号
         let cpos = (lerp(pcx, hc, m), lerp(21.0, 23.0, m));

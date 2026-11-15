@@ -129,7 +129,7 @@ impl App {
                     c.text(cx, mid + 13.0, &minute, 13.5, W::Bold, theme::WHITE, H::Center);
                 }
                 SideItem::Weather => self.draw_side_weather(c,cx,mid),
-                SideItem::Battery => paint::battery(c, cx, mid, env.battery, env.charging, 0.72),
+                SideItem::Battery => paint::battery(c, cx, mid, env.battery, env.charging, 0.72, env.battery_watts),
                 SideItem::Music => paint::playback_bars(c, cx, mid, self.t, self.media.playing, theme::WHITE),
                 SideItem::Focus => {
                     let minutes = (self.pomo.remaining / 60.0).ceil().max(0.0) as u32;

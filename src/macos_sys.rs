@@ -4,7 +4,8 @@
 //! 因此 macOS 上电池、音量、网络、闲置时间、媒体、文件打开全是空值或空操作，
 //! 灵动岛收起状态只剩时钟和天气。本模块补上这些数据源：
 //!
-//! - 电池：`/usr/bin/pmset -g batt`
+//! - 电池：IOKit 直读 IORegistry `AppleSmartBattery`（借鉴 StatusTrio，零子进程、
+//!   事件级实时，且能拿充电功率）；读不到才回退 `/usr/bin/pmset -g batt`
 //! - 音量：`/usr/bin/osascript` 读写系统输出音量与静音
 //! - 网络：`/sbin/route -n get default`（有默认网关即视为在线）
 //! - 闲置：`CGEventSourceSecondsSinceLastEventType`（无需辅助功能权限）
@@ -25,10 +26,115 @@ use std::time::{Duration, Instant};
 pub struct Snapshot {
     pub battery: Option<u8>,
     pub charging: bool,
+    /// 正在充电时的实时功率（瓦）。None = 未在充电（含接电已充满）。
+    pub watts: Option<f32>,
     pub volume: Option<(u32, bool)>,
     pub network: Option<bool>,
     pub idle: Option<f64>,
 }
+
+/// AppleSmartBattery 直读结果（纯数据，解析逻辑在 [`smart_from`] 可单测）。
+struct SmartBattery {
+    percent: Option<u8>,
+    /// 接着电源（含充满挂机）。
+    external: bool,
+    /// 正在充电（IsCharging）。
+    charging_now: bool,
+    watts: Option<f32>,
+}
+
+/// 从 AppleSmartBattery 属性字典挑出的标量 → 电池状态（纯函数，可测）。
+/// - 百分比：`CurrentCapacity` 直接是 0-100；个别固件给 mAh 时按 `MaxCapacity` 换算。
+/// - 功率：Amperage(mA) × Voltage(mV) / 1e6；充电为正、放电为负，<0.5W 视为未充电。
+fn smart_from(
+    capacity: Option<f64>,
+    max_capacity: Option<f64>,
+    amperage: Option<f64>,
+    voltage: Option<f64>,
+    is_charging: bool,
+    external: bool,
+) -> SmartBattery {
+    let percent = capacity.map(|c| {
+        let pct = if c <= 100.0 || max_capacity.map_or(true, |m| m <= 0.0) { c }
+            else { c / max_capacity.unwrap_or(100.0) * 100.0 };
+        pct.round().clamp(0.0, 100.0) as u8
+    });
+    let watts = match (amperage, voltage) {
+        (Some(a), Some(v)) if is_charging && a > 0.0 && v > 0.0 => {
+            let w = (a * v / 1.0e6) as f32;
+            (w >= 0.5).then_some(w)
+        },
+        _ => None,
+    };
+    SmartBattery { percent, external, charging_now: is_charging && external, watts }
+}
+
+/// IOKit 直读 IORegistry 的 `AppleSmartBattery`：无子进程、毫秒级，
+/// 充电功率（InstantAmperage × Voltage）只有这里能拿到（借鉴 StatusTrio）。
+#[cfg(target_os = "macos")]
+fn read_smart_battery() -> Option<SmartBattery> {
+    use std::ffi::{c_char, c_void, CStr};
+    const KUTF8: u32 = 0x0800_0100;
+    const SINT64: isize = 4;
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperties(
+            entry: u32, properties: *mut *mut c_void, allocator: *mut c_void, options: u32,
+        ) -> i32;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFStringCreateWithCString(alloc: *const c_void, c_str: *const c_char, encoding: u32) -> *const c_void;
+        fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
+        fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> bool;
+        fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+        fn CFRelease(cf: *mut c_void);
+    }
+    const KEY: &[(&[u8], bool)] = &[
+        (b"CurrentCapacity\0", true), (b"MaxCapacity\0", true),
+        (b"InstantAmperage\0", true), (b"Amperage\0", true), (b"Voltage\0", true),
+        (b"IsCharging\0", false), (b"ExternalConnected\0", false),
+    ];
+    unsafe {
+        let matching = IOServiceMatching(CStr::from_bytes_with_nul(b"AppleSmartBattery\0").unwrap().as_ptr());
+        if matching.is_null() { return None; }
+        let service = IOServiceGetMatchingService(0, matching); // 0 = kIOMasterPortDefault
+        if service == 0 { return None; }
+        let mut props: *mut c_void = std::ptr::null_mut();
+        let status = IORegistryEntryCreateCFProperties(service, &mut props, std::ptr::null_mut(), 0);
+        let _ = IOObjectRelease(service);
+        if status != 0 || props.is_null() { return None; }
+        // (键, 是否数字)；布尔键用 CFBoolean 读。
+        let mut values: Vec<Option<f64>> = Vec::new();
+        let mut booleans: Vec<bool> = Vec::new();
+        for &(bytes, numeric) in KEY {
+            let name = CStr::from_bytes_with_nul(bytes).unwrap();
+            let cf_key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), KUTF8);
+            let value = CFDictionaryGetValue(props, cf_key);
+            CFRelease(cf_key.cast_mut());
+            if numeric {
+                let mut out: i64 = 0;
+                values.push((!value.is_null()
+                    && CFNumberGetValue(value, SINT64, (&mut out as *mut i64).cast()))
+                    .then_some(out as f64));
+            } else {
+                booleans.push(!value.is_null() && CFBooleanGetValue(value));
+            }
+        }
+        CFRelease(props);
+        // KEY 顺序：CurrentCapacity, MaxCapacity, InstantAmperage, Amperage, Voltage | IsCharging, ExternalConnected
+        Some(smart_from(
+            values[0], values[1],
+            values[2].or(values[3]), values[4],
+            booleans[0], booleans[1],
+        ))
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn read_smart_battery() -> Option<SmartBattery> { None }
 
 fn run(program: &str, args: &[&str]) -> Option<String> {
     Command::new(program).args(args).output().ok()
@@ -36,9 +142,13 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// 返回 (剩余电量百分比, 是否接着电源)。台式机无电池时返回 (None, true)。
-pub fn power() -> (Option<u8>, bool) {
-    let Some(out) = run("/usr/bin/pmset", &["-g", "batt"]) else { return (None, true) };
+/// 返回 (剩余电量百分比, 是否接着电源, 充电功率瓦数)。
+/// 台式机无电池时返回 (None, true, None)。
+pub fn power() -> (Option<u8>, bool, Option<f32>) {
+    if let Some(b) = read_smart_battery() {
+        return (b.percent, b.external, b.watts);
+    }
+    let Some(out) = run("/usr/bin/pmset", &["-g", "batt"]) else { return (None, true, None) };
     let mut battery = None;
     for line in out.lines() {
         let Some(pos) = line.find('%') else { continue };
@@ -48,7 +158,7 @@ pub fn power() -> (Option<u8>, bool) {
     }
     // 电池行出现 discharging 才是真正在用电池；AC Power / charged / charging 都算接着电源。
     let charging = !out.lines().any(|l| l.contains("discharging"));
-    (battery, charging)
+    (battery, charging, None)
 }
 
 /// 系统输出音量 (0..100, 是否静音)。
@@ -229,8 +339,8 @@ struct PowerNotify { tx: mpsc::Sender<Snapshot>, ctx: egui::Context }
 /// 延迟从最多 1.5s 轮询降到毫秒级；采样失败不影响轮询兜底。
 unsafe extern "C" fn on_power_change(context: *mut std::ffi::c_void) {
     let state = &*(context as *const PowerNotify);
-    let (battery, charging) = power();
-    let snap = Snapshot { battery, charging, volume: volume(), network: network(), idle: idle_seconds() };
+    let (battery, charging, watts) = power();
+    let snap = Snapshot { battery, charging, watts, volume: volume(), network: network(), idle: idle_seconds() };
     let _ = state.tx.send(snap);
     state.ctx.request_repaint();
 }
@@ -267,13 +377,71 @@ pub fn start(ctx: egui::Context) -> Receiver<Snapshot> {
         });
     }
     let _ = std::thread::Builder::new().name("islandhop-mac-sys".into()).spawn(move || loop {
-        let (battery, charging) = power();
-        let snap = Snapshot { battery, charging, volume: volume(), network: network(), idle: idle_seconds() };
+        let (battery, charging, watts) = power();
+        let snap = Snapshot { battery, charging, watts, volume: volume(), network: network(), idle: idle_seconds() };
         if tx.send(snap).is_err() { break; }
         ctx.request_repaint();
         std::thread::sleep(Duration::from_millis(1500));
     });
     rx
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+
+    // 96W 充电器给 MacBook 充电的典型读数：InstantAmperage 约 6200mA、Voltage 约 11600mV。
+    #[test]
+    fn charging_reports_watts_and_percent() {
+        let b = smart_from(Some(76.0), Some(5322.0), Some(6200.0), Some(11600.0), true, true);
+        assert_eq!(b.percent, Some(76));
+        assert!(b.external);
+        assert!(b.charging_now);
+        let watts = b.watts.expect("充电中必须给出功率");
+        assert!((watts - 71.9).abs() < 1.0, "6200mA×11600mV≈71.9W，实际 {watts}");
+    }
+
+    // 放电：Amperage 为负，不给功率；插电充满：IsCharging=false，不给功率但仍算接着电源。
+    #[test]
+    fn discharging_and_fully_charged_have_no_watts() {
+        let b = smart_from(Some(64.0), None, Some(-1420.0), Some(11400.0), false, false);
+        assert_eq!(b.percent, Some(64));
+        assert!(!b.external && !b.charging_now && b.watts.is_none());
+        let full = smart_from(Some(100.0), None, Some(0.0), Some(12800.0), false, true);
+        assert!(full.external && !full.charging_now && full.watts.is_none(), "充满挂机不算充电");
+    }
+
+    // 个别固件 CurrentCapacity 给 mAh（>100），要按 MaxCapacity 换算成百分比。
+    #[test]
+    fn mah_capacity_is_converted_to_percent() {
+        let b = smart_from(Some(2800.0), Some(5088.0), None, None, false, false);
+        assert_eq!(b.percent, Some(55), "2800/5088≈55%");
+    }
+
+    // 台式机/读不到电池：百分比缺失但不炸。
+    #[test]
+    fn missing_capacity_stays_none() {
+        let b = smart_from(None, None, None, None, false, true);
+        assert_eq!(b.percent, None);
+        assert!(b.external);
+    }
+
+    // 实机验证（默认忽略，发版前跑一次）：IOKit 直读必须拿到本机电池百分比，
+    // 且与 pmset 的读数一致；充电功率可打印核对。
+    // `cargo test --lib live_smart_battery -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_smart_battery_reads_real_values() {
+        let (pct, external, watts) = power();
+        println!("IOKit 直读：percent={pct:?} external={external} watts={watts:?}");
+        let pmset = std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"])
+            .output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        println!("pmset 对照：{}", pmset.lines().take(2).collect::<Vec<_>>().join(" | "));
+        assert!(pct.is_some(), "本机（MacBook）有电池，IOKit 直读必须拿到百分比");
+        if let (Some(a), Some(b)) = (pct, pmset.lines().next().and_then(|l| l.split('%').next().and_then(|s| s.split_whitespace().last().and_then(|d| d.parse::<u8>().ok())))) {
+            assert_eq!(a, b, "IOKit 与 pmset 的百分比应一致");
+        }
+    }
 }
 
 #[cfg(test)]

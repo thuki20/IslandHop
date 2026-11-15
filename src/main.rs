@@ -351,8 +351,20 @@ impl Shell {
             clock,
             today,
             date,
-            battery: self.sys.0,
-            charging: self.sys.1,
+            // macOS 电量走后台快照（IOKit 事件 + 1.5s 兜底轮询，双通道无延迟）；
+            // Windows 保持 5 秒低频轮询即可（无充电功率可读）。
+            battery: {
+                #[cfg(target_os = "macos")] { self.mac_sys.0.battery }
+                #[cfg(not(target_os = "macos"))] { self.sys.0 }
+            },
+            charging: {
+                #[cfg(target_os = "macos")] { self.mac_sys.0.charging }
+                #[cfg(not(target_os = "macos"))] { self.sys.1 }
+            },
+            battery_watts: {
+                #[cfg(target_os = "macos")] { self.mac_sys.0.watts }
+                #[cfg(not(target_os = "macos"))] { None }
+            },
             // 上游这两处漏了 cfg 守卫：system_state 字段本身是 #[cfg(windows)]。
             // IslandHop 在 macOS 上走 Default，保持 Env 结构不变、不删功能。
             network: {
@@ -1041,7 +1053,10 @@ fn read_power() -> (Option<u8>, bool) {
 }
 
 #[cfg(target_os = "macos")]
-fn read_power() -> (Option<u8>, bool) { daozai::macos_sys::power() }
+fn read_power() -> (Option<u8>, bool) {
+    let (b, c, _) = daozai::macos_sys::power();
+    (b, c)
+}
 
 #[cfg(not(any(windows, target_os = "macos")))]
 fn read_power() -> (Option<u8>, bool) { (None, true) }

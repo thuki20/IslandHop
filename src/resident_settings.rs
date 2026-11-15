@@ -72,7 +72,7 @@ impl crate::app::App {
             let active=match slot{BATTERY=>self.settings.show_battery&&self.resident_power.0.is_some(),PET=>self.settings.pet,QUOTA=>count>0,MUSIC=>self.media.is_music(),FOCUS=>self.pomo.running,_=>true};
             let c=card.shifted(dx,0.0).faded(if active||is_dragged{1.0}else{0.38}).ghost();
             match slot{
-                BATTERY=>paint::battery(&c,x,15.0,self.resident_power.0,self.resident_power.1,1.0),
+                BATTERY=>paint::battery(&c,x,15.0,self.resident_power.0,self.resident_power.1,1.0,self.resident_power.2),
                 CLOCK=>{
                     let text=self.settings.clock_text(&chrono::Local::now().format("%H:%M:%S").to_string());
                     paint::clock(&c,x-paint::clock_width(&c,&text,theme::size::PILL_CLOCK)/2.0,21.0,&text,theme::size::PILL_CLOCK);

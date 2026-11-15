@@ -410,7 +410,7 @@ pub fn chevron(c: &Card, x: f32, y: f32, dir: f32, hover: f32, press: f32) {
 }
 
 /// 电池环：充电绿色 + 闪电；低电量红色；否则灰色并显示百分比弧。
-pub fn battery(c: &Card, cx: f32, cy: f32, pct: Option<u8>, charging: bool, k: f32) {
+pub fn battery(c: &Card, cx: f32, cy: f32, pct: Option<u8>, charging: bool, k: f32, watts: Option<f32>) {
     let r = 8.2 * k;
     let w = 2.6 * k;
     let level = pct.unwrap_or(100) as f32 / 100.0;
@@ -428,7 +428,12 @@ pub fn battery(c: &Card, cx: f32, cy: f32, pct: Option<u8>, charging: bool, k: f
     } else {
         c.arc(cx, cy, r, a0, a0 + TAU * level.max(0.02), w, col);
     }
-    if charging || pct.is_none() {
+    if let Some(watts) = watts.filter(|w| *w >= 0.5) {
+        // StatusTrio 式：充电中环心显示实时功率（如 28W）；100W+ 充电器字号略缩。
+        let text = format!("{watts:.0}W");
+        let size = if text.len() >= 4 { 5.2 * k } else { 6.2 * k };
+        c.text(cx, cy + 2.2 * k, &text, size, W::Bold, col, H::Center);
+    } else if charging || pct.is_none() {
         let s = k;
         c.poly(&[(cx + 1.6 * s, cy - 5.0 * s), (cx - 3.2 * s, cy + 0.9 * s), (cx + 0.3 * s, cy + 0.9 * s)], col);
         c.poly(&[(cx - 0.3 * s, cy - 0.9 * s), (cx + 3.2 * s, cy - 0.9 * s), (cx - 1.6 * s, cy + 5.0 * s)], col);
