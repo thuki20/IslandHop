@@ -20,6 +20,7 @@ IslandHop 是把 Windows 版「岛仔（xiaotang-daozai）」全量 fork 到 mac
 | 技术栈 | Rust 2021 · eframe/egui 0.31（vendored）· winit 0.30.13 · objc2 0.6 · keyring 3 |
 | 主产物 | `IslandHop.app`（macOS，ad-hoc 或 `OpenHopSign` 签名） |
 | 版本 | v0.6.68 |
+| 云端构建 | `.github/workflows/release-macos.yml`（GitHub `macos-15` runner，**不需要 Mac**，见 §2.5） |
 | 更新源 | **多源自动回退**（`src/updates.rs: FEEDS`）：① `https://203.195.201.85/home/updates/islandhop/`（当前生效，LE **IP 证书**）② `http://203.195.201.85/.well-known/acme-challenge/islandhop/`（无证书兜底）③ `https://ncsai.top/home/updates/islandhop/`（**目前不可用**，见 §6 第 14 条） |
 | 测试基线 | `cargo test --release --lib` → 904 passed / 0 failed / 77 ignored |
 
@@ -76,6 +77,40 @@ bash packaging/push-update.sh "更新说明第一行" "第二行" "第三行"
 | `ssh ncsai` 别名 | 脚本用 `ssh ncsai` 推 203.195.201.85，别名配在**本机** `~/.ssh/config` | 新机补 ssh 配置，或把 zip+manifest 拷给有权限的机器推；也可 `ISLANDHOP_UPDATE_SERVER=user@host` 覆盖 |
 | 签名证书 `OpenHopSign` | 本机钥匙串自建代码签名证书，TCC 按「签名身份 + bundle id」记授权 | 新机没有该证书会退回 ad-hoc → **每次重打包都要重新授权辅助功能**。要稳定就新建同名证书：钥匙串访问 → 证书助理 → 创建证书 → 类型「代码签名」 |
 | 客户端更新源 | 已改为多源候选（`src/updates.rs: FEEDS`），按序自动回退，域名排最后 | 无需改；调试单个源用 `ISLANDHOP_FEED_URL=<url>` 覆盖 |
+
+---
+
+## 2.5 云端构建：Windows 也能发版（不需要 Mac）
+
+`.github/workflows/release-macos.yml` 在 GitHub 的 Apple Silicon runner 上编译、签名、打包、推云端，
+**改完代码 push 就完事**，本机不需要装 Rust、也不需要出包。
+
+```bash
+# Windows / 任意机器上：
+# 1) 改代码
+# 2) Cargo.toml 两处 version 一起 bump（这是发版开关）
+# 3) CHANGELOG.md 顶部加一节
+# 4) git push
+# → Actions 自动跑约 15 分钟 → 云端 manifest 更新 → 已装客户端下次启动弹更新
+```
+
+手动触发（可以自定义更新说明）：仓库 Actions → **Release macOS (OTA)** → Run workflow → 填 `notes`。
+
+| 项 | 值 | 备注 |
+|---|---|---|
+| runner | `macos-15`（arm64） | **不要用 `macos-14`**：实测 1 秒内 cancelled、0 step；`macos-13` 长期 queued。可用仓库变量 `MACOS_RUNNER` 覆盖 |
+| 触发 | push 到 main（改 `src/` `crates/` `vendor/` `packaging/` `Cargo.toml`）+ 手动 | 只改文档不会触发 |
+| 实测耗时 | 首次约 16 分钟（904 测试占一半），有缓存后更快 | 公开仓库免费，不烧额度 |
+| 需要的 Secrets | `MACOS_CERT_P12`（OpenHopSign 的 p12 base64）、`MACOS_CERT_PASSWORD`、`DEPLOY_SSH_KEY`（CI 专用私钥） | 已配置；缺证书→ad-hoc（用户需重授权），缺 SSH key→只出 artifact 不推云端 |
+| CI 专用密钥 | `~/.ssh/islandhop_ci_ed25519`，公钥在服务器 `~/.ssh/authorized_keys`（注释 `islandhop-ci@github-actions`） | 撤销=删该行；换密钥就重跑 `gh secret` 写入 |
+
+**两个必须知道的坑：**
+
+1. **secrets 是 run 启动时快照的**。改完 secret 必须**重新触发**一次 workflow，正在跑的 job 拿不到新值
+   （首次实测就栽在这：job 10:17 启动，secret 10:18 写入，env 里仍是空）。
+2. **自签名证书导出成 p12 会丢 TrustSettings**，CI 里导入后 `find-identity -v` 认为它不受信 → `macos-app.sh`
+   静默退回 ad-hoc 签名。workflow 里已用 `security add-trusted-cert -d -r trustRoot` 修掉，并在看不到身份时
+   直接报错而不是悄悄降级。
 
 ---
 

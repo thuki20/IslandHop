@@ -34,7 +34,7 @@ on:
       - ".github/workflows/release-macos.yml"
 
 permissions:
-  contents: read
+  contents: write   # 需要创建 Release 并上传 zip/manifest
 
 # 同一时刻只跑一个发版，避免两条流水线交叉写 manifest
 concurrency:
@@ -114,45 +114,20 @@ jobs:
         continue-on-error: true
         run: cargo test --release --lib
 
-      - name: 配置部署 SSH
-        id: ssh
+      - name: 构建 + 打包 + 生成 manifest
+        id: build
         env:
-          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
-        run: |
-          if [ -z "${DEPLOY_SSH_KEY:-}" ]; then
-            echo "::warning::未配置 DEPLOY_SSH_KEY，本次只出包不推云端（产物见 Actions artifact）"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 203.195.201.85 >> ~/.ssh/known_hosts 2>/dev/null
-          ssh -o BatchMode=yes -o ConnectTimeout=15 ubuntu@203.195.201.85 'echo ssh-ok'
-          echo "ready=true" >> "$GITHUB_OUTPUT"
-
-      - name: 仅构建出包（未配置部署密钥）
-        if: steps.ssh.outputs.ready != 'true'
-        run: |
-          set -euo pipefail
-          VERSION=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
-          cargo build --release --bin IslandHop
-          bash packaging/macos-app.sh --app-only
-          mkdir -p dist
-          ditto -c -k --sequesterRsrc --keepParent IslandHop.app "dist/IslandHop-v$VERSION-macos.zip"
-
-      - name: 构建 + 打包 + 推送 OTA
-        if: steps.ssh.outputs.ready == 'true'
-        env:
-          ISLANDHOP_UPDATE_SERVER: ubuntu@203.195.201.85
+          ISLANDHOP_NO_PUBLISH: "1"
           INPUT_NOTES: ${{ inputs.notes }}
         run: |
           set -euo pipefail
           VERSION=$(python3 -c "import tomllib;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           NOTES="${INPUT_NOTES:-}"
           if [ -z "$NOTES" ]; then NOTES="CI 自动构建 v$VERSION"; fi
-          echo "==> 发版 v$VERSION"
+          echo "==> 出包 v$VERSION"
           bash packaging/push-update.sh "$NOTES"
+          ls -la dist/
 
       - name: 校验签名身份
         run: |
@@ -162,6 +137,22 @@ jobs:
           else
             echo "::warning::本次为 ad-hoc 签名，用户端更新后需重新授权辅助功能"
           fi
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build.outputs.version }}
+          name: v${{ steps.build.outputs.version }}
+          body: |
+            ${{ inputs.notes }}
+
+            macOS arm64 自动构建。服务器端 `ncsai-portal-sync.timer` 会在几分钟内把它镜像到
+            `https://203.195.201.85/home/updates/islandhop/`，客户端随后自动更新。
+          files: |
+            dist/IslandHop-*-macos.zip
+            dist/manifest.json
+            dist/manifest-legacy.json
+          fail_on_unmatched_files: true
 
       - uses: actions/upload-artifact@v4
         with:

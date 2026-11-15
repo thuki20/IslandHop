@@ -60,6 +60,14 @@ for path, data in (("dist/manifest.json", main), ("dist/manifest-legacy.json", o
 print(json.dumps(main, ensure_ascii=False, indent=2))
 PY
 
+if [ "${ISLANDHOP_NO_PUBLISH:-}" = "1" ]; then
+  # 只出包模式：CI 用。产物留在 dist/，由调用方（GitHub Release）分发，
+  # 服务器端再由 sync-islandhop-update 定时镜像回门户目录。
+  echo "==> 跳过推送（ISLANDHOP_NO_PUBLISH=1）"
+  echo "✔ 产物就绪：dist/$ZIP_NAME + dist/manifest.json（v${VERSION}）"
+  exit 0
+fi
+
 echo "==> 推送到 $SERVER:$PORTAL_DIR/（门户）与旧兼容目录"
 ssh "$SERVER" "mkdir -p '$PORTAL_DIR' '$LEGACY_DIR'"
 rsync -avz --checksum "dist/$ZIP_NAME" "dist/manifest.json" "$SERVER:$PORTAL_DIR/"

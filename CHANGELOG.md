@@ -1,5 +1,11 @@
 # 更新记录
 
+## v0.6.69
+
+- 新增云端构建：GitHub Actions 在 Apple Silicon runner 上编译、用 OpenHopSign 签名、打包并发布，Windows 上改完代码 push 即可出包，不再需要在 Mac 上手动打包安装。
+- 服务器新增每 5 分钟一次的镜像任务，把 GitHub Release 上的最新包同步到更新目录（GitHub runner 的出口 IP 会被服务器安全策略拦截，无法直接 ssh 推送）。
+- 签名身份在云端沿用同一张 OpenHopSign 证书，更新后辅助功能授权不会失效。
+
 ## v0.6.68
 
 - 更新通道改为多源自动回退，不再单点依赖域名：依次尝试「https + IP」「http + IP 兼容副本」「https + 域名」，首个可用的源生效，前一个连不上会自动换下一个。
