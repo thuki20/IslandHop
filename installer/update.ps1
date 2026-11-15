@@ -2,7 +2,15 @@ param([Parameter(Mandatory=$true)][string]$WorkPath, [Parameter(Mandatory=$true)
 $ErrorActionPreference = 'Stop'
 # 更新只使用当前 PowerShell 自带模块，避免继承其他终端版本的模块路径。
 $env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
-$cacheRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Daozai\Updates')).TrimEnd('\')
+# 更新缓存根：IslandHop 为主；Daozai 是改名前的历史路径，两者都认可。
+# 0.6.64–0.6.77 的 update.ps1 只认 Daozai\Updates，而同版客户端的下载目录已是
+# IslandHop\Updates，前缀校验必然失败（错误信息也写不出来）——应用内更新全程空转。
+$cacheRoots = @('IslandHop\Updates', 'Daozai\Updates') | ForEach-Object {
+    [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA $_)).TrimEnd('\')
+}
+function Test-KnownCachePath([string]$PathToCheck) {
+    @($cacheRoots | Where-Object { $PathToCheck.StartsWith($_ + '\', [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+}
 $workRoot = [IO.Path]::GetFullPath($WorkPath).TrimEnd('\')
 $target = [IO.Path]::GetFullPath($TargetExe)
 $targetDir = Split-Path $target -Parent
@@ -18,7 +26,7 @@ function Assert-PlainPath([string]$PathToCheck) {
     }
 }
 try {
-    if (-not $workRoot.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw '更新缓存目录无效。' }
+    if (-not (Test-KnownCachePath $workRoot)) { throw '更新缓存目录无效。' }
     Assert-PlainPath $workRoot
     Assert-PlainPath $target
     if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw '找不到当前程序。' }
@@ -58,7 +66,7 @@ try {
         if ($sizeKb -gt 0) { Set-ItemProperty -LiteralPath $key -Name EstimatedSize -Value $sizeKb -Type DWord -ErrorAction SilentlyContinue }
     }
     # 只清理已经确认位于专用缓存内的本次更新目录。
-    if ($workRoot.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    if (Test-KnownCachePath $workRoot) {
         try { Assert-PlainPath $workRoot; Remove-Item -LiteralPath $workRoot -Recurse -Force } catch { }
     }
 } catch {
@@ -66,7 +74,7 @@ try {
     if ($replaced -and (Test-Path -LiteralPath $backup)) { [IO.File]::Copy($backup, $target, $true) }
     if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Force }
     if (-not $exited) {
-        if ($workRoot.StartsWith($cacheRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        if (Test-KnownCachePath $workRoot) {
             [IO.File]::WriteAllText((Join-Path $workRoot 'error.txt'), $message)
         }
         exit 1

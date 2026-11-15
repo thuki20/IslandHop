@@ -7,6 +7,8 @@
 - **Windows 电池徽标集成 StatusTrio 式功率读取**：充电时电量环中心显示实时充电功率（`CallNtPowerInformation` 直读，毫秒级），未充电显示电量百分比；与 macOS 同策略（双平台一致）。
 
 ### 🔧 问题修复
+- **Windows 应用内更新全程空转**（进度条完成后停在「正在准备重启」，软件不退出、不覆盖、版本号不变）：品牌 Daozai → IslandHop 时，客户端下载目录改成了 `%LOCALAPPDATA%\IslandHop\Updates`，但编译进程序里的更新脚本仍只认 `%LOCALAPPDATA%\Daozai\Updates` 前缀，校验必然失败，且失败时连错误信息都写不出来（同一个前缀条件把关），界面只能无声卡住。现在脚本同时认可两个缓存前缀，任何校验失败都会留下错误信息供界面展示。经端到端实测：0.6.77 → 0.6.78 原地替换、重启、缓存清理全部成功。
+- **Windows 更新检查不再依赖 GitHub**：与 macOS 一致，优先走自托管 feed（`manifest-windows.json`），国内网络直连也能检查更新；GitHub API 降级为兜底。
 - **macOS 充电时电量环内不显示实时功率**（0.6.77 实测问题）：大部分 MacBook 固件充电时 `InstantAmperage` 为负值（电流流入电池），旧代码按 `> 0` 过滤导致功率恒为空；现按绝对值取幅值。
 - **跨屏后 macOS 画布不跟随**：`DriveStart` 协议补上目标端名（协议版本 16 → 17），接收端把对端选中的屏幕记为活动屏，画布不再永远显示「本机」。
 - **macOS 开机自启打不开**：补上 LaunchAgent 实现（`~/Library/LaunchAgents/com.ncsai.islandhop.plist` + launchctl load/unload），设置页开关现在真正生效。

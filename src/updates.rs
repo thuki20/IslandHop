@@ -6,21 +6,23 @@ const REPOSITORY: &str = "https://github.com/thuki20/IslandHop";
 const API: &str = "https://api.github.com/repos/thuki20/IslandHop/releases/latest";
 const RELEASES: &str = "https://github.com/thuki20/IslandHop/releases/latest";
 const BACKUP_DOWNLOAD: &str = "https://github.com/thuki20/IslandHop/releases/latest";
-/// 云端私有更新源（自有服务器）：迭代后把 `IslandHop-v*版本*-macos.zip` 与
-/// `manifest.json`（version/notes/url/sha256/size）用 packaging/push-update.sh
-/// 推到软件工作台 /home/updates/islandhop/，客户端启动即自动检查、
-/// 应用内下载并覆盖安装，无需逐台手动替换。
+/// 云端私有更新源（自有服务器）：迭代后把 `IslandHop-v*版本*-macos.zip`、
+/// `IslandHop-v*版本*-windows-x64.zip` 与清单（manifest.json / manifest-windows.json，
+/// 字段 version/notes/url/sha256/size）推到软件工作台 /home/updates/islandhop/，
+/// 客户端启动即自动检查、应用内下载并覆盖安装，无需逐台手动替换。
 /// 更新源按顺序尝试，首个可用即用（单点故障会让整条 OTA 挂掉）：
 ///   1. https + IP      —— Let's Encrypt IP 证书（SAN 就是 203.195.201.85），不依赖域名与 SNI；
 ///   2. http  + IP      —— acme-challenge 兼容副本，连证书都不依赖的最后兜底（sha256 兜完整性）；
 ///   3. https + 域名    —— ncsai.top 的 443 链路打通后自动接管，排在最后不影响现状。
 /// 完整性始终由 manifest 的 sha256 保证。
 /// 可用环境变量 `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用，覆盖后只用该单一源）。
-const FEEDS: &[&str] = &[
-    "https://203.195.201.85/home/updates/islandhop/manifest.json",
-    "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json",
-    "https://ncsai.top/home/updates/islandhop/manifest.json",
+const FEED_BASES: &[&str] = &[
+    "https://203.195.201.85/home/updates/islandhop/",
+    "http://203.195.201.85/.well-known/acme-challenge/islandhop/",
+    "https://ncsai.top/home/updates/islandhop/",
 ];
+#[cfg(any(target_os = "macos", windows))]
+const FEED_MANIFEST: &str = if cfg!(windows) { "manifest-windows.json" } else { "manifest.json" };
 
 /// 自有服务器前缀：命中这些前缀的 http 下载才允许（GitHub 等外部源强制 https）。
 const SELF_HOSTED: &[&str] = &["http://203.195.201.85/", "https://203.195.201.85/", "https://ncsai.top/"];
@@ -28,7 +30,7 @@ const SELF_HOSTED: &[&str] = &["http://203.195.201.85/", "https://203.195.201.85
 fn feed_urls() -> Vec<String> {
     match std::env::var("ISLANDHOP_FEED_URL") {
         Ok(value) if !value.trim().is_empty() => vec![value],
-        _ => FEEDS.iter().map(|url| (*url).to_owned()).collect(),
+        _ => FEED_BASES.iter().map(|base| format!("{base}{FEED_MANIFEST}")).collect(),
     }
 }
 
@@ -345,8 +347,8 @@ fn http_agent() -> Result<ureq::Agent, String> {
 }
 
 fn check() -> Result<Option<Release>, String> {
-    // macOS 优先走自有云端 feed（无 GitHub Release 依赖）；feed 不可达再回退 GitHub。
-    #[cfg(target_os = "macos")]
+    // 优先走自有云端 feed（不依赖 GitHub 可达性，国内网络也能更新）；feed 不可达再回退 GitHub。
+    #[cfg(any(windows, target_os = "macos"))]
     match check_feed() {
         Ok(found) => return Ok(found),
         Err(_) => {}
@@ -363,10 +365,10 @@ fn check() -> Result<Option<Release>, String> {
     release_info(&value, env!("CARGO_PKG_VERSION"))
 }
 
-/// 云端 feed 检查（macOS OTA）。manifest 格式：
+/// 云端 feed 检查。manifest 格式：
 /// `{"version":"0.6.65","notes":"- …","url":"…/IslandHop-v0.6.65-macos.zip","sha256":"…","size":123}`
 /// version 不比本地新返回 Ok(None)；url/sha256/size 齐全才允许应用内安装。
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 fn check_feed() -> Result<Option<Release>, String> {
     let mut last = String::from("feed 不可达");
     for url in feed_urls() {
@@ -386,7 +388,7 @@ fn check_feed() -> Result<Option<Release>, String> {
 
 /// feed 清单解析（纯函数，单测覆盖）：version 不比本地新返回 Ok(None)；
 /// url/sha256/size 合法齐全才允许应用内安装（package=None 时仅提示）。
-#[cfg(target_os = "macos")]
+#[cfg(any(windows, target_os = "macos"))]
 fn parse_feed(value: &serde_json::Value, current: &str) -> Result<Option<Release>, String> {
     let ver = value["version"].as_str().ok_or("feed 清单缺少 version")?;
     let latest = version(ver).ok_or("feed 清单 version 格式异常")?;
@@ -646,7 +648,16 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn feed_urls_point_at_the_platform_manifest() {
+        for url in feed_urls() {
+            assert!(url.ends_with(FEED_MANIFEST), "{url} 应指向本平台清单 {FEED_MANIFEST}");
+        }
+        assert_eq!(feed_urls().len(), FEED_BASES.len(), "每个 feed 源都要被尝试");
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
     #[test]
     fn feed_manifest_parsing_requires_newer_version_and_valid_package() {
         let base = serde_json::json!({
