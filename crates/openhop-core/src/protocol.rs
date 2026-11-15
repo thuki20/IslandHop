@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 // 16: IslandHop 新增 `Ext::IslandState`，旧版收到未知枚举会整帧 decode 失败，
 // 因此握手阶段就拒绝协议不一致的对端（双端都用同一版 IslandHop 即可互联）。
-pub const PROTOCOL_VERSION: u32 = 16;
+// 17: `DriveStart` 携带被驱动屏幕名——客户端屏幕排列画布的「光标当前在」
+// 指示要靠它指向正确的对端（此前客户端永远显示「本机」）。
+pub const PROTOCOL_VERSION: u32 = 17;
 // IslandHop 使用独立的端口组，避免与仍在运行的旧版 OpenHop
 // （TCP 24850 / UDP 24851）抢占端口和组播发现组。双端都用 IslandHop 即可互联。
 pub const DEFAULT_PORT: u16 = 24950;
@@ -239,8 +241,11 @@ pub enum Msg {
         frac: f64,
     },
     /// Server -> client: your keyboard and mouse now drive the others:
-    /// capture them and send [`Msg::Drive`].
-    DriveStart,
+    /// capture them and send [`Msg::Drive`]. `target` is the driven screen's
+    /// name (客户端靠它把「光标当前在」指示指向正确的对端；None = 驱动本机)。
+    DriveStart {
+        target: Option<String>,
+    },
     /// Server -> client: the pointer came back to your screen at (x, y): let
     /// your keyboard and mouse work here again. (-1, -1): another computer's
     /// mouse took over; stop, and keep your pointer hidden.

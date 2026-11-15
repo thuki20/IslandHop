@@ -42,7 +42,7 @@ struct Shell {
     #[cfg(windows)]
     oled_shift: (i32, i32),
     win_x: f32,
-    sys: (Option<u8>, bool, PollClock),
+    sys: (Option<u8>, bool, Option<f32>, PollClock),
     /// 视觉验证辅助：设 `ISLANDHOP_HUD_DEMO=1` 启动 3 秒后弹一条电源已连接，
     /// 用于实测 HUD 弹窗的落位（macOS 下挂到刘海下方）；弹完即清空，无副作用。
     hud_demo: Option<std::time::Instant>,
@@ -76,7 +76,7 @@ struct Shell {
     native: Option<daozai::native::Window>,
     #[cfg(windows)]
     tray: Option<daozai::tray::Tray>,
-    #[cfg(windows)]
+    /// 开机自启状态：Windows 读 HKCU\Run，macOS 读 LaunchAgent plist。
     autostart: bool,
     /// v0.5.4：蓝牙音频设备（后台线程推送）与音量回声的静默窗口。
     #[cfg(windows)]
@@ -165,8 +165,11 @@ impl Shell {
         let media = smtc::shared();
         let media_enabled=smtc::spawn_poller(media.clone(),cc.egui_ctx.clone());
         media_enabled.store(app.settings.visible_pages[0],std::sync::atomic::Ordering::Relaxed);
+        // 开机自启状态：Windows 读 HKCU\Run；macOS 读 LaunchAgent（此前 mac 上开关是空操作）。
         #[cfg(windows)]
         let autostart = daozai::tray::autostart_enabled();
+        #[cfg(target_os = "macos")]
+        let autostart = daozai::macos_sys::autostart::enabled();
         #[cfg(windows)]
         let tray = app.start_tray(daozai::tray::State {
             pet: app.settings.pet,
@@ -215,7 +218,7 @@ impl Shell {
             #[cfg(windows)]
             oled_shift: (0, 0),
             win_x: 0.0,
-            sys: (None, false, PollClock::default()),
+            sys: (None, false, None, PollClock::default()),
             hud_demo: std::env::var_os("ISLANDHOP_HUD_DEMO").is_some().then(std::time::Instant::now),
             #[cfg(windows)]
             system_state,
@@ -304,12 +307,12 @@ impl Shell {
             }
         }
         let (clock, today, date) = local_now();
-        // 电量变化很慢，每 5 秒读一次就够
-        if self.sys.2.ready(Duration::from_secs(5)) {
-            let (b, c) = read_power();
+        // 电量百分比变化很慢，但充电功率（W）需要跟手：1.5 秒节奏与 macOS 对齐
+        if self.sys.3.ready(Duration::from_millis(1500)) {
+            let (b, c, w) = read_power();
             if self.app.settings.show_battery && self.sys.0.is_some() && self.sys.1!=c && self.app.settings.system_hud {self.app.alert(if c {"电源已连接"}else{"已切换电池供电"},b.map(|v|format!("当前电量 {v}%")).unwrap_or_else(||"桌面电源状态已更新".into()),5,false);}
             if self.app.settings.show_battery && b.is_some_and(|v|v<=20) && !c && self.sys.0.is_some_and(|v|v>20) {self.app.alert("电量偏低",format!("剩余 {}% · 请连接电源",b.unwrap()),5,true);}
-            self.sys = (b, c, PollClock::now());
+            self.sys = (b, c, w, PollClock::now());
         }
         if let Some(at)=self.hud_demo {
             if at.elapsed()>=std::time::Duration::from_secs(3) {
@@ -352,7 +355,7 @@ impl Shell {
             today,
             date,
             // macOS 电量走后台快照（IOKit 事件 + 1.5s 兜底轮询，双通道无延迟）；
-            // Windows 保持 5 秒低频轮询即可（无充电功率可读）。
+            // Windows 走 CallNtPowerInformation 直读 + 1.5s 轮询，充电功率与 macOS 同款显示。
             battery: {
                 #[cfg(target_os = "macos")] { self.mac_sys.0.battery }
                 #[cfg(not(target_os = "macos"))] { self.sys.0 }
@@ -363,7 +366,7 @@ impl Shell {
             },
             battery_watts: {
                 #[cfg(target_os = "macos")] { self.mac_sys.0.watts }
-                #[cfg(not(target_os = "macos"))] { None }
+                #[cfg(not(target_os = "macos"))] { self.sys.2 }
             },
             // 上游这两处漏了 cfg 守卫：system_state 字段本身是 #[cfg(windows)]。
             // IslandHop 在 macOS 上走 Default，保持 Env 结构不变、不删功能。
@@ -864,6 +867,14 @@ impl eframe::App for Shell {
                 Cmd::QuotaConnected=>{self.quota_sig=None;},
                 Cmd::ToggleAutostart=>{
                     #[cfg(windows)] {let want=!self.autostart;match daozai::tray::set_autostart(want){Ok(())=>self.autostart=want,Err(e)=>self.app.say(e)}}
+                    // macOS：LaunchAgent 写/删（此前此分支是空的，开关拨了没有任何效果）。
+                    #[cfg(target_os = "macos")] {
+                        let want=!daozai::macos_sys::autostart::enabled();
+                        match daozai::macos_sys::autostart::set(want) {
+                            Ok(())=>{self.autostart=want;self.app.say(if want {"已开启开机自启（下次登录自动打开）"}else{"已关闭开机自启"});}
+                            Err(e)=>self.app.say(&e),
+                        }
+                    }
                 },
                 Cmd::SetVolume(v)=>{
                     #[cfg(windows)] daozai::system::set_volume(v);
@@ -896,7 +907,11 @@ impl eframe::App for Shell {
                 Cmd::CalendarMonth(month)=>if let Some(cal)=&self.cal {cal.view_month(month);},
                 Cmd::CalendarForget=>{
                     if let Err(error)=daozai::calendar::forget_config(){self.app.say(&error);continue;}
-                    if let Some(old)=self.app.forget_calendar(){daozai::calendar::secrets::delete(&old);}
+                    if let Some(old)=self.app.forget_calendar(){
+                        daozai::calendar::secrets::delete(&old);
+                        // 删除请求转发主端：主端删除后随快照确认，删除永久生效不复活。
+                        daozai::sync_state::request_deletion(format!("cal:{}",daozai::calendar::credential_key(&old)));
+                    }
                     if let Some(cal)=&self.cal {
                         let configs=self.app.calendar_configs();
                         cal.configure(configs.clone(),self.app.settings.calendar_auto_sync);
@@ -909,7 +924,7 @@ impl eframe::App for Shell {
 
 
         #[cfg(windows)] let autostart = self.autostart;
-        #[cfg(not(windows))] let autostart = false;
+        #[cfg(not(windows))] let autostart = self.autostart;
         self.app.settings_ui(ctx, autostart);
         self.app.mail_reader_ui(ctx);
         // IslandHop：Cmd/Ctrl + Shift + K 直达岛仔设置里的「局域网跨屏」分组。
@@ -1040,22 +1055,43 @@ fn local_now() -> (String, String, String) {
     )
 }
 
+/// Windows 电池状态：百分比 + 是否接电 + 充电功率（W，借鉴 StatusTrio 的直读思路）。
+/// `GetSystemPowerStatus` 只有百分比与 AC 状态；功率走 `CallNtPowerInformation(SystemBatteryState)`，
+/// `Rate` 单位 mW（`Charging` 时为充电电流），无需管理员权限、调用即返回（微秒级）。
 #[cfg(windows)]
-fn read_power() -> (Option<u8>, bool) {
-    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+fn read_power() -> (Option<u8>, bool, Option<f32>) {
+    use windows::Win32::System::Power::{
+        CallNtPowerInformation, GetSystemPowerStatus, SystemBatteryState, SYSTEM_BATTERY_STATE,
+        SYSTEM_POWER_STATUS,
+    };
     let mut st = SYSTEM_POWER_STATUS::default();
-    if unsafe { GetSystemPowerStatus(&mut st) }.is_ok() {
-        let pct = if st.BatteryLifePercent == 255 { None } else { Some(st.BatteryLifePercent) };
-        (pct, st.ACLineStatus == 1)
-    } else {
-        (None, false)
+    let ok = unsafe { GetSystemPowerStatus(&mut st) }.is_ok();
+    let pct = if ok && st.BatteryLifePercent != 255 { Some(st.BatteryLifePercent) } else { None };
+    let ac = ok && st.ACLineStatus == 1;
+    // 部分固件接电但未充电（保护阈值）时 Charging=false，此时不显示功率
+    let mut watts = None;
+    let mut bs = SYSTEM_BATTERY_STATE::default();
+    let status = unsafe {
+        CallNtPowerInformation(
+            SystemBatteryState,
+            None,
+            0,
+            Some(&mut bs as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<SYSTEM_BATTERY_STATE>() as u32,
+        )
+    };
+    if status.is_ok() && ac && bs.Charging.as_bool() && bs.BatteryPresent.as_bool() && bs.Rate > 0 {
+        let w = bs.Rate as f32 / 1000.0;
+        watts = (w >= 0.5).then_some(w);
     }
+    (pct, ac, watts)
 }
 
 #[cfg(target_os = "macos")]
-fn read_power() -> (Option<u8>, bool) {
+fn read_power() -> (Option<u8>, bool, Option<f32>) {
+    // macOS 的功率走 mac_sys 后台快照（IOKit 事件 + 1.5s 轮询），轮询线程只取百分比与接电状态
     let (b, c, _) = daozai::macos_sys::power();
-    (b, c)
+    (b, c, None)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]

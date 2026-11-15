@@ -1734,6 +1734,8 @@ impl App {
                                 self.mail.status.remove(&email.to_ascii_lowercase());
                                 self.mail.note=format!("{email}：已移除，凭据已从系统凭据管理器删除");
                                 self.mail_accounts_changed();
+                                // 删除请求转发主端：主端删除后随快照确认，删除永久生效不复活。
+                                crate::sync_state::request_deletion(format!("mail:{}",email.to_ascii_lowercase()));
                             }
                             if let Some(i)=test{
                                 let account=self.mail.accounts[i].clone();

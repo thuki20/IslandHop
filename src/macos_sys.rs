@@ -45,7 +45,9 @@ struct SmartBattery {
 
 /// 从 AppleSmartBattery 属性字典挑出的标量 → 电池状态（纯函数，可测）。
 /// - 百分比：`CurrentCapacity` 直接是 0-100；个别固件给 mAh 时按 `MaxCapacity` 换算。
-/// - 功率：Amperage(mA) × Voltage(mV) / 1e6；充电为正、放电为负，<0.5W 视为未充电。
+/// - 功率：|Amperage(mA)| × Voltage(mV) / 1e6，仅在 IsCharging 时给出，<0.5W 视为未充电。
+///   注意 AppleSmartBattery 的电流**符号约定随固件而异**：多数机型充电为负（电流流入电池），
+///   也有固件充电给正——按绝对值取幅值，充电与否只信 IsCharging 标志。
 fn smart_from(
     capacity: Option<f64>,
     max_capacity: Option<f64>,
@@ -60,8 +62,9 @@ fn smart_from(
         pct.round().clamp(0.0, 100.0) as u8
     });
     let watts = match (amperage, voltage) {
-        (Some(a), Some(v)) if is_charging && a > 0.0 && v > 0.0 => {
-            let w = (a * v / 1.0e6) as f32;
+        // 充电中：电流取绝对值（兼容充电为负/为正两种固件符号约定）
+        (Some(a), Some(v)) if is_charging && a != 0.0 && v > 0.0 => {
+            let w = (a.abs() * v / 1.0e6) as f32;
             (w >= 0.5).then_some(w)
         },
         _ => None,
@@ -159,6 +162,57 @@ pub fn power() -> (Option<u8>, bool, Option<f32>) {
     // 电池行出现 discharging 才是真正在用电池；AC Power / charged / charging 都算接着电源。
     let charging = !out.lines().any(|l| l.contains("discharging"));
     (battery, charging, None)
+}
+
+/// macOS 开机自启：LaunchAgent（`~/Library/LaunchAgents/com.ncsai.islandhop.plist`）。
+/// 不用 SMAppService——它要求 App 打包成 .app 且签名约束多，对裸二进制/开发构建
+/// 不生效；用户级 LaunchAgent + `launchctl load` 对任何形态都有效，无需管理员权限。
+pub mod autostart {
+    const LABEL: &str = "com.ncsai.islandhop";
+
+    fn plist_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Library").join("LaunchAgents").join(format!("{LABEL}.plist")))
+    }
+
+    /// 开机自启当前是否开启（以 LaunchAgent plist 是否存在为准）。
+    pub fn enabled() -> bool {
+        plist_path().is_some_and(|path| path.exists())
+    }
+
+    /// 开/关开机自启：写或删 LaunchAgent plist，并同步 launchctl 加载/卸载。
+    pub fn set(on: bool) -> Result<(), String> {
+        let path = plist_path().ok_or("读不到 HOME 环境变量，无法定位 LaunchAgents 目录")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("创建 LaunchAgents 目录失败：{e}"))?;
+        }
+        let path_text = path.display().to_string();
+        if on {
+            let exe = std::env::current_exe().map_err(|e| format!("定位当前程序失败：{e}"))?;
+            let plist = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>{LABEL}</string>
+    <key>ProgramArguments</key><array><string>{exe}</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+</dict></plist>
+"#
+            );
+            std::fs::write(&path, plist).map_err(|e| format!("写 LaunchAgent 失败：{e}"))?;
+            let _ = std::process::Command::new("/bin/launchctl").args(["load", &path_text]).output();
+            Ok(())
+        } else {
+            // 卸载当前会话里已加载的 Agent（未加载时报错没关系），再删 plist。
+            let _ = std::process::Command::new("/bin/launchctl").args(["unload", &path_text]).output();
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("删除 LaunchAgent 失败：{e}")),
+            }
+        }
+    }
 }
 
 /// 系统输出音量 (0..100, 是否静音)。
@@ -399,6 +453,15 @@ mod battery_tests {
         assert!(b.charging_now);
         let watts = b.watts.expect("充电中必须给出功率");
         assert!((watts - 71.9).abs() < 1.0, "6200mA×11600mV≈71.9W，实际 {watts}");
+    }
+
+    // 大部分 MacBook 固件充电时 InstantAmperage 为负（电流流入电池）：
+    // 必须按绝对值取幅值，否则充电时电量环内永远不显示功率（0.6.77 实测问题）。
+    #[test]
+    fn charging_with_negative_amperage_still_reports_watts() {
+        let b = smart_from(Some(76.0), Some(5322.0), Some(-6200.0), Some(11600.0), true, true);
+        let watts = b.watts.expect("充电中（电流为负的固件）也必须给出功率");
+        assert!((watts - 71.9).abs() < 1.0, "|-6200mA|×11600mV≈71.9W，实际 {watts}");
     }
 
     // 放电：Amperage 为负，不给功率；插电充满：IsCharging=false，不给功率但仍算接着电源。

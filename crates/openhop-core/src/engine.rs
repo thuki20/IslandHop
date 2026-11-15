@@ -2018,7 +2018,7 @@ impl Server {
                 self.drive_enter(d, side, frac);
             }
         }
-        self.send(c, Msg::DriveStart);
+        self.send(c, Msg::DriveStart { target: Some(target.clone()) });
         self.update_status();
     }
 
@@ -3083,7 +3083,7 @@ impl Client {
                 }
                 Ok(())
             }
-            Msg::DriveStart => {
+            Msg::DriveStart { target } => {
                 // This computer's keyboard and mouse now drive another screen.
                 if let Some(cap) = &self.capture {
                     if cap.grab() {
@@ -3094,6 +3094,10 @@ impl Client {
                         self.ctx.status.lock().active.clear();
                     }
                 }
+                // IslandHop：把「光标当前在」指向被驱动的屏幕——客户端（受控端）
+                // 的屏幕排列画布此前永远显示「本机」，因为跨越调度在服务端，
+                // 客户端收不到目标名。
+                self.ctx.status.lock().active = target.unwrap_or_default();
                 Ok(())
             }
             Msg::DriveStop { x, y } => {

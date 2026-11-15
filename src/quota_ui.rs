@@ -567,11 +567,15 @@ impl App {
             if candidate.selected==id{candidate.selected=candidate.accounts.iter().find(|a|a.enabled).map(|a|a.id.clone()).unwrap_or_default();}
             if let Err(error)=candidate.save_checked(){self.quota.note=error;return;}
             self.quota.config=candidate;self.quota.rows.remove(id);self.quota.stale.remove(id);self.quota.busy.remove(id);self.quota.save_snapshots();
-            self.quota.note=match if a.provider==Provider::Doubao{quota::doubao::forget(&a)}else{quota::api::cleanup_pending(&self.quota.config)}{Ok(())=>"账号已移除".into(),Err(error)=>error};return;
+            self.quota.note=match if a.provider==Provider::Doubao{quota::doubao::forget(&a)}else{quota::api::cleanup_pending(&self.quota.config)}{Ok(())=>"账号已移除".into(),Err(error)=>error};
+            crate::sync_state::request_deletion(format!("acct:{id}"));
+            return;
         }
         if let Some(a)=self.quota.config.accounts.iter().find(|a|a.id==id){match a.provider{Provider::GrokBot=>quota::grok::forget(a),Provider::Gemini=>quota::gemini::forget(a),Provider::DeepSeek=>quota::deepseek::forget(a),Provider::WorkBuddy=>quota::workbuddy::forget(a),_=>{}}}
         self.quota.config.accounts.retain(|a|a.id!=id);self.quota.config.colors.remove(id);self.quota.rows.remove(id);self.quota.stale.remove(id);self.quota.busy.remove(id);self.quota.save_snapshots();
         if self.quota.config.selected==id{self.quota.config.selected=self.quota.config.accounts.first().map(|a|a.id.clone()).unwrap_or_default();}
+        // 删除请求转发主端：主端执行后随快照镜像确认，删除永久生效不复活。
+        crate::sync_state::request_deletion(format!("acct:{id}"));
     }
     pub(crate) fn quota_settings(&mut self,ui:&mut egui::Ui){
         let before=self.quota.config.clone();

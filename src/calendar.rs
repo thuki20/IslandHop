@@ -232,7 +232,7 @@ pub fn save_config(cfg: &Config) -> Result<(), String> {
     save_configs(&accounts, cfg.provider)
 }
 
-fn save_configs(accounts: &[Config], active: Provider) -> Result<(), String> {
+pub(crate) fn save_configs(accounts: &[Config], active: Provider) -> Result<(), String> {
     let accounts: Vec<serde_json::Value> = accounts.iter()
         .map(|cfg| serde_json::from_slice(&encode_config(cfg)).expect("日历配置可以序列化")).collect();
     let data = serde_json::to_vec(&serde_json::json!({"active": active.key(), "accounts": accounts}))

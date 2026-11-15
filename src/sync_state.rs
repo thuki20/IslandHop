@@ -1,24 +1,27 @@
-//! IslandHop：两台电脑互联后，把「主设备」的岛仔业务数据同步到对端。
+//! IslandHop：两台电脑互联后，把「主端」的岛仔业务数据**单向镜像**到从端。
 //!
 //! 走 OpenHop 已建好的加密 TCP 连接（`Msg::Ext::IslandState` / `Hub::tell`），
 //! 不另起端口、不重复实现发现/配对/转发。设计口径：
 //!
+//! * **主从角色**：macOS 是唯一数据主端（`is_data_master()`），Windows 是从端。
+//!   主端只发不收；从端只收不发、对主端快照**整表替换**。这样：
+//!   - 主端的删除/编辑立即传播到从端（整表替换语义，删除自然传播，无需墓碑）；
+//!   - 从端的任何本地变动**永远不会写回主端**——彻底杜绝
+//!     「从端删掉的东西被主端并集又同步回来」的回灌问题。
 //! * **同步什么**：`settings.txt` 里与设备无关的白名单键（喝水 / 久坐 / 专注 /
 //!   天气城市 / 常用偏好 / 岛上歌词）、`todo.txt`、`water.txt` + `water-extra.txt`、
-//!   `shelf.txt`、`ai-quota.json` 的**账号元数据**、邮件账号清单
-//!   （`mail-accounts.json`，本身无密码）、日历账号配置（`calendar.json`）、
-//!   本机日程事件（`local-calendar.json`，按 uid 求并集），以及**跨机凭据克隆**
-//!   （邮箱授权码 / 日历密码 / AI 额度 API Key，经加密通道写入对端本机 keyring）。
+//!   `shelf.txt`、`ai-quota.json` 的**账号元数据**（镜像时按 id 回填本机
+//!   `source` 登录路径与 `slot` 凭据槽位）、邮件账号清单（`mail-accounts.json`，
+//!   本身无密码）、日历账号配置（`calendar.json`）、本机日程事件
+//!   （`local-calendar.json`），以及**跨机凭据克隆**（邮箱授权码 / 日历密码 /
+//!   AI 额度 API Key，经加密通道写入从端本机 keyring；主端删除的凭据
+//!   同步后从端也跟着清掉）。
 //! * **不同步什么**：`display_id` / `dock` / `island_offset` / `avoid_apps` 等
 //!   设备相关键；天气缓存（两台出口 IP 不同，各机自拉）；久坐计时与番茄钟剩余
 //!   时间（纯本地会话）；剪贴板历史（OpenHop 已有实时剪贴板同步）；以及
 //!   DPAPI / 登录文件路径绑定的凭据文件 `credentials/*.bin`（豆包等需要各自重登）。
-//! * **冲突口径**：`rev` 大者胜；`rev` 相同比 `updated_at`；仍相同则 **Mac 胜出**
-//!   （「所有数据以 mac 为主」——OpenHop 的 Role::Server 是键鼠主控端，与数据
-//!   主设备无关）。注意：**账号 / 日历 / 邮件 / 凭据是并集型数据，不参与 LWW
-//!   裁决**，任何快照都无条件求并集，否则 Mac 会把 Windows 整包拒收，
-//!   邮箱与飞书/钉钉账号永远克隆不过来。收到并应用后立刻重算本地指纹，
-//!   避免两台互推回环。
+//! * **从端只读**：账号 / 邮箱 / 日历的增删改入口在从端一律禁用
+//!   （`is_slave()`），信息完全来自主跨屏；邮件收取等本机读操作照常执行。
 //! * **落盘**：一律「先写盘、再刷新内存」。上游 `App::new()` 与跨天 `tick()` 都会
 //!   用磁盘文件覆盖内存，不落盘会在重启/跨天后回退。
 
@@ -76,6 +79,69 @@ pub struct SyncPayload {
     /// 的根因：对端根本不会发送 mail / calendar / secrets 这些字段。
     #[serde(default)]
     pub version: String,
+    /// 从端→主端的**删除请求**（键格式 `acct:<id>` / `mail:<邮箱小写>` / `cal:<平台:用户名>`）。
+    /// 主端收到后在本机执行删除，再随下一次快照镜像回所有从端——
+    /// 删除从此在两台机器上都生效且永不复活。旧端无此字段（serde default 空表）。
+    #[serde(default)]
+    pub deletions: Vec<String>,
+}
+
+/// 从端删除请求队列：(待发主端, 待确认)。从端 UI 删除账号时调用 `request_deletion`，
+/// `SyncManager::tick` 把待发键注入下一帧控制帧；主端删除完成、快照里不再出现
+/// 该条目后，待确认键才清除——期间镜像会跳过这些条目，杜绝「删了又复活」。
+fn deletion_queue() -> &'static Mutex<(Vec<String>, Vec<String>)> {
+    static QUEUE: OnceLock<Mutex<(Vec<String>, Vec<String>)>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new((Vec::new(), Vec::new())))
+}
+
+/// 从端请求删除一个账号：本地立即生效（UI 已改），删除键转发主端执行。
+pub fn request_deletion(key: String) {
+    let Ok(mut queue) = deletion_queue().lock() else { return; };
+    if !queue.0.contains(&key) { queue.0.push(key.clone()); }
+    if !queue.1.contains(&key) { queue.1.push(key); }
+}
+
+/// 仍待主端确认的删除键（镜像时跳过这些条目，不复活）。
+fn pending_deletions() -> Vec<String> {
+    deletion_queue().lock().map(|q| q.1.clone()).unwrap_or_default()
+}
+
+/// 取走待发的删除键。
+fn drain_deletion_outbox() -> Vec<String> {
+    deletion_queue().lock().map(|mut q| std::mem::take(&mut q.0)).unwrap_or_default()
+}
+
+/// 主端已执行删除（快照里不再出现）→ 从待确认列表移除，镜像恢复正常跟随。
+fn confirm_deletions(confirmed: &[String]) {
+    let Ok(mut queue) = deletion_queue().lock() else { return; };
+    queue.1.retain(|k| !confirmed.contains(k));
+}
+
+/// 主端快照里是否还有这个键（用于确认从端删除请求已被主端执行）。
+fn master_still_has(doc: &SyncPayload, key: &str) -> bool {
+    if let Some(id) = key.strip_prefix("acct:") {
+        let Some(accounts) = doc.accounts.as_deref().and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok()) else { return false; };
+        return accounts.get("accounts").and_then(|a| a.as_array()).is_some_and(|list| {
+            list.iter().any(|a| a.get("id").and_then(|v| v.as_str()) == Some(id))
+        });
+    }
+    if let Some(email) = key.strip_prefix("mail:") {
+        let Some(list) = doc.mail.as_deref().and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok()) else { return false; };
+        return list.as_array().is_some_and(|arr| arr.iter().any(|a| {
+            a.get("email").and_then(|v| v.as_str()).map(|e| e.to_ascii_lowercase())
+                == Some(email.to_ascii_lowercase())
+        }));
+    }
+    if let Some(ckey) = key.strip_prefix("cal:") {
+        let Some(cfg) = doc.calendar.as_deref().and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok()) else { return false; };
+        return cfg.get("accounts").and_then(|a| a.as_array()).is_some_and(|arr| arr.iter().any(|a| {
+            // credential_key 的口径 = 「平台:用户名小写」，外层已有 cal: 前缀。
+            format!("{}:{}",
+                a.get("provider").and_then(|v| v.as_str()).unwrap_or_default(),
+                a.get("username").and_then(|v| v.as_str()).unwrap_or_default().to_ascii_lowercase()) == ckey
+        }));
+    }
+    false
 }
 
 fn read_text(path: &Path) -> Option<String> {
@@ -117,12 +183,25 @@ fn account_metadata(path: &Path) -> Option<String> {
     .ok()
 }
 
-/// 账号求并集：对端账号补进本机清单（保留本机同名账号的 `source`），
-/// 不删本机独有账号、不覆盖任何凭据文件。
-fn merge_accounts(path: &Path, remote: Option<&str>) {
-    let Some(remote) = remote else { return; };
-    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
-    let Some(rarr) = rv.get("accounts").and_then(|a| a.as_array()) else { return; };
+/// 主端角色判定：macOS 是唯一数据主端，Windows 是从端。
+/// OpenHop 的 `Role::Server` 是键鼠主控端（=Windows），与数据主设备无关，不能沿用。
+pub fn is_data_master() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// 从端只读判定：账号 / 邮箱 / 日历的增删改入口在从端一律禁用。
+pub fn is_slave() -> bool {
+    !is_data_master()
+}
+
+/// 账号清单镜像：以主端清单为准**整表替换**（主端删除的账号随之消失），
+/// 但按 id 回填本机 `source`（登录文件路径）与既有 `slot`（凭据槽位），
+/// 保证本机已登录的账号不因镜像掉登录。`pending` 里是从端已删、主端尚未确认的
+/// `acct:<id>` 键——镜像时跳过，防止主端快照把刚删的账号送回来。返回是否写盘。
+fn mirror_accounts(path: &Path, remote: Option<&str>, pending: &[String]) -> bool {
+    let Some(remote) = remote else { return false; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return false; };
+    let Some(rarr) = rv.get("accounts").and_then(|a| a.as_array()) else { return false; };
     let mut local: serde_json::Value = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -132,9 +211,10 @@ fn merge_accounts(path: &Path, remote: Option<&str>) {
         .and_then(|a| a.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut mirrored: Vec<serde_json::Value> = Vec::new();
     for r in rarr {
         let Some(id) = r.get("id").and_then(|v| v.as_str()) else { continue; };
+        if pending.iter().any(|k| k == &format!("acct:{id}")) { continue; }
         let mut entry = existing
             .iter()
             .find(|l| l.get("id").and_then(|v| v.as_str()) == Some(id))
@@ -148,24 +228,179 @@ fn merge_accounts(path: &Path, remote: Option<&str>) {
         if entry.get("source").is_none() {
             entry["source"] = serde_json::json!("");
         }
-        merged.push(entry);
+        mirrored.push(entry);
     }
-    for l in &existing {
-        let id = l.get("id").and_then(|v| v.as_str());
-        if id.is_none() || merged.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == id) {
-            continue;
-        }
-        merged.push(l.clone());
-    }
-    local["accounts"] = serde_json::json!(merged);
+    if mirrored == existing { return false; }
+    local["accounts"] = serde_json::json!(mirrored);
     if let Some(colors) = rv.get("colors") {
         if colors.is_object() {
             local["colors"] = colors.clone();
         }
     }
     if let Ok(raw) = serde_json::to_vec_pretty(&local) {
-        let _ = model::atomic_write(path, &raw);
+        return model::atomic_write(path, &raw).is_ok();
     }
+    false
+}
+
+/// 邮件账号清单镜像：主端数组原文整表替换（含删空——「[]」是合法的镜像结果）。
+/// `pending` 里是从端已删、主端尚未确认的 `mail:<邮箱小写>` 键，镜像时跳过。
+fn mirror_mail(path: &Path, remote: Option<&str>, pending: &[String]) -> bool {
+    let Some(remote) = remote else { return false; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return false; };
+    let Some(arr) = rv.as_array() else { return false; };
+    let kept: Vec<&serde_json::Value> = arr.iter().filter(|a| {
+        let email = a.get("email").and_then(|v| v.as_str()).unwrap_or_default().to_ascii_lowercase();
+        !pending.iter().any(|k| k == &format!("mail:{email}"))
+    }).collect();
+    let local = std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or(serde_json::json!([]));
+    if local.as_array().is_some_and(|l| l.len() == kept.len()
+        && l.iter().zip(kept.iter()).all(|(a, b)| a == *b)) { return false; }
+    let payload: Vec<serde_json::Value> = kept.into_iter().cloned().collect();
+    if let Ok(raw) = serde_json::to_vec_pretty(&serde_json::json!(payload)) {
+        return model::atomic_write(path, &raw).is_ok();
+    }
+    false
+}
+
+/// 日历账号配置镜像：主端文档原文整表替换（含 `active` 指向）。
+/// `pending` 里是从端已删、主端尚未确认的 `cal:<平台:用户名>` 键，镜像时跳过。
+fn mirror_calendar(path: &Path, remote: Option<&str>, pending: &[String]) -> bool {
+    let Some(remote) = remote else { return false; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return false; };
+    if !rv.is_object() { return false; }
+    let mut doc = rv.clone();
+    if let Some(accounts) = doc.get_mut("accounts").and_then(|a| a.as_array_mut()) {
+        accounts.retain(|a| {
+            let key = format!("cal:{}:{}",
+                a.get("provider").and_then(|v|v.as_str()).unwrap_or_default(),
+                a.get("username").and_then(|v|v.as_str()).unwrap_or_default().to_ascii_lowercase());
+            !pending.iter().any(|k| k == &key)
+        });
+    }
+    // active 指向被 pending 屏蔽掉的账号时，沿用本机 active（若它仍在剩余清单里），
+    // 否则顺延到剩余第一个——等主端确认删除后的快照再最终对齐。
+    if let Some(accounts) = doc.get("accounts").and_then(|a| a.as_array()) {
+        let active = doc.get("active").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let providers: Vec<String> = accounts.iter()
+            .filter_map(|a| a.get("provider").and_then(|v| v.as_str()).map(str::to_string)).collect();
+        if !providers.is_empty() && !providers.iter().any(|p| p == &active) {
+            let local_active = local_active_provider(path);
+            if providers.iter().any(|p| p == &local_active) {
+                doc["active"] = serde_json::json!(local_active);
+            } else {
+                doc["active"] = serde_json::json!(providers[0]);
+            }
+        }
+    }
+    let local = std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or(serde_json::json!({}));
+    if local == doc { return false; }
+    if let Ok(raw) = serde_json::to_vec_pretty(&doc) {
+        return model::atomic_write(path, &raw).is_ok();
+    }
+    false
+}
+
+/// 本机日程事件镜像：主端数组原文整表替换。
+fn mirror_local_calendar(path: &Path, remote: Option<&str>) -> bool {
+    let Some(remote) = remote else { return false; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return false; };
+    let Some(arr) = rv.as_array() else { return false; };
+    let local = std::fs::read(path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or(serde_json::json!([]));
+    if local.as_array() == Some(arr) { return false; }
+    if let Ok(raw) = serde_json::to_vec_pretty(&serde_json::json!(arr)) {
+        return model::atomic_write(path, &raw).is_ok();
+    }
+    false
+}
+
+/// 本机 calendar.json 当前的活动平台（无配置时为空串）。
+fn local_active_provider(path: &Path) -> String {
+    std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v.get("active").and_then(|a| a.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// 从端凭据剪除：镜像后，主端已删除的账号凭据在本机 keyring 里也删掉。
+/// 只删「镜像前本机存在、主端快照里已不存在」的键，避免误删本机独有凭据。
+fn prune_slave_secrets(
+    pre_mail: &[crate::mail::Account],
+    pre_calendar: &[crate::calendar::Config],
+    pre_apiq_slots: &[String],
+    master_keys: &[String],
+) {
+    let has = |key: &str| master_keys.iter().any(|k| k == key);
+    // 邮箱授权码
+    for account in pre_mail {
+        let key = format!("mail:{}", account.email.to_ascii_lowercase());
+        if !has(&key) { crate::mail::secrets::delete(&account.email); }
+    }
+    // 日历密码
+    for cfg in pre_calendar {
+        let key = format!("cal:{}", crate::calendar::credential_key(cfg));
+        if !has(&key) { crate::calendar::secrets::delete(cfg); }
+    }
+    // AI 额度 API Key（走既有清理 journal，安全异步删除）
+    for slot in pre_apiq_slots {
+        if slot.is_empty() { continue; }
+        let key = format!("apiq:{slot}");
+        if !has(&key) { let _ = crate::quota::api::queue_cleanup(slot); }
+    }
+}
+
+/// 主端执行从端转发的删除请求（主端唯一接受的「收」）：键格式
+/// `acct:<id>` / `mail:<邮箱>` / `cal:<平台:用户名>`。删除发生在主端本机，
+/// 之后的快照广播会把删除镜像到所有从端。返回是否有任何变更。
+fn apply_master_deletions(deletions: &[String]) -> bool {
+    use crate::quota::Provider;
+    let mut changed = false;
+    for key in deletions {
+        if let Some(id) = key.strip_prefix("acct:") {
+            let mut cfg = crate::quota::Config::load();
+            let Some(account) = cfg.accounts.iter().find(|a| a.id == id).cloned() else { continue; };
+            // 与 quota_ui::quota_remove_account 相同的清理路径：API-Key 先排队删凭据，
+            // 登录态类（豆包/Grok/Gemini 等）走各自的 forget。
+            if account.provider.api_key() {
+                if let Some(slot) = &account.slot { let _ = crate::quota::api::queue_cleanup(slot); }
+            }
+            cfg.accounts.retain(|a| a.id != id);
+            cfg.colors.remove(id);
+            if cfg.selected == id {
+                cfg.selected = cfg.accounts.iter().find(|a| a.enabled).map(|a| a.id.clone()).unwrap_or_default();
+            }
+            if cfg.save_checked().is_err() { continue; }
+            match account.provider {
+                Provider::Doubao => { let _ = crate::quota::doubao::forget(&account); },
+                Provider::GrokBot => { let _ = crate::quota::grok::forget(&account); },
+                Provider::Gemini => { let _ = crate::quota::gemini::forget(&account); },
+                Provider::DeepSeek => { let _ = crate::quota::deepseek::forget(&account); },
+                Provider::WorkBuddy => { let _ = crate::quota::workbuddy::forget(&account); },
+                _ => {},
+            }
+            changed = true;
+        } else if let Some(email) = key.strip_prefix("mail:") {
+            let mut accounts = crate::mail::load_accounts();
+            let before = accounts.len();
+            accounts.retain(|a| !a.email.eq_ignore_ascii_case(email));
+            if accounts.len() != before {
+                crate::mail::save_accounts(&accounts);
+                crate::mail::secrets::delete(email);
+                changed = true;
+            }
+        } else if let Some(ckey) = key.strip_prefix("cal:") {
+            let mut accounts = crate::calendar::load_configs();
+            let Some(position) = accounts.iter().position(|cfg| crate::calendar::credential_key(cfg) == ckey) else { continue; };
+            let removed = accounts.remove(position);
+            // 活动账号顺延到剩余第一个；删空时保持被删账号的平台占位。
+            let active = accounts.first().map(|cfg| cfg.provider).unwrap_or(removed.provider);
+            if crate::calendar::save_configs(&accounts, active).is_ok() {
+                crate::calendar::secrets::delete(&removed);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// 生成本机快照（不含 rev / device，便于两端比较「数据是否一致」）。
@@ -183,6 +418,8 @@ pub fn snapshot() -> String {
         local_calendar: read_text(&dir.join("local-calendar.json")),
         secrets: collect_secrets(),
         version: env!("CARGO_PKG_VERSION").into(),
+        // 快照不带删除请求：删除键只出现在从端的控制帧里。
+        deletions: Vec::new(),
     };
     serde_json::to_string(&payload).unwrap_or_default()
 }
@@ -271,143 +508,76 @@ fn union_fingerprint(dir: &Path) -> String {
         .join("\u{1}")
 }
 
-/// 应用对端快照：先落盘、再刷新内存。`today` 来自 `Env`，保证当日饮水不跨天重置。
-///
-/// `overwrite=true` 表示 LWW 裁决本机落败，覆盖型数据（设置 / 待办 / 饮水 / 便签）
-/// 整表接收；`overwrite=false` 时**只做账号类求并集**。
-///
-/// 账号 / 日历 / 邮件 / 凭据属于「并集型」数据，不受「Mac 为主」的 LWW 裁决影响：
-/// 否则两端 rev 相同时 Mac 会把整个 Windows 快照拒收，Windows 上的邮箱、
-/// 飞书 / 钉钉日历、AI 额度账号与授权码就永远克隆不过来。
-pub fn apply(app: &mut App, payload: &str, today: &str, now: f64, overwrite: bool) -> bool {
+/// 从端应用主端快照：**整表镜像**，先落盘、再刷新内存。`today` 来自 `Env`，
+/// 保证当日饮水不跨天重置。主端的删除/编辑随整表替换自然传播；
+/// 凭据随之克隆与剪除（主端删掉的凭据本机也清掉）。
+pub fn apply_mirror(app: &mut App, payload: &str, today: &str, now: f64) -> bool {
     let Ok(doc) = serde_json::from_str::<SyncPayload>(payload) else { return false; };
     let empty = doc.settings.is_empty() && doc.todo.is_none() && doc.water.is_none()
         && doc.water_extra.is_none() && doc.shelf.is_none() && doc.accounts.is_none()
         && doc.mail.is_none() && doc.calendar.is_none() && doc.local_calendar.is_none()
         && doc.secrets.is_empty();
-    if empty { return false; } // 空快照不覆盖本机数据
+    if empty { return false; } // 空快照（旧客户端占位帧）不覆盖本机数据
     let dir: PathBuf = model::config_dir();
     let _ = std::fs::create_dir_all(&dir);
 
-    if overwrite {
-        // settings.txt：白名单键合并，保留本机 display_id / dock / 路径等键。
-        let settings_path = dir.join("settings.txt");
-        let mut kv: Vec<(String, String)> = Vec::new();
-        if let Ok(text) = std::fs::read_to_string(&settings_path) {
-            for line in text.trim_start_matches('\u{feff}').lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    kv.push((k.trim().to_owned(), v.trim().to_owned()));
-                }
+    // 镜像前的本机账号清单：凭据剪除只针对「镜像前存在、主端已删除」的键。
+    let pre_mail = crate::mail::load_accounts();
+    let pre_calendar = crate::calendar::load_configs();
+    let pre_apiq_slots: Vec<String> = crate::quota::Config::load()
+        .accounts.iter().filter(|a| a.provider.api_key())
+        .filter_map(|a| a.slot.clone()).collect();
+
+    // settings.txt：白名单键合并，保留本机 display_id / dock / 路径等键。
+    let settings_path = dir.join("settings.txt");
+    let mut kv: Vec<(String, String)> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&settings_path) {
+        for line in text.trim_start_matches('\u{feff}').lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                kv.push((k.trim().to_owned(), v.trim().to_owned()));
             }
         }
-        for (k, v) in &doc.settings {
-            if !SYNC_SETTING_KEYS.contains(&k.as_str()) { continue; }
-            kv.retain(|(existing, _)| existing != k);
-            kv.push((k.clone(), v.clone()));
-        }
-        let body: String = kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-        if model::atomic_write(&settings_path, body.as_bytes()).is_err() { return false; }
-
-        let write = |name: &str, value: Option<&String>| {
-            if let Some(text) = value { let _ = model::atomic_write(&dir.join(name), text.as_bytes()); }
-        };
-        write("todo.txt", doc.todo.as_ref());
-        write("water.txt", doc.water.as_ref());
-        write("water-extra.txt", doc.water_extra.as_ref());
-        write("shelf.txt", doc.shelf.as_ref());
     }
+    for (k, v) in &doc.settings {
+        if !SYNC_SETTING_KEYS.contains(&k.as_str()) { continue; }
+        kv.retain(|(existing, _)| existing != k);
+        kv.push((k.clone(), v.clone()));
+    }
+    let body: String = kv.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    if model::atomic_write(&settings_path, body.as_bytes()).is_err() { return false; }
 
-    // 账号类无条件求并集（幂等：内容没变就不写盘）。
+    let write = |name: &str, value: Option<&String>| {
+        if let Some(text) = value { let _ = model::atomic_write(&dir.join(name), text.as_bytes()); }
+    };
+    write("todo.txt", doc.todo.as_ref());
+    write("water.txt", doc.water.as_ref());
+    write("water-extra.txt", doc.water_extra.as_ref());
+    write("shelf.txt", doc.shelf.as_ref());
+
+    // 账号类整表镜像（幂等：内容没变不写盘）。pending = 从端已删、主端尚未
+    // 执行的删除键：镜像时跳过这些条目，主端确认执行后（快照不再出现）自动恢复跟随。
+    let pending = pending_deletions();
     let before = union_fingerprint(&dir);
-    merge_accounts(&dir.join("ai-quota.json"), doc.accounts.as_deref());
-    merge_mail(&dir.join("mail-accounts.json"), doc.mail.as_deref());
-    merge_calendar(&dir.join("calendar.json"), doc.calendar.as_deref());
-    merge_local_calendar(&dir.join("local-calendar.json"), doc.local_calendar.as_deref());
-    let secrets = apply_secrets(&doc.secrets);
-    let union_changed = secrets > 0 || union_fingerprint(&dir) != before;
-    if secrets > 0 { set_status(format!("已从对端克隆 {secrets} 个账号凭据")); }
+    let mirrored = mirror_accounts(&dir.join("ai-quota.json"), doc.accounts.as_deref(), &pending)
+        | mirror_mail(&dir.join("mail-accounts.json"), doc.mail.as_deref(), &pending)
+        | mirror_calendar(&dir.join("calendar.json"), doc.calendar.as_deref(), &pending)
+        | mirror_local_calendar(&dir.join("local-calendar.json"), doc.local_calendar.as_deref());
+    // 待删除条目的凭据不克隆（等主端执行删除后自然消失）。
+    let master_secrets: Vec<(String, String)> = doc.secrets.iter()
+        .filter(|(k, _)| !pending.contains(k)).cloned().collect();
+    let secrets = apply_secrets(&master_secrets);
+    // 主端删掉的账号凭据：本机 keyring 同步剪除。
+    let master_keys: Vec<String> = doc.secrets.iter().map(|(k, _)| k.clone()).collect();
+    prune_slave_secrets(&pre_mail, &pre_calendar, &pre_apiq_slots, &master_keys);
+    if secrets > 0 { set_status(format!("已从主端克隆 {secrets} 个账号凭据")); }
+    // 主端已执行删除 → 从待确认列表移除。
+    let confirmed: Vec<String> = pending.iter().filter(|k| !master_still_has(&doc, k)).cloned().collect();
+    confirm_deletions(&confirmed);
 
     // 只在确实有变化时刷新内存，避免 15 秒心跳反复重载打断编辑。
-    if overwrite || union_changed { app.apply_synced_state(today, now); }
-    overwrite || union_changed
-}
-
-/// 邮件账号求并集（按 email 去重）：对端账号补进本机清单，本机同名账号保留。
-/// 清单本身不含密码（密码在 keyring，走 `secrets` 通道）。
-fn merge_mail(path: &Path, remote: Option<&str>) {
-    let Some(remote) = remote else { return; };
-    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
-    let Some(rarr) = rv.as_array() else { return; };
-    let key = |a: &serde_json::Value| a.get("email").and_then(|v| v.as_str()).map(str::to_ascii_lowercase);
-    let local: Vec<serde_json::Value> = std::fs::read(path).ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_else(|| serde_json::json!([]))
-        .as_array().cloned().unwrap_or_default();
-    let mut merged = local.clone();
-    for r in rarr {
-        let Some(rkey) = key(r) else { continue };
-        if merged.iter().any(|l| key(l).as_deref() == Some(rkey.as_str())) { continue; }
-        merged.push(r.clone());
-    }
-    if merged.len() != local.len() {
-        if let Ok(raw) = serde_json::to_vec_pretty(&merged) {
-            let _ = model::atomic_write(path, &raw);
-        }
-    }
-}
-
-/// 日历账号求并集（按「平台:用户名」去重）：单账号对象与多账号数组两种格式都兼容。
-fn merge_calendar(path: &Path, remote: Option<&str>) {
-    let Some(remote) = remote else { return; };
-    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
-    let key = |a: &serde_json::Value| format!("{}:{}", 
-        a.get("provider").and_then(|v|v.as_str()).unwrap_or_default(),
-        a.get("username").and_then(|v|v.as_str()).unwrap_or_default().to_ascii_lowercase());
-    let accounts_of = |v: &serde_json::Value| -> Vec<serde_json::Value> {
-        if let Some(list)=v.get("accounts").and_then(|a|a.as_array()) { list.clone() }
-        else if v.get("username").is_some() { vec![v.clone()] } else { vec![] }
-    };
-    let remote_accounts = accounts_of(&rv);
-    if remote_accounts.is_empty() { return; }
-    let local: serde_json::Value = std::fs::read(path).ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let mut local_accounts = accounts_of(&local);
-    let mut merged = local_accounts.clone();
-    for r in &remote_accounts {
-        let rkey = key(r);
-        if rkey.is_empty() || merged.iter().any(|l|key(l)==rkey) { continue; }
-        merged.push(r.clone());
-    }
-    if merged.len() == local_accounts.len() { return; }
-    let mut doc=local.clone();
-    doc["accounts"]=serde_json::json!(merged);
-    // 活动账号指向新补进的账号，让对端账号在克隆后立即生效。
-    if let Some(active)=merged.last() {
-        if let Some(k)=active.get("provider").and_then(|v|v.as_str()) { doc["active"]=serde_json::json!(k); }
-    }
-    if let Ok(raw)=serde_json::to_vec_pretty(&doc) { let _ = model::atomic_write(path, &raw); }
-}
-
-/// 本机日程事件按 uid 求并集：两台机器都能添加，互补不覆盖。
-fn merge_local_calendar(path: &Path, remote: Option<&str>) {
-    let Some(remote) = remote else { return; };
-    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
-    let Some(rarr) = rv.as_array() else { return; };
-    let uid = |a: &serde_json::Value| a.get("uid").and_then(|v|v.as_str()).map(str::to_owned);
-    let mut local: Vec<serde_json::Value> = std::fs::read(path).ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_else(|| serde_json::json!([]))
-        .as_array().cloned().unwrap_or_default();
-    let mut added = 0;
-    for r in rarr {
-        let Some(ruid) = uid(r) else { continue };
-        if local.iter().any(|l|uid(l).as_deref()==Some(ruid.as_str())) { continue; }
-        local.push(r.clone());added+=1;
-    }
-    if added>0 {
-        if let Ok(raw)=serde_json::to_vec_pretty(&local) { let _ = model::atomic_write(path, &raw); }
-    }
+    let changed = mirrored || secrets > 0 || union_fingerprint(&dir) != before;
+    if changed { app.apply_synced_state(today, now); }
+    changed
 }
 
 impl App {
@@ -500,11 +670,11 @@ impl SyncManager {
 
         let (peers, _is_server) = crate::cross_screen::sync_link();
         let connected = peers > 0;
+        let master = is_data_master();
 
-        // ---- 收：LWW 裁决 ----
-        // 冲突口径：rev 大者胜；rev 相同比 updated_at；完全相同则 **Mac 胜出**
-        // （用户拍板「所有数据以 mac 为主」；OpenHop 的 Role::Server 是键鼠
-        // 主控端=Windows，与数据主设备无关，不能沿用）。
+        // ---- 收：主端只发不收（唯一例外=从端的删除请求）；从端无条件整表镜像 ----
+        // 主端忽略一切业务数据：Windows 从端的数据永远不写回 Mac，
+        // 从源头上杜绝「从端删掉的东西被主端并集又同步回来」的回灌。
         let mut applied = 0usize;
         for msg in crate::cross_screen::sync_inbox() {
             if msg.device == self.device { continue; }
@@ -513,48 +683,69 @@ impl SyncManager {
             if let Ok(doc) = serde_json::from_str::<SyncPayload>(&msg.payload) {
                 self.peer_version = if doc.version.is_empty() { "旧版（未上报版本）".into() } else { doc.version };
             }
-            if msg.payload == self.last && msg.rev == self.rev { continue; }
-            let accept = msg.rev > self.rev
-                || (msg.rev == self.rev && msg.updated_at > self.updated_at)
-                || (msg.rev == self.rev && msg.updated_at == self.updated_at && !cfg!(target_os = "macos"));
-            // accept=false 也要跑一遍：账号/日历/邮件/凭据无条件求并集，
-            // 否则「Mac 为主」会把 Windows 的整包拒掉，账号永远克隆不过来。
-            if apply(app, &msg.payload, today, now, accept) {
-                if accept {
-                    self.rev = msg.rev;
-                    self.updated_at = msg.updated_at;
+            if master {
+                // 主端唯一的「收」：从端的删除请求。在本机执行后随下一次快照广播镜像回去。
+                if let Ok(doc) = serde_json::from_str::<SyncPayload>(&msg.payload) {
+                    if !doc.deletions.is_empty() && apply_master_deletions(&doc.deletions) {
+                        // 不更新 self.last：发送分支的指纹比对会发现数据变了，自动广播新快照。
+                    }
                 }
-                // 关键：重算本地指纹，否则会把刚收到的数据原样回推造成无限互推。
+                continue;
+            }
+            // 从端：镜像幂等——与上次应用的内容相同就跳过。
+            if msg.payload == self.last { continue; }
+            if apply_mirror(app, &msg.payload, today, now) {
+                self.rev = msg.rev;
+                self.updated_at = msg.updated_at;
+                // 关键：重算本地指纹，否则会把刚收到的数据当作本地变更再广播造成回环。
                 self.last = snapshot();
                 applied += 1;
             }
         }
 
-        // ---- 发：本地变更 / 新连接 / 15 秒心跳 ----
-        let current = snapshot();
-        let changed = current != self.last;
-        let joined = connected && self.last_peers == 0;
-        let heartbeat = connected && self.last_push.elapsed() >= Duration::from_secs(15);
-        if connected && (changed || joined || heartbeat) {
-            if changed || joined {
+        // ---- 发：主端广播快照（本地变更 / 新连接 / 15 秒心跳）；从端只发删除请求控制帧 ----
+        if connected && master {
+            let current = snapshot();
+            let changed = current != self.last;
+            let joined = self.last_peers == 0;
+            let heartbeat = self.last_push.elapsed() >= Duration::from_secs(15);
+            if changed || joined || heartbeat {
+                if changed || joined {
+                    self.rev = self.rev.saturating_add(1);
+                    self.updated_at = now_millis();
+                }
+                if crate::cross_screen::sync_broadcast(self.rev, self.updated_at, current.clone()) {
+                    self.last = current;
+                    self.last_push = Instant::now();
+                }
+            }
+        } else if connected {
+            // 从端的反向控制面：只有删除请求键，不带任何业务数据。
+            let outbox = drain_deletion_outbox();
+            if !outbox.is_empty() {
+                let mut frame = snapshot();
+                if let Ok(mut doc) = serde_json::from_str::<SyncPayload>(&frame) {
+                    doc.deletions = outbox;
+                    if let Ok(text) = serde_json::to_string(&doc) { frame = text; }
+                }
                 self.rev = self.rev.saturating_add(1);
                 self.updated_at = now_millis();
-            }
-            if crate::cross_screen::sync_broadcast(self.rev, self.updated_at, current.clone()) {
-                self.last = current;
-                self.last_push = Instant::now();
+                crate::cross_screen::sync_broadcast(self.rev, self.updated_at, frame);
             }
         }
         self.last_peers = peers;
 
         let peer = if self.peer_version.is_empty() { "等待对端数据".to_string() }
             else { format!("对端 {}", self.peer_version) };
+        let role = if master { "主端（数据以本机为准）" } else { "从端（镜像主端数据）" };
         set_status(if !connected {
-            "未连接对端 · 本地数据保持独立".into()
+            format!("未连接对端 · 本地数据保持独立 · {role}")
         } else if applied > 0 {
-            format!("已从对端同步 · rev {} · {} · {}", self.rev, describe(&self.last), peer)
+            format!("{role} · 已应用主端快照 rev {} · {} · {}", self.rev, describe(&self.last), peer)
+        } else if master {
+            format!("主端 · 已连接 {} 台 · 数据一致 · rev {} · {} · {}", peers, self.rev, describe(&self.last), peer)
         } else {
-            format!("已连接 {} 台 · 数据一致 · rev {} · {} · {}", peers, self.rev, describe(&self.last), peer)
+            format!("从端 · 已连接 {} 台 · 镜像一致 · {} · {}", peers, describe(&self.last), peer)
         });
     }
 }
@@ -588,43 +779,95 @@ mod merge_tests {
     }
 
     #[test]
-    fn mail_merge_unions_accounts_by_email_and_keeps_local(){
+    fn mail_mirror_replaces_whole_table_and_propagates_deletion(){
         let dir=tmpdir("mail");
         let path=dir.join("mail-accounts.json");
-        std::fs::write(&path,br#"[{"email":"Me@QQ.com","provider":"qq","enabled":true}]"#).unwrap();
-        merge_mail(&path,Some(r#"[{"email":"me@qq.com","provider":"qq","enabled":false},{"email":"work@163.com","provider":"163","enabled":true}]"#));
-        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let list=merged.as_array().unwrap();
-        assert_eq!(list.len(),2,"同名邮箱（大小写不敏感）保留本机，新增对端独有账号");
-        assert_eq!(list[0]["enabled"],serde_json::json!(true),"本机同名账号的开关不能被对端覆盖");
-        assert_eq!(list[1]["email"],serde_json::json!("work@163.com"));
+        std::fs::write(&path,br#"[{"email":"Me@QQ.com","provider":"qq","enabled":true},{"email":"old@163.com","provider":"163","enabled":true}]"#).unwrap();
+        // 主端只剩一个账号（old@163.com 已在主端删除）→ 镜像后从端也只剩一个。
+        assert!(mirror_mail(&path,Some(r#"[{"email":"me@qq.com","provider":"qq","enabled":false}]"#),&[]));
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let list=mirrored.as_array().unwrap();
+        assert_eq!(list.len(),1,"主端删除的账号随整表替换消失，不再回灌");
+        assert_eq!(list[0]["email"],serde_json::json!("me@qq.com"));
+        // 再推相同内容：幂等，不写盘。
+        assert!(!mirror_mail(&path,Some(r#"[{"email":"me@qq.com","provider":"qq","enabled":false}]"#),&[]));
+        // 主端删空：镜像为空数组，这是合法结果。
+        assert!(mirror_mail(&path,Some("[]"),&[]));
+        let emptied:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(emptied.as_array().unwrap().len(),0,"主端删空的清单必须传播到从端");
         let _=std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn calendar_merge_unions_accounts_and_activates_the_newest(){
+    fn mail_mirror_skips_pending_deletions_until_master_confirms(){
+        let dir=tmpdir("mailp");
+        let path=dir.join("mail-accounts.json");
+        // 从端已删 keep@p.com（本地文件里已没有），pending 里还挂着删除键；
+        // 主端快照仍带着该账号（还没执行删除）→ 镜像不能把它送回来（返回值不重要）。
+        std::fs::write(&path,br#"[{"email":"other@p.com","provider":"qq","enabled":true}]"#).unwrap();
+        let _=mirror_mail(&path,Some(r#"[{"email":"keep@p.com","provider":"qq","enabled":true},{"email":"other@p.com","provider":"qq","enabled":true}]"#),&["mail:keep@p.com".to_string()]);
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(mirrored.as_array().unwrap().len(),1,"pending 删除键在主端确认前必须屏蔽对应条目");
+        assert_eq!(mirrored.as_array().unwrap()[0]["email"],serde_json::json!("other@p.com"));
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn master_still_has_checks_all_key_kinds(){
+        let doc=SyncPayload{
+            accounts:Some(r#"{"accounts":[{"id":"a1"}]}"#.into()),
+            mail:Some(r#"[{"email":"A@B.com"}]"#.into()),
+            calendar:Some(r#"{"accounts":[{"provider":"feishu","username":"Bob"}],"active":"feishu"}"#.into()),
+            ..Default::default()
+        };
+        assert!(master_still_has(&doc,"acct:a1"));
+        assert!(!master_still_has(&doc,"acct:a2"));
+        assert!(master_still_has(&doc,"mail:a@b.com"),"邮箱键大小写不敏感");
+        assert!(!master_still_has(&doc,"mail:other@b.com"));
+        assert!(master_still_has(&doc,"cal:feishu:bob"),"日历键按「平台:用户名小写」匹配");
+        assert!(!master_still_has(&doc,"cal:feishu:alice"));
+    }
+
+    #[test]
+    fn accounts_mirror_keeps_local_source_and_slot(){
+        let dir=tmpdir("acct");
+        let path=dir.join("ai-quota.json");
+        std::fs::write(&path,r#"{"accounts":[{"id":"a1","provider":"api","alias":"本机已登录","source":"C:/login/a1.json","slot":"ab12","enabled":true,"pinned":false}],"colors":{}}"#.as_bytes()).unwrap();
+        // 主端改了别名、删掉了另一账号、新增一个：source/slot 按 id 回填，删除传播。
+        assert!(mirror_accounts(&path,Some(r#"{"accounts":[{"id":"a1","provider":"api","alias":"主端新别名","slot":"ab12","enabled":true,"pinned":true},{"id":"a2","provider":"api","alias":"新账号","slot":"cd34","enabled":true,"pinned":false}],"colors":{}}"#),&[]));
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let list=mirrored["accounts"].as_array().unwrap();
+        assert_eq!(list.len(),2);
+        assert_eq!(list[0]["alias"],serde_json::json!("主端新别名"),"别名等展示字段跟随主端");
+        assert_eq!(list[0]["source"],serde_json::json!("C:/login/a1.json"),"本机登录路径按 id 回填，镜像不掉登录");
+        assert_eq!(list[0]["slot"],serde_json::json!("ab12"),"凭据槽位回填，克隆来的 API Key 才能读得到");
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_mirror_replaces_config_and_active(){
         let dir=tmpdir("cal");
         let path=dir.join("calendar.json");
         std::fs::write(&path,br#"{"accounts":[{"provider":"feishu","username":"a"}],"active":"feishu"}"#).unwrap();
-        merge_calendar(&path,Some(r#"{"accounts":[{"provider":"apple","username":"b"}],"active":"apple"}"#));
-        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(merged["accounts"].as_array().unwrap().len(),2);
-        assert_eq!(merged["active"],serde_json::json!("apple"),"克隆后活动账号指向新补进的账号");
-        // 再推一次相同内容：幂等，不产生重复。
-        merge_calendar(&path,Some(r#"{"accounts":[{"provider":"apple","username":"b"}],"active":"apple"}"#));
-        let again:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(again["accounts"].as_array().unwrap().len(),2);
+        assert!(mirror_calendar(&path,Some(r#"{"accounts":[{"provider":"apple","username":"b"}],"active":"apple"}"#),&[]));
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(mirrored["accounts"].as_array().unwrap().len(),1);
+        assert_eq!(mirrored["active"],serde_json::json!("apple"),"整表替换连 active 一起跟随主端");
+        // pending 删除键屏蔽对应账号：主端还没删，从端不复活。
+        assert!(!mirror_calendar(&path,Some(r#"{"accounts":[{"provider":"feishu","username":"a"},{"provider":"apple","username":"b"}],"active":"feishu"}"#),&["cal:feishu:a".to_string()]));
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(mirrored["accounts"].as_array().unwrap().len(),1);
         let _=std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn local_calendar_merge_unions_by_uid(){
+    fn local_calendar_mirror_replaces_events(){
         let dir=tmpdir("local");
         let path=dir.join("local-calendar.json");
         std::fs::write(&path,br#"[{"uid":"u1","title":"a","start":100,"end":200,"all_day":false,"reminder":15}]"#).unwrap();
-        merge_local_calendar(&path,Some(r#"[{"uid":"u1","title":"a","start":100,"end":200,"all_day":false,"reminder":15},{"uid":"u2","title":"b","start":300,"end":400,"all_day":false,"reminder":null}]"#));
-        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(merged.as_array().unwrap().len(),2,"按 uid 求并集，两端添加的事件互补");
+        assert!(mirror_local_calendar(&path,Some(r#"[{"uid":"u1","title":"a","start":100,"end":200,"all_day":false,"reminder":15},{"uid":"u2","title":"b","start":300,"end":400,"all_day":false,"reminder":null}]"#)));
+        let mirrored:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(mirrored.as_array().unwrap().len(),2,"主端事件整表镜像到从端");
         let _=std::fs::remove_dir_all(&dir);
     }
 
@@ -658,8 +901,16 @@ mod merge_tests {
     fn union_fingerprint_detects_cloned_accounts(){
         let dir=tmpdir("fp");
         let before=union_fingerprint(&dir);
-        merge_mail(&dir.join("mail-accounts.json"),Some(r#"[{"email":"a@b.com","provider":"qq","enabled":true}]"#));
+        mirror_mail(&dir.join("mail-accounts.json"),Some(r#"[{"email":"a@b.com","provider":"qq","enabled":true}]"#),&[]);
         assert_ne!(union_fingerprint(&dir),before,"账号新增后指纹必须变化，才会刷新内存");
         let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn data_master_is_macos_only(){
+        // 主从角色口径：macOS 是唯一数据主端；本测试在两端编译运行，
+        // 双向锚定 is_data_master 的平台语义，防止日后被误改。
+        assert_eq!(is_data_master(), cfg!(target_os = "macos"));
+        assert_eq!(is_slave(), cfg!(not(target_os = "macos")));
     }
 }
