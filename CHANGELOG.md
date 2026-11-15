@@ -1,5 +1,10 @@
 # 更新记录
 
+## v0.6.70
+
+- 修复 macOS 上「运行中应用的 Dock 图标显示成黑底白 e」的问题：macOS（15.8 实测）对运行中的进程解析不出 bundle 图标，只有退出后钉选槽位才恢复正确。现在启动时由应用主动声明系统图标（内嵌与 .app 包同一份 AppIcon），Dock / 程序切换器与 Finder 显示一致，无需重启 Dock。
+- 顺带清理了本机 LaunchServices 里 40 多条同 bundle id 的僵尸注册（废纸篓/下载目录/ArcZip 挂载缓存里的旧副本），避免图标与「打开方式」串味。
+
 ## v0.6.69
 
 - 新增云端构建：GitHub Actions 在 Apple Silicon runner 上编译、用 OpenHopSign 签名、打包并发布，Windows 上改完代码 push 即可出包，不再需要在 Mac 上手动打包安装。

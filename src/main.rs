@@ -1082,10 +1082,17 @@ fn run() -> eframe::Result<()> {
         .with_taskbar(false)
         .with_always_on_top()
         .with_visible(false);
-    // macOS：eframe 的 with_icon() 会在启动时调用 NSApp.setApplicationIconImage，
-    // 把 Dock / 程序坞 / 切换器里的图标换成内嵌的岛仔 logo，而 Finder 里显示的是
-    // .app bundle 的 AppIcon.icns —— 表现就是「一打开软件图标就变」。
-    // .app 包已带图标，macOS 分支不再替换 Dock 图标；Windows 仍需要任务栏图标。
+    // macOS：运行中的 Dock 图标必须由进程自己声明。实测（macOS 15.8）LaunchServices
+    // 对该进程解析不出 bundle 图标（Dock 显示黑底白 e 的系统占位块），只有退出后
+    // 钉选槽位才恢复 AppIcon。因此 macOS 也要 with_icon——内嵌与 .app 包同一份
+    // AppIcon（512px），eframe 会调 NSApp.setApplicationIconImage，Dock/切换器与
+    // Finder 显示一致；Windows 仍用 daozai 内嵌图标（任务栏需要）。
+    #[cfg(target_os = "macos")]
+    if let Ok(icon) = image::load_from_memory(include_bytes!("../packaging/assets/AppIcon-512.png")) {
+        let rgba = icon.to_rgba8();
+        let (width, height) = (rgba.width(), rgba.height());
+        viewport = viewport.with_icon(eframe::egui::IconData { width, height, rgba: rgba.into_raw() });
+    }
     #[cfg(not(target_os = "macos"))]
     { viewport = viewport.with_icon(daozai::theme::app_icon()); }
     let opts = eframe::NativeOptions { viewport, vsync: !cfg!(windows), ..Default::default() };
