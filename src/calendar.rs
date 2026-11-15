@@ -281,6 +281,12 @@ pub fn forget_config() -> Result<(), String> {
 
 // ---------------------------------------------------------------- 凭据
 
+/// 日历凭据在 keyring 里的键位（「平台:用户名」小写）。
+/// `secrets` 与跨机凭据克隆（sync_state）共用同一格式。
+pub fn credential_key(cfg: &Config) -> String {
+    format!("{}:{}", cfg.provider.key(), cfg.username.trim().to_ascii_lowercase())
+}
+
 #[cfg(windows)]
 pub mod secrets {
     /// 凭据只进 Windows 凭据管理器；键是「平台:用户名」，值是密码。
@@ -302,9 +308,7 @@ pub mod secrets {
         }
     }
 
-    fn name(cfg: &super::Config) -> String {
-        format!("{}:{}", cfg.provider.key(), cfg.username.trim().to_ascii_lowercase())
-    }
+    fn name(cfg: &super::Config) -> String { super::credential_key(cfg) }
 }
 
 #[cfg(not(windows))]
@@ -329,9 +333,7 @@ pub mod secrets {
         }
     }
 
-    fn name(cfg: &super::Config) -> String {
-        format!("{}:{}", cfg.provider.key(), cfg.username.trim().to_ascii_lowercase())
-    }
+    fn name(cfg: &super::Config) -> String { super::credential_key(cfg) }
 }
 
 // ---------------------------------------------------------------- 粘贴拆分

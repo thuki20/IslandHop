@@ -4,20 +4,20 @@
 //! 不另起端口、不重复实现发现/配对/转发。设计口径：
 //!
 //! * **同步什么**：`settings.txt` 里与设备无关的白名单键（喝水 / 久坐 / 专注 /
-//!   天气城市 / 常用偏好）、`todo.txt`、`water.txt` + `water-extra.txt`、
-//!   `shelf.txt`，以及 `ai-quota.json` 的**账号元数据**。
+//!   天气城市 / 常用偏好 / 岛上歌词）、`todo.txt`、`water.txt` + `water-extra.txt`、
+//!   `shelf.txt`、`ai-quota.json` 的**账号元数据**、邮件账号清单
+//!   （`mail-accounts.json`，本身无密码）、日历账号配置（`calendar.json`）、
+//!   本机日程事件（`local-calendar.json`，按 uid 求并集），以及**跨机凭据克隆**
+//!   （邮箱授权码 / 日历密码 / AI 额度 API Key，经加密通道写入对端本机 keyring）。
 //! * **不同步什么**：`display_id` / `dock` / `island_offset` / `avoid_apps` 等
 //!   设备相关键；天气缓存（两台出口 IP 不同，各机自拉）；久坐计时与番茄钟剩余
-//!   时间（纯本地会话）；剪贴板历史（OpenHop 已有实时剪贴板同步）；以及所有
-//!   凭据文件 `credentials/*.bin`、邮件账号密码、Keychain / DPAPI 绑定的 token。
-//! * **冲突口径**：`rev` 大者胜；`rev` 相同比 `updated_at`；仍相同则 OpenHop 的
-//!   `Role::Server`（主设备）胜出。收到并应用后立刻重算本地指纹，避免两台互推回环。
+//!   时间（纯本地会话）；剪贴板历史（OpenHop 已有实时剪贴板同步）；以及
+//!   DPAPI / 登录文件路径绑定的凭据文件 `credentials/*.bin`（豆包等需要各自重登）。
+//! * **冲突口径**：`rev` 大者胜；`rev` 相同比 `updated_at`；仍相同则 **Mac 胜出**
+//!   （「所有数据以 mac 为主」——OpenHop 的 Role::Server 是键鼠主控端，与数据
+//!   主设备无关）。收到并应用后立刻重算本地指纹，避免两台互推回环。
 //! * **落盘**：一律「先写盘、再刷新内存」。上游 `App::new()` 与跨天 `tick()` 都会
 //!   用磁盘文件覆盖内存，不落盘会在重启/跨天后回退。
-//!
-//! 账号只同步**清单元数据**（id/provider/alias/slot/enabled/pinned），`source`
-//! 登录文件路径与凭据留在本机；对端新增的账号会以 `source=""` 建立在清单里，
-//! 需要各自登录一次才能读数。这不是遗漏，是跨机凭据无法通用。
 
 use crate::app::App;
 use crate::model;
@@ -38,6 +38,8 @@ const SYNC_SETTING_KEYS: &[&str] = &[
     "clock_12h", "clock_period", "show_battery", "pet", "minimal",
     "skin", "island_shape", "settings_theme", "visible_pages", "page_order",
     "resident_order", "notifications", "sound", "lyrics_enabled", "system_hud",
+    // 岛上歌词（桌面歌词）：开关与时间偏移、通知预览
+    "island_lyrics", "lyric_delay_ms", "notification_preview",
 ];
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -50,6 +52,16 @@ pub struct SyncPayload {
     pub shelf: Option<String>,
     /// 账号清单元数据 JSON（不含本机登录文件路径与凭据）
     pub accounts: Option<String>,
+    /// 邮件账号清单（mail-accounts.json 原文；文件里没有密码字段，密码走 `secrets`）
+    pub mail: Option<String>,
+    /// 日历账号配置（calendar.json 原文；密码走 `secrets`）
+    pub calendar: Option<String>,
+    /// 本机日程事件（local-calendar.json 原文，按 uid 求并集）
+    pub local_calendar: Option<String>,
+    /// 跨机克隆的凭据：键带服务前缀（mail:邮箱 / cal:平台:用户名 / apiq:槽位），
+    /// 值是明文密码 / 授权码 / API Key。只走 OpenHop 的加密 TCP 通道，
+    /// 不落任何明文文件；两端都用本机 keyring 存储。
+    pub secrets: Vec<(String, String)>,
 }
 
 fn read_text(path: &Path) -> Option<String> {
@@ -152,8 +164,85 @@ pub fn snapshot() -> String {
         water_extra: read_text(&dir.join("water-extra.txt")),
         shelf: read_text(&dir.join("shelf.txt")),
         accounts: account_metadata(&dir.join("ai-quota.json")),
+        mail: read_text(&dir.join("mail-accounts.json")),
+        calendar: read_text(&dir.join("calendar.json")),
+        local_calendar: read_text(&dir.join("local-calendar.json")),
+        secrets: collect_secrets(),
     };
     serde_json::to_string(&payload).unwrap_or_default()
+}
+
+/// 凭据缓存：键 = 账号清单指纹，值 = 已收集的凭据。
+fn secret_cache() -> &'static Mutex<(String, Vec<(String, String)>)> {
+    static CACHE: OnceLock<Mutex<(String, Vec<(String, String)>)>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new((String::new(), Vec::new())))
+}
+
+/// 收集跨机可克隆的凭据（邮箱授权码 / 日历密码 / AI 额度 API Key）。
+/// keyring 读取有成本（macOS 还可能弹授权），按账号清单指纹缓存，清单不变就复用。
+fn collect_secrets() -> Vec<(String, String)> {
+    let mail = read_text(&model::config_dir().join("mail-accounts.json")).unwrap_or_default();
+    let calendar = read_text(&model::config_dir().join("calendar.json")).unwrap_or_default();
+    let quota = crate::quota::Config::load();
+    // 指纹只含账号身份（不含内容），清单稳定时不在每次快照都读 keyring。
+    let fingerprint = format!("{}|{}|{}",
+        mail.split('"').filter(|s|s.contains('@')).collect::<Vec<_>>().join(","),
+        calendar.len(),
+        quota.accounts.iter().filter(|a|a.provider.api_key()).map(|a|a.slot.clone().unwrap_or_default()).collect::<Vec<_>>().join(","));
+    if let Ok(cache)=secret_cache().lock() {
+        if cache.0==fingerprint { return cache.1.clone(); }
+    }
+    let mut out=Vec::new();
+    // 邮箱授权码：mail::secrets 以邮箱为键。
+    for account in crate::mail::load_accounts() {
+        if let Ok(password)=crate::mail::secrets::load(&account.email) {
+            out.push((format!("mail:{}",account.email.to_ascii_lowercase()),password));
+        }
+    }
+    // 日历密码：以「平台:用户名」为键。
+    for cfg in crate::calendar::load_configs() {
+        if let Ok(password)=crate::calendar::secrets::load(&cfg) {
+            out.push((format!("cal:{}",crate::calendar::credential_key(&cfg)),password));
+        }
+    }
+    // AI 额度 API Key：API-Key 类账号以槽位为键，与 api_quota 同一服务名。
+    for account in quota.accounts.iter().filter(|a|a.provider.api_key()) {
+        let Some(slot)=account.slot.as_deref() else {continue};
+        if slot.is_empty() {continue}
+        if let Ok(entry)=keyring::Entry::new("Daozai.ApiQuota",slot) {
+            if let Ok(key)=entry.get_password() { out.push((format!("apiq:{slot}"),key)); }
+        }
+    }
+    if let Ok(mut cache)=secret_cache().lock() {
+        cache.0=fingerprint;cache.1=out.clone();
+    }
+    out
+}
+
+/// 把对端克隆来的凭据写进本机 keyring。返回成功写入的数量。
+fn apply_secrets(secrets:&[(String,String)])->usize {
+    let mut saved=0;
+    for (key,value) in secrets {
+        if value.is_empty() {continue}
+        let result=if let Some(email)=key.strip_prefix("mail:") {
+            crate::mail::secrets::save(email,value).map(|_|())
+        } else if let Some(rest)=key.strip_prefix("cal:") {
+            // 找到本机同键位的日历账号再写（save 需要 Config 结构）。
+            crate::calendar::load_configs().into_iter()
+                .find(|cfg|crate::calendar::credential_key(cfg)==rest)
+                .map(|cfg|crate::calendar::secrets::save(&cfg,value).map(|_|()))
+                .unwrap_or(Err("本机没有对应日历账号".into()))
+        } else if let Some(slot)=key.strip_prefix("apiq:") {
+            match keyring::Entry::new("Daozai.ApiQuota",slot) {
+                Ok(entry)=>entry.set_password(value).map_err(|e|format!("{e}")),
+                Err(e)=>Err(format!("{e}")),
+            }
+        } else {continue};
+        if result.is_ok() {saved+=1;}
+    }
+    // 凭据变了：下次快照要重新收集。
+    if saved>0 { if let Ok(mut cache)=secret_cache().lock() {cache.0.clear();} }
+    saved
 }
 
 /// 应用对端快照：先落盘、再刷新内存。`today` 来自 `Env`，保证当日饮水不跨天重置。
@@ -197,9 +286,92 @@ pub fn apply(app: &mut App, payload: &str, today: &str, now: f64) -> bool {
     write("water-extra.txt", doc.water_extra.as_ref());
     write("shelf.txt", doc.shelf.as_ref());
     merge_accounts(&dir.join("ai-quota.json"), doc.accounts.as_deref());
+    merge_mail(&dir.join("mail-accounts.json"), doc.mail.as_deref());
+    merge_calendar(&dir.join("calendar.json"), doc.calendar.as_deref());
+    merge_local_calendar(&dir.join("local-calendar.json"), doc.local_calendar.as_deref());
+    let secrets=apply_secrets(&doc.secrets);
+    if secrets>0 { set_status(format!("已从对端克隆 {secrets} 个账号凭据")); }
 
     app.apply_synced_state(today, now);
     true
+}
+
+/// 邮件账号求并集（按 email 去重）：对端账号补进本机清单，本机同名账号保留。
+/// 清单本身不含密码（密码在 keyring，走 `secrets` 通道）。
+fn merge_mail(path: &Path, remote: Option<&str>) {
+    let Some(remote) = remote else { return; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
+    let Some(rarr) = rv.as_array() else { return; };
+    let key = |a: &serde_json::Value| a.get("email").and_then(|v| v.as_str()).map(str::to_ascii_lowercase);
+    let local: Vec<serde_json::Value> = std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!([]))
+        .as_array().cloned().unwrap_or_default();
+    let mut merged = local.clone();
+    for r in rarr {
+        let Some(rkey) = key(r) else { continue };
+        if merged.iter().any(|l| key(l).as_deref() == Some(rkey.as_str())) { continue; }
+        merged.push(r.clone());
+    }
+    if merged.len() != local.len() {
+        if let Ok(raw) = serde_json::to_vec_pretty(&merged) {
+            let _ = model::atomic_write(path, &raw);
+        }
+    }
+}
+
+/// 日历账号求并集（按「平台:用户名」去重）：单账号对象与多账号数组两种格式都兼容。
+fn merge_calendar(path: &Path, remote: Option<&str>) {
+    let Some(remote) = remote else { return; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
+    let key = |a: &serde_json::Value| format!("{}:{}", 
+        a.get("provider").and_then(|v|v.as_str()).unwrap_or_default(),
+        a.get("username").and_then(|v|v.as_str()).unwrap_or_default().to_ascii_lowercase());
+    let accounts_of = |v: &serde_json::Value| -> Vec<serde_json::Value> {
+        if let Some(list)=v.get("accounts").and_then(|a|a.as_array()) { list.clone() }
+        else if v.get("username").is_some() { vec![v.clone()] } else { vec![] }
+    };
+    let remote_accounts = accounts_of(&rv);
+    if remote_accounts.is_empty() { return; }
+    let local: serde_json::Value = std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut local_accounts = accounts_of(&local);
+    let mut merged = local_accounts.clone();
+    for r in &remote_accounts {
+        let rkey = key(r);
+        if rkey.is_empty() || merged.iter().any(|l|key(l)==rkey) { continue; }
+        merged.push(r.clone());
+    }
+    if merged.len() == local_accounts.len() { return; }
+    let mut doc=local.clone();
+    doc["accounts"]=serde_json::json!(merged);
+    // 活动账号指向新补进的账号，让对端账号在克隆后立即生效。
+    if let Some(active)=merged.last() {
+        if let Some(k)=active.get("provider").and_then(|v|v.as_str()) { doc["active"]=serde_json::json!(k); }
+    }
+    if let Ok(raw)=serde_json::to_vec_pretty(&doc) { let _ = model::atomic_write(path, &raw); }
+}
+
+/// 本机日程事件按 uid 求并集：两台机器都能添加，互补不覆盖。
+fn merge_local_calendar(path: &Path, remote: Option<&str>) {
+    let Some(remote) = remote else { return; };
+    let Ok(rv) = serde_json::from_str::<serde_json::Value>(remote) else { return; };
+    let Some(rarr) = rv.as_array() else { return; };
+    let uid = |a: &serde_json::Value| a.get("uid").and_then(|v|v.as_str()).map(str::to_owned);
+    let mut local: Vec<serde_json::Value> = std::fs::read(path).ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| serde_json::json!([]))
+        .as_array().cloned().unwrap_or_default();
+    let mut added = 0;
+    for r in rarr {
+        let Some(ruid) = uid(r) else { continue };
+        if local.iter().any(|l|uid(l).as_deref()==Some(ruid.as_str())) { continue; }
+        local.push(r.clone());added+=1;
+    }
+    if added>0 {
+        if let Ok(raw)=serde_json::to_vec_pretty(&local) { let _ = model::atomic_write(path, &raw); }
+    }
 }
 
 impl App {
@@ -211,6 +383,15 @@ impl App {
         self.shelf = model::Shelf::load();
         self.water = model::Water::load(today);
         self.quota = crate::quota_ui::State::load();
+        // 邮件账号清单与日历/本机日程从磁盘重载（对端克隆来的账号立即生效）。
+        // 日历连接状态随 feeds 重建，由周期轮询重新握手。
+        self.mail.accounts = crate::mail::load_accounts();
+        self.mail_accounts_changed();
+        let calendar_form = std::mem::take(&mut self.calendar.form);
+        let calendar_note = std::mem::take(&mut self.calendar.note);
+        self.calendar = crate::app::CalendarState::load();
+        self.calendar.form = calendar_form;
+        self.calendar.note = calendar_note;
         // 别让「刚同步完」立刻触发一轮喝水 / 久坐提醒。
         self.last_reminder = now;
         self.sit_start = now;
@@ -278,17 +459,20 @@ impl SyncManager {
         if !ready { return; }
         self.clock = Some(Instant::now());
 
-        let (peers, is_server) = crate::cross_screen::sync_link();
+        let (peers, _is_server) = crate::cross_screen::sync_link();
         let connected = peers > 0;
 
         // ---- 收：LWW 裁决 ----
+        // 冲突口径：rev 大者胜；rev 相同比 updated_at；完全相同则 **Mac 胜出**
+        // （用户拍板「所有数据以 mac 为主」；OpenHop 的 Role::Server 是键鼠
+        // 主控端=Windows，与数据主设备无关，不能沿用）。
         let mut applied = 0usize;
         for msg in crate::cross_screen::sync_inbox() {
             if msg.device == self.device { continue; }
             if msg.payload == self.last && msg.rev == self.rev { continue; }
             let accept = msg.rev > self.rev
                 || (msg.rev == self.rev && msg.updated_at > self.updated_at)
-                || (msg.rev == self.rev && msg.updated_at == self.updated_at && !is_server);
+                || (msg.rev == self.rev && msg.updated_at == self.updated_at && !cfg!(target_os = "macos"));
             if !accept { continue; }
             if apply(app, &msg.payload, today, now) {
                 self.rev = msg.rev;
@@ -341,4 +525,64 @@ fn describe(payload: &str) -> String {
         .and_then(|v| v.get("accounts")?.as_array().map(|x| x.len()))
         .unwrap_or(0);
     format!("设置 {} 项 / 待办 {} 条 / 账号 {} 个", doc.settings.len(), todos, accounts)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn tmpdir(name:&str)->PathBuf {
+        let dir=std::env::temp_dir().join(format!("daozai-sync-{}-{}",name,std::process::id()));
+        let _=std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn mail_merge_unions_accounts_by_email_and_keeps_local(){
+        let dir=tmpdir("mail");
+        let path=dir.join("mail-accounts.json");
+        std::fs::write(&path,br#"[{"email":"Me@QQ.com","provider":"qq","enabled":true}]"#).unwrap();
+        merge_mail(&path,Some(r#"[{"email":"me@qq.com","provider":"qq","enabled":false},{"email":"work@163.com","provider":"163","enabled":true}]"#));
+        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let list=merged.as_array().unwrap();
+        assert_eq!(list.len(),2,"同名邮箱（大小写不敏感）保留本机，新增对端独有账号");
+        assert_eq!(list[0]["enabled"],serde_json::json!(true),"本机同名账号的开关不能被对端覆盖");
+        assert_eq!(list[1]["email"],serde_json::json!("work@163.com"));
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_merge_unions_accounts_and_activates_the_newest(){
+        let dir=tmpdir("cal");
+        let path=dir.join("calendar.json");
+        std::fs::write(&path,br#"{"accounts":[{"provider":"feishu","username":"a"}],"active":"feishu"}"#).unwrap();
+        merge_calendar(&path,Some(r#"{"accounts":[{"provider":"apple","username":"b"}],"active":"apple"}"#));
+        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(merged["accounts"].as_array().unwrap().len(),2);
+        assert_eq!(merged["active"],serde_json::json!("apple"),"克隆后活动账号指向新补进的账号");
+        // 再推一次相同内容：幂等，不产生重复。
+        merge_calendar(&path,Some(r#"{"accounts":[{"provider":"apple","username":"b"}],"active":"apple"}"#));
+        let again:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(again["accounts"].as_array().unwrap().len(),2);
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_calendar_merge_unions_by_uid(){
+        let dir=tmpdir("local");
+        let path=dir.join("local-calendar.json");
+        std::fs::write(&path,br#"[{"uid":"u1","title":"a","start":100,"end":200,"all_day":false,"reminder":15}]"#).unwrap();
+        merge_local_calendar(&path,Some(r#"[{"uid":"u1","title":"a","start":100,"end":200,"all_day":false,"reminder":15},{"uid":"u2","title":"b","start":300,"end":400,"all_day":false,"reminder":null}]"#));
+        let merged:serde_json::Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(merged.as_array().unwrap().len(),2,"按 uid 求并集，两端添加的事件互补");
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_setting_keys_cover_island_lyrics(){
+        for key in ["island_lyrics","lyric_delay_ms","notification_preview"] {
+            assert!(SYNC_SETTING_KEYS.contains(&key),"桌面歌词相关键 {key} 必须在同步白名单里");
+        }
+    }
 }

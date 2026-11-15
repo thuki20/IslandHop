@@ -326,7 +326,7 @@ impl CrossScreen {
         ui.label(RichText::new(format!("● {}", crate::sync_state::status_text()))
             .size(11.5)
             .color(Color32::from_rgb(76, 209, 160)));
-        ui.label(RichText::new("喝水 / 天气 / 久坐 / 待办 / 账号清单自动互通；登录凭据与本机路径留在各自电脑")
+        ui.label(RichText::new("喝水 / 天气 / 久坐 / 待办 / 邮箱 / 日历 / AI 额度账号自动互通（Mac 为数据主设备）；\n邮箱授权码、日历密码与 API Key 随账号克隆到对端本机钥匙串，不落明文文件")
             .size(10.0)
             .color(ui.visuals().weak_text_color()));
     }

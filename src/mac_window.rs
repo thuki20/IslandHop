@@ -30,12 +30,19 @@ pub fn elevate(_frame: &eframe::Frame) -> bool { true }
 /// 的值，岛就再也不会响应悬停。全局 `NSEvent.mouseLocation` 不依赖事件流，
 /// 也不需要「输入监控」权限（只有监听事件流才需要）。
 #[cfg(target_os = "macos")]
-pub fn cursor_local(ppp: f32) -> Option<eframe::egui::Pos2> {
-    imp::cursor_local(ppp)
+pub fn cursor_local(scale: f32) -> Option<eframe::egui::Pos2> {
+    imp::cursor_local(scale)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn cursor_local(_ppp: f32) -> Option<eframe::egui::Pos2> { None }
+pub fn cursor_local(_scale: f32) -> Option<eframe::egui::Pos2> { None }
+
+/// 按「岛体大小」倍率缩放主窗口画布（macOS；Windows 由 place_on_display 调整）。
+#[cfg(target_os = "macos")]
+pub fn resize_canvas(scale: f32) { imp::resize_canvas(scale) }
+
+#[cfg(not(target_os = "macos"))]
+pub fn resize_canvas(_scale: f32) {}
 
 /// 每帧按岛体命中矩形决定主窗口是否穿透鼠标。
 /// `cursor` 为全局鼠标换算出的窗口本地坐标；`hits` 是 `FrameOut` 里的
@@ -200,7 +207,7 @@ mod imp {
         true
     }
 
-    pub fn cursor_local(ppp: f32) -> Option<Pos2> {
+    pub fn cursor_local(scale: f32) -> Option<Pos2> {
         let ns = window();
         if ns.is_null() { return None }
         let mouse: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
@@ -213,9 +220,31 @@ mod imp {
         {
             return None;
         }
-        // ppp 仅用于防御异常值；正常路径不改变坐标含义。
-        let _ = ppp;
-        Some(Pos2::new(x as f32, y as f32))
+        // 岛体大小缩放：窗口按倍率放大（AppKit 点），egui 逻辑点 = AppKit 点 / 倍率。
+        let scale = if scale.is_finite() && scale > 0.01 { scale } else { 1.0 } as f64;
+        Some(Pos2::new((x / scale) as f32, (y / scale) as f32))
+    }
+
+    /// 把主窗口（透明画布）按岛体大小倍率缩放：AppKit 点尺寸 = 画布逻辑尺寸 × 倍率。
+    /// vendored eframe 的 `scale_root_input` 会把 egui 的 screen_rect / 指针坐标
+    /// / 字体栅格化换算到同一套逻辑点，UI 布局代码完全不用感知倍率。
+    /// 顶边保持不动（AppKit 原点在左下），高度变化向下伸展。
+    pub fn resize_canvas(scale: f32) {
+        let scale = if scale.is_finite() && scale > 0.01 { scale } else { return };
+        let ns = window();
+        if ns.is_null() { return }
+        unsafe {
+            let frame: NSRect = msg_send![ns, frame];
+            let w = (crate::app::CANVAS_W * scale) as f64;
+            let h = (crate::app::WIN_H * scale) as f64;
+            if (frame.size.width - w).abs() < 0.5 && (frame.size.height - h).abs() < 0.5 { return; }
+            let top = frame.origin.y + frame.size.height;
+            let mut next = frame;
+            next.size.width = w;
+            next.size.height = h;
+            next.origin.y = top - h;
+            let _: Bool = msg_send![ns, setFrame: next display: Bool::YES animate: Bool::NO];
+        }
     }
 
     pub fn set_passthrough(ignore: bool) -> bool {

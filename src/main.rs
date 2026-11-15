@@ -30,6 +30,9 @@ struct Shell {
     placed: bool,
     placement_at: PollClock,
     placement_scale: f32,
+    /// macOS 当前已应用到窗口的岛体大小倍率；变化后重设窗口尺寸并重新定位。
+    #[cfg(not(windows))]
+    mac_scale: f32,
     /// 上次定位时的目标屏幕与水平位置；变化后立即重新定位，不等下一次轮询。
     placement_key: (String, i32, daozai::model::Dock, bool),
     win_x: f32,
@@ -179,7 +182,8 @@ impl Shell {
         #[cfg(target_os = "macos")]
         let mac_sys = (daozai::macos_sys::Snapshot::default(), daozai::macos_sys::start(cc.egui_ctx.clone()));
         // 岛体大小只作用于主窗口，在首帧之前生效，避免启动时先按 100% 闪一下。
-        #[cfg(windows)] eframe::set_root_viewport_scale(app.settings.island_scale());
+        // macOS 由 mac_window::resize_canvas 同步放大窗口本体（AppKit 点）。
+        eframe::set_root_viewport_scale(app.settings.island_scale());
         Self {
             app,
             t0: Instant::now(),
@@ -197,6 +201,8 @@ impl Shell {
             placed: false,
             placement_at: PollClock::default(),
             placement_scale: 0.0,
+            #[cfg(not(windows))]
+            mac_scale: 0.0,
             placement_key: (String::new(), 0, daozai::model::Dock::Top, true),
             win_x: 0.0,
             sys: (None, false, PollClock::default()),
@@ -320,8 +326,12 @@ impl Shell {
         });
         // IslandHop（macOS）：提供所在屏幕的窗口本地矩形。上游写死 None，
         // 拖动换边、贴边定位与浮层避让在 Mac 上全部失效。
+        // 岛体大小缩放：screen_rect_local 返回 AppKit 点，除以倍率换算到 egui 逻辑点。
         #[cfg(not(windows))]
-        let screen=daozai::mac_window::screen_rect_local();
+        let screen=daozai::mac_window::screen_rect_local().map(|r|{
+            let s=self.app.settings.island_scale();
+            egui::Rect::from_min_size(egui::Pos2::new(r.min.x/s,r.min.y/s),r.size()/s)
+        });
         #[cfg(windows)]
         let (backdrop,glass_blur)=(self.backdrop.as_ref().and_then(|b|b.color()),self.native.as_ref().is_some_and(|w|w.blur_active()));
         #[cfg(not(windows))]
@@ -400,7 +410,7 @@ impl eframe::App for Shell {
         if self.media_fast_until.is_some_and(|until|Instant::now()>=until){self.media_fast_until=None;}
         self.media_enabled.set_interval(if self.media_fast_until.is_some(){smtc::POLL_FAST}else{self.app.media_poll_interval()});
         // 设置里改了岛体大小：下一帧起主窗口按新倍率栅格化，定位逻辑随像素比变化同步调整画布。
-        #[cfg(windows)] eframe::set_root_viewport_scale(self.app.settings.island_scale());
+        eframe::set_root_viewport_scale(self.app.settings.island_scale());
         #[cfg(windows)]
         {
             // 用帧间隔限制刷新，绕过部分 Intel 驱动在垂直同步中的忙等待。
@@ -459,23 +469,31 @@ impl eframe::App for Shell {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(self.win_x, 0.0)));
             ctx.request_repaint();
         }
-        // IslandHop（macOS）：水平位置 / 左右停靠跟随。Windows 有每帧的
+        // IslandHop（macOS）：水平位置 / 左右停靠 / 岛体大小跟随。Windows 有每帧的
         // place_on_display 循环，macOS 一直缺——窗口只在启动时居中一次，
         // 拖动和设置里的位置改了也没有任何效果。这里对齐同一行为：
         // 位置或岛体大小变化时按「可见半宽」的可移动范围重新定位。
         #[cfg(not(windows))]
         {
             let offset=self.app.placement_offset();
+            let scale=self.app.settings.island_scale();
             let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar);
-            if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.placement_key!=placement_key {
+            if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.mac_scale!=scale || self.placement_key!=placement_key {
+                if self.mac_scale!=scale {
+                    // 岛体大小：窗口本体按倍率放大（AppKit 点）。vendored eframe 的
+                    // scale_root_input 把 screen_rect / 指针 / 字体栅格化换算回同一套
+                    // 逻辑点，pixels_per_point 随之变为 系统ppi×倍率，触发上面的重定位。
+                    self.mac_scale=scale;
+                    daozai::mac_window::resize_canvas(scale);
+                }
                 self.placement_scale=ctx.pixels_per_point();
                 self.placement_key=placement_key;
                 if let Some(bounds)=daozai::mac_window::main_display_bounds() {
-                    // macOS 坐标是逻辑点，缩放比 1:1；左右停靠与 Windows 共用 side_origin。
+                    // 窗口/命中区按倍率放大（屏幕点 = UI 逻辑点 × 倍率），定位公式与 Windows 共用。
                     let origin=if self.app.settings.dock.is_side() {
-                        daozai::display_layout::side_origin(bounds,self.app.settings.dock,(daozai::side_dock::SIDE_W,daozai::side_dock::SIDE_H),daozai::side_dock::SIDE_HALF_EXTENT,1.0,offset)
+                        daozai::display_layout::side_origin(bounds,self.app.settings.dock,(daozai::side_dock::SIDE_W,daozai::side_dock::SIDE_H),daozai::side_dock::SIDE_HALF_EXTENT,scale,offset)
                     } else {
-                        daozai::display_layout::island_origin_offset_for(bounds,app::WIN_W,1.0,offset,self.app.placement_half_visible())
+                        daozai::display_layout::island_origin_offset_for(bounds,app::WIN_W,scale,offset,self.app.placement_half_visible())
                     };
                     if let Some((x,y))=origin {
                         self.win_x=x as f32;
@@ -605,7 +623,7 @@ impl eframe::App for Shell {
         // macOS：先取全局鼠标位置（窗口穿透时 egui 自己拿不到），供 env() 判定悬停。
         #[cfg(not(windows))]
         {
-            self.mac_cursor = daozai::mac_window::cursor_local(ctx.pixels_per_point());
+            self.mac_cursor = daozai::mac_window::cursor_local(self.app.settings.island_scale());
         }
         let env = self.env(ctx);
         // IslandHop：跨设备业务状态同步。引擎在 thread_local 里（!Send），
@@ -685,16 +703,16 @@ impl eframe::App for Shell {
             // 跨屏边缘上，光标在其上不能被引擎当作跨屏意图 grab 输入。
             #[cfg(target_os = "macos")]
             if let Some((ox, oy)) = daozai::mac_window::window_origin_top_left() {
-                // hits 是窗口本地 egui 逻辑点；macOS 上 egui 逻辑点与屏幕点 1:1
-                // （AppKit point == winit logical pixel，见 cursor_local 注释），
-                // 窗口原点也是屏幕点，直接相加即可，不要乘 pixels_per_point。
+                // hits 是窗口本地 egui 逻辑点；屏幕点 = 窗口原点 + 本地点 × 岛体倍率
+                // （倍率 1 时与旧 1:1 行为一致）。
+                let s = self.app.settings.island_scale();
                 let live: Vec<_> = hits.iter().copied().filter(|r| r.is_positive() && r.width() > 1.0).collect();
                 if let (Some(min), Some(max)) = (
                     live.iter().map(|r| r.min).fold(None, |acc: Option<egui::Pos2>, p| Some(acc.map_or(p, |a| egui::Pos2::new(a.x.min(p.x), a.y.min(p.y))))),
                     live.iter().map(|r| r.max).fold(None, |acc: Option<egui::Pos2>, p| Some(acc.map_or(p, |a| egui::Pos2::new(a.x.max(p.x), a.y.max(p.y))))),
                 ) {
-                    let rect=[(ox + min.x) as i32, (oy + min.y) as i32,
-                        (max.x - min.x) as i32, (max.y - min.y) as i32];
+                    let rect=[(ox + min.x*s) as i32, (oy + min.y*s) as i32,
+                        ((max.x - min.x)*s) as i32, ((max.y - min.y)*s) as i32];
                     openhop_core::platform::set_ui_exclude(Some(rect));
                 }
             }

@@ -45,6 +45,19 @@ pub const BAR_H: f32 = 30.0; // 收起药丸高（macOS 上被 bar_h() 覆盖，
 /// 普通机型约 24-25pt），用户要求岛高不能比菜单栏矮一节，否则菜单栏下缘
 /// 部分区域点不到。其余平台/测试环境用 BAR_H 兜底。
 pub fn bar_h() -> f32 { crate::mac_window::menu_bar_height().unwrap_or(BAR_H) }
+
+/// 刘海机型的「下挂」高度：收起态歌词条/横幅通知在菜单栏高度带里的中线
+/// 正好落在物理刘海死区（本机刘海 185×32pt）正后方，用户什么都看不见。
+/// 有刘海时把这类内容整体下移到刘海下缘之下（返回值 = 相对菜单栏中线的
+/// 额外偏移），岛体随之向下延长；Windows 与无刘海 Mac 返回 0。
+/// 测试构建 `notch_layout()` 恒为 None，录制/像素基线不受影响。
+pub(crate) fn notch_shelf() -> f32 {
+    crate::mac_window::notch_layout().map(|(_, h)| {
+        // 内容（封面 20pt / 歌词文字约 14pt）中线 = 刘海下缘 + 16：
+        // 顶部离刘海下缘至少 6pt，底部留 10pt 呼吸。
+        (h + 16.0).max(bar_h() * 0.5 + 12.0) - bar_h() * 0.5
+    }).unwrap_or(0.0)
+}
 pub(crate) const HUD_W: f32 = 260.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
@@ -1653,14 +1666,21 @@ impl App {
     }
     fn base_size(&self) -> (f32, f32) {
         if !self.compact_notices()&&!self.open {
-            if let Some(a)=&self.notice {let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);}
+            if let Some(a)=&self.notice {
+                // 刘海机型：横幅通知卡（约 334pt 宽居中）中段会被物理刘海挡住。
+                // 岛体保持常驻形态，通知卡整体下挂到岛体下方弹出（frame() banner 分支）。
+                if crate::mac_window::notch_layout().is_none() {
+                    let (width,height)=self.notice_size(a);return (width+self.pet_space(),height);
+                }
+            }
         }
         if self.side() {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
             return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.pending_messengers.is_empty()));
         }
         if self.island_lyrics_active() {
-            (self.lyric_bar_width(),bar_h())
+            // 刘海机型：歌词条向下延长，歌词画在刘海下方可见区（见 notch_shelf）。
+            (self.lyric_bar_width(), bar_h() + notch_shelf())
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
@@ -1997,7 +2017,26 @@ impl App {
                 }
             }
         }else if banner {
-            if let Some(a)=self.notice.clone(){self.draw_notice(&Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())),panel,&a,&mut cmds);}
+            if let Some(a)=self.notice.clone(){
+                // 刘海机型：横幅通知下挂到岛体下方弹出（同 HUD），菜单栏高度带
+                // 的中间被物理刘海挡住，画在原位中段用户看不见。岛体保持常驻形态。
+                if crate::mac_window::notch_layout().is_some() {
+                    // 常驻行照常显示，通知卡在其下方弹出。
+                    if !minimal_pill||pc>0.0 {self.resident_header(&base,panel,cx,pc,reveal,env);}
+                    let (tw,th)=self.notice_size(&a);
+                    let rect=Rect::from_min_size(Pos2::new(cx-tw/2.0,top+bar_h()+8.0),Vec2::new(tw,th));
+                    self.hud_drop=Some(rect);
+                    let from=crate::skin_paint::shape_count(&ctx,layer);
+                    shape::shadow(&painter,rect,0.0,0.0,12.0,0.5*shadow_k);
+                    painter.rect_filled(rect,12.0,self.glass_fill());
+                    if glass_skin {painter.rect_stroke(rect,12.0,egui::Stroke::new(1.0_f32,self.glass_rim()),egui::StrokeKind::Inside);}
+                    keep_colors.push((from,crate::skin_paint::shape_count(&ctx,layer)));
+                    let overlay=Card::new(ui,rect.min,rect.intersect(ui.max_rect())).ghost();
+                    self.draw_notice(&overlay,rect,&a,&mut cmds);
+                }else{
+                    self.draw_notice(&Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())),panel,&a,&mut cmds);
+                }
+            }
         }else if !minimal_pill || pc > 0.0 {
             self.resident_header(&base, panel, cx, if restoring_lyrics{0.0}else{pc}, reveal, env);
         }
@@ -2686,7 +2725,8 @@ impl App {
             let content_width=self.lyric_bar_width()-self.lyric_focus_space();
             let width=self.w.pos.max(content_width);
             let left=local_cx-width/2.0;
-            let center_y=bar_h()/2.0;
+            // 刘海机型下挂：内容中线移到刘海下缘之下（notch_shelf），不再压在死区上。
+            let center_y=bar_h()/2.0+notch_shelf();
             if let Some((image,texture))=&self.music_artwork {
                 let [width,height]=image.size;
                 let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};

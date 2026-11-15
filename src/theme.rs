@@ -168,8 +168,10 @@ fn build_fonts()->FontDefinitions {
     ];
 
     let korean = [
-        find(&[("malgun.ttf", 0), ("NotoSansKR-Regular.otf", 0), ("NotoSansCJK-Regular.ttc", 1)], &dirs),
-        find(&[("malgunbd.ttf", 0), ("malgun.ttf", 0), ("NotoSansKR-Bold.otf", 0), ("NotoSansCJK-Bold.ttc", 1)], &dirs),
+        // macOS 系统韩文字体：AppleSDGothicNeo（ malgun / Noto 系在 Mac 上不存在，
+        // 缺它韩文歌名和歌词渲染成豆腐块）。.ttc 含多字重，index 0 为 Regular。
+        find(&[("malgun.ttf", 0), ("AppleSDGothicNeo.ttc", 0), ("NotoSansKR-Regular.otf", 0), ("NotoSansCJK-Regular.ttc", 1)], &dirs),
+        find(&[("malgunbd.ttf", 0), ("malgun.ttf", 0), ("AppleSDGothicNeo.ttc", 1), ("NotoSansKR-Bold.otf", 0), ("NotoSansCJK-Bold.ttc", 1)], &dirs),
     ];
 
     let mut fonts = FontDefinitions::default();
@@ -220,7 +222,6 @@ pub fn app_icon()->std::sync::Arc<eframe::egui::IconData>{
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     #[test]
     fn korean_titles_and_lyrics_have_glyphs_in_all_weights(){
         let ctx=eframe::egui::Context::default();

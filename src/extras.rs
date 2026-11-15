@@ -1987,6 +1987,8 @@ impl App {
                             });
                             ui.label(egui::RichText::new("桌面顶部的音乐、专注、提醒与日程小助手，内置局域网键鼠共享与剪贴板同步。").size(12.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             ui.horizontal_wrapped(|ui|{
+                                ui.hyperlink_to("项目主页 · ncsai.top", "https://ncsai.top/home/#software");
+                                ui.label(egui::RichText::new("·").size(11.0));
                                 ui.hyperlink_to("GitHub · thuki20/IslandHop", "https://github.com/thuki20/IslandHop");
                                 ui.label(egui::RichText::new("·").size(11.0));
                                 ui.hyperlink_to("发布与下载", "https://github.com/thuki20/IslandHop/releases/latest");
