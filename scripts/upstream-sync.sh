@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 
 UPSTREAM="${ISLANDHOP_UPSTREAM:-Renly1994/xiaotang-daozai}"
 BASE_FILE=".upstream-base"
-CACHE=".upstream-cache"
+CACHE="$(pwd)/.upstream-cache"
 MODE="report"
 TARGET=""
 RUN_TEST=0
@@ -46,11 +46,10 @@ fetch_tree() { # $1=ref  $2=目录名
   local ref="$1" dir="$CACHE/$2" tgz="$CACHE/$2.tar.gz" u attempt ok=0
   if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then return 0; fi
   mkdir -p "$dir"
-  local urls=("https://codeload.github.com/$UPSTREAM/tar.gz/refs/tags/$ref")
-  case "$ref" in
-    v[0-9]*) ;;
-    *) urls=("https://codeload.github.com/$UPSTREAM/tar.gz/refs/heads/$ref" "${urls[@]}") ;;
-  esac
+  # 依次尝试：直接 ref（tag / 分支 / commit SHA 都支持）→ refs/tags → refs/heads
+  local urls=("https://codeload.github.com/$UPSTREAM/tar.gz/$ref"
+              "https://codeload.github.com/$UPSTREAM/tar.gz/refs/tags/$ref"
+              "https://codeload.github.com/$UPSTREAM/tar.gz/refs/heads/$ref")
   for u in "${urls[@]}"; do
     for attempt in 1 2 3; do
       # codeload 是按需打包的流式响应，不支持 Range 续传，只能一次性拉完；
@@ -69,16 +68,31 @@ fetch_tree "$TARGET" "target-$TARGET"
 BASE_DIR="$CACHE/base-$BASE"
 TARGET_DIR="$CACHE/target-$TARGET"
 
-# 上游历史里改动过的文件清单（对比两份快照）。
-cd "$BASE_DIR"
-CHANGED="$(diff -rq --exclude=.git . "$TARGET_DIR" 2>/dev/null | sed -E 's/^Files \.\/(.*) and .* differ$/\1/; s/^Only in .*\/(.*): (.*)$/\1\/\2/' | sort -u)"
-cd - >/dev/null
+# 上游历史里改动过的文件清单（对比两份快照）。路径必须绝对：
+# 下面会 cd 进基线目录做 diff，相对路径会失效。
+CHANGED="$(cd "$BASE_DIR" && diff -rq -x .git . "$TARGET_DIR" 2>/dev/null | python3 -c '
+import os, sys
+base = os.getcwd()
+target = sys.argv[1]
+out = []
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if line.startswith("Files "):
+        out.append(os.path.relpath(line[len("Files "):].split(" and ")[0], base))
+    elif line.startswith("Only in "):
+        head, name = line[len("Only in "):].rsplit(": ", 1)
+        full = os.path.join(head, name)
+        # 只在目标树里存在的文件：相对目标是新路径；只在基线里的是上游删除
+        out.append(os.path.relpath(full, target if full.startswith(target) else base))
+print("\n".join(sorted(set(out))))
+' "$TARGET_DIR")"
 
-APPLY_LIST=(); MANUAL_LIST=(); SKIP_LIST=()
+APPLY_LIST=(); MANUAL_LIST=(); SKIP_LIST=(); DOC_LIST=()
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   case "$f" in
     .github/*|.gitignore|dist/*|target/*) SKIP_LIST+=("$f"); continue ;;  # 上游 CI 与产物：我们用自己的
+    README*|CHANGELOG*|AGENTS.md) DOC_LIST+=("$f"); continue ;;           # 文档：手工摘录要点即可
   esac
   [ -f "$TARGET_DIR/$f" ] || { SKIP_LIST+=("${f}（上游已删除）"); continue; }
   if [ ! -f "$f" ]; then
@@ -116,6 +130,7 @@ for c in d.get("commits",[]):
   echo "| --- | --- |"
   echo "| 可直接应用 | ${#APPLY_LIST[@]} |"
   echo "| 需人工合并 | ${#MANUAL_LIST[@]} |"
+  echo "| 文档（手工摘录） | ${#DOC_LIST[@]} |"
   echo "| 跳过 | ${#SKIP_LIST[@]} |"
   echo
   echo "## 可直接应用"
@@ -125,6 +140,10 @@ for c in d.get("commits",[]):
   echo "## 需人工合并"
   echo
   for item in "${MANUAL_LIST[@]:-}"; do [ -n "$item" ] && echo "- ${item%%|*}"; done
+  echo
+  echo "## 文档类（建议手工摘录要点）"
+  echo
+  for item in "${DOC_LIST[@]:-}"; do [ -n "$item" ] && echo "- ${item}"; done
   echo
   echo "## 冲突明细（我方 vs 上游）"
   echo

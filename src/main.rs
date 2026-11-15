@@ -33,8 +33,14 @@ struct Shell {
     /// macOS 当前已应用到窗口的岛体大小倍率；变化后重设窗口尺寸并重新定位。
     #[cfg(not(windows))]
     mac_scale: f32,
-    /// 上次定位时的目标屏幕与水平位置；变化后立即重新定位，不等下一次轮询。
-    placement_key: (String, i32, daozai::model::Dock, bool),
+    /// macOS 的 OLED 像素偏移当前位移（与 Windows 的 `oled_shift` 同义）。
+    #[cfg(not(windows))]
+    mac_shift: (i32, i32),
+    /// 上次定位时的目标屏幕、水平位置与 OLED 像素偏移；变化后立即重新定位，不等下一次轮询。
+    placement_key: (String, i32, daozai::model::Dock, bool, (i32, i32)),
+    /// OLED 像素偏移当前实际使用的位移；展开、拖拽、隐藏时保持不变。
+    #[cfg(windows)]
+    oled_shift: (i32, i32),
     win_x: f32,
     sys: (Option<u8>, bool, PollClock),
     /// 视觉验证辅助：设 `ISLANDHOP_HUD_DEMO=1` 启动 3 秒后弹一条电源已连接，
@@ -203,7 +209,11 @@ impl Shell {
             placement_scale: 0.0,
             #[cfg(not(windows))]
             mac_scale: 0.0,
-            placement_key: (String::new(), 0, daozai::model::Dock::Top, true),
+            #[cfg(not(windows))]
+            mac_shift: (0, 0),
+            placement_key: (String::new(), 0, daozai::model::Dock::Top, true, (0, 0)),
+            #[cfg(windows)]
+            oled_shift: (0, 0),
             win_x: 0.0,
             sys: (None, false, PollClock::default()),
             hud_demo: std::env::var_os("ISLANDHOP_HUD_DEMO").is_some().then(std::time::Instant::now),
@@ -429,14 +439,16 @@ impl eframe::App for Shell {
         }
         #[cfg(windows)]
         let offset=self.app.placement_offset();
+        #[cfg(windows)]
+        let shift=self.oled_shift;
         // 拖动时位置不取整，按万分之一比例比较，窗口逐帧平滑跟随。
         #[cfg(windows)]
-        let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar);
+        let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar,shift);
         #[cfg(windows)]
         if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.placement_key!=placement_key || self.placement_at.ready(Duration::from_secs(1)) {
             // 只有位置变化时沿用已知屏幕，避免拖动中每帧枚举显示器。
             let offset_only=self.placed && self.placement_scale==ctx.pixels_per_point() && !self.placement_at.ready(Duration::from_secs(1))
-                && (&self.placement_key.0,self.placement_key.2,self.placement_key.3)==(&placement_key.0,placement_key.2,placement_key.3);
+                && (&self.placement_key.0,self.placement_key.2,self.placement_key.3,self.placement_key.4)==(&placement_key.0,placement_key.2,placement_key.3,placement_key.4);
             if !offset_only {
                 self.placement_at=PollClock::now();
                 self.app.displays=daozai::display_layout::connected();
@@ -444,7 +456,7 @@ impl eframe::App for Shell {
             self.placement_scale=ctx.pixels_per_point();
             self.placement_key=placement_key;
             let display=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id);
-            if display.is_some_and(|d|self.native.as_ref().is_some_and(|w|w.place_on_display(self.placement_scale,daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar),offset,self.app.settings.dock,self.app.placement_half_visible()))) {
+            if display.is_some_and(|d|self.native.as_ref().is_some_and(|w|w.place_on_display(self.placement_scale,daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar),offset,self.app.settings.dock,self.app.placement_half_visible(),shift))) {
                 if !self.placed {diagnostics::startup("目标屏幕物理坐标定位完成，已请求显示");}
                 self.placed=true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -477,7 +489,14 @@ impl eframe::App for Shell {
         {
             let offset=self.app.placement_offset();
             let scale=self.app.settings.island_scale();
-            let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar);
+            // OLED 像素偏移：与 Windows 同一套时间表，收起静止时逐像素挪；macOS 的
+            // 定位是自己算 OuterPosition，所以这里把位移叠进坐标并纳入 placement_key。
+            let shift=if self.app.settings.oled_shift && !self.hidden && self.app.oled_shift_idle(ctx) {
+                ctx.request_repaint_after(daozai::oled_shift::until_next_step(self.t0.elapsed()));
+                daozai::oled_shift::toward(self.mac_shift,daozai::oled_shift::shift(true,self.app.settings.dock,self.t0.elapsed()))
+            } else {self.mac_shift};
+            self.mac_shift=shift;
+            let placement_key=(self.app.settings.display_id.clone(),(offset*10000.0).round() as i32,self.app.settings.dock,self.app.settings.avoid_top_bar,shift);
             if !self.placed || self.placement_scale!=ctx.pixels_per_point() || self.mac_scale!=scale || self.placement_key!=placement_key {
                 if self.mac_scale!=scale {
                     // 岛体大小：窗口本体按倍率放大（AppKit 点）。vendored eframe 的
@@ -496,6 +515,10 @@ impl eframe::App for Shell {
                         daozai::display_layout::island_origin_offset_for(bounds,app::WIN_W,scale,offset,self.app.placement_half_visible())
                     };
                     if let Some((x,y))=origin {
+                        // 与 Windows 一致的收窄规则：展开面板必须留在屏幕内，贴边一侧不动。
+                        let (back,forth)=daozai::display_layout::shift_slack(bounds,scale,if self.app.settings.dock.is_side() {daozai::side_dock::SIDE_HALF_EXTENT} else {daozai::display_layout::ISLAND_HALF_EXTENT},offset,self.app.settings.dock);
+                        let (dx,dy)=(shift.0.clamp(-back,forth),shift.1.clamp(-back,forth));
+                        let (x,y)=if self.app.settings.dock.is_side() {(x,y+dy)} else {(x+dx,y)};
                         self.win_x=x as f32;
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32,y as f32)));
                         ctx.request_repaint();
@@ -679,6 +702,26 @@ impl eframe::App for Shell {
                 out = Some(self.app.frame(ui, win, &env));
             });
         let Some(out) = out else { return };
+
+        #[cfg(windows)]
+        {
+            // 先处理本帧输入和动画，再决定是否移动，避免悬停或按下的首帧仍使用旧状态。
+            let hovering=env.cursor.is_some_and(|p|out.hit.contains(p)||out.notice_hit.is_some_and(|r|r.contains(p)));
+            let shift=if !self.app.settings.oled_shift {(0,0)}
+                else if !self.hidden && !hovering && self.app.oled_shift_idle(ctx) {
+                    ctx.request_repaint_after(daozai::oled_shift::until_next_step(self.t0.elapsed()));
+                    let target=daozai::oled_shift::shift(true,self.app.settings.dock,self.t0.elapsed());
+                    daozai::oled_shift::toward(self.oled_shift,target)
+                } else {self.oled_shift};
+            if shift!=self.oled_shift {
+                self.oled_shift=shift;
+                let display=daozai::display_layout::selected(&self.app.displays,&self.app.settings.display_id);
+                if display.is_some_and(|d|self.native.as_ref().is_some_and(|w|w.place_on_display(ctx.pixels_per_point(),daozai::display_layout::placement_bounds(d,self.app.settings.avoid_top_bar),self.app.placement_offset(),self.app.settings.dock,self.app.placement_half_visible(),shift))) {
+                    self.placement_key.4=shift;
+                }
+                ctx.request_repaint();
+            }
+        }
 
         #[cfg(windows)]
         if let Some(native) = &mut self.native {
