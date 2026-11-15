@@ -82,8 +82,8 @@ bash packaging/push-update.sh "更新说明第一行" "第二行" "第三行"
 
 ## 2.5 云端构建：Windows 也能发版（不需要 Mac）
 
-`.github/workflows/release-macos.yml` 在 GitHub 的 Apple Silicon runner 上编译、签名、打包、推云端，
-**改完代码 push 就完事**，本机不需要装 Rust、也不需要出包。
+`.github/workflows/release-macos.yml` 在 GitHub 的 Apple Silicon runner 上编译、签名、打包并**发布 GitHub Release**，
+服务器上的定时任务再把 Release 镜像到更新目录，**改完代码 push 就完事**，本机不需要装 Rust、也不需要出包。
 
 ```bash
 # Windows / 任意机器上：
@@ -91,18 +91,23 @@ bash packaging/push-update.sh "更新说明第一行" "第二行" "第三行"
 # 2) Cargo.toml 两处 version 一起 bump（这是发版开关）
 # 3) CHANGELOG.md 顶部加一节
 # 4) git push
-# → Actions 自动跑约 15 分钟 → 云端 manifest 更新 → 已装客户端下次启动弹更新
+# → Actions 约 15 分钟出包并建 Release → 服务器 5 分钟内镜像 → 客户端下次启动弹更新
 ```
 
-手动触发（可以自定义更新说明）：仓库 Actions → **Release macOS (OTA)** → Run workflow → 填 `notes`。
+手动触发（可自定义更新说明）：仓库 Actions → **Release macOS (OTA)** → Run workflow → 填 `notes`。
+
+**为什么不让 CI 直接 ssh 推包？** GitHub runner 的出口 IP 每次都变，而服务器 `YJ-FIREWALL-INPUT` 链里有大量
+`REJECT ... tcp dpt:22` 黑名单（安全软件自动生成的防爆破规则），CI 的 ip 一进去就是 `Connection refused`，
+且没法用白名单维持。所以方向反过来：**CI 只往 GitHub 推，服务器定时往回拉**。
 
 | 项 | 值 | 备注 |
 |---|---|---|
 | runner | `macos-15`（arm64） | **不要用 `macos-14`**：实测 1 秒内 cancelled、0 step；`macos-13` 长期 queued。可用仓库变量 `MACOS_RUNNER` 覆盖 |
 | 触发 | push 到 main（改 `src/` `crates/` `vendor/` `packaging/` `Cargo.toml`）+ 手动 | 只改文档不会触发 |
 | 实测耗时 | 首次约 16 分钟（904 测试占一半），有缓存后更快 | 公开仓库免费，不烧额度 |
-| 需要的 Secrets | `MACOS_CERT_P12`（OpenHopSign 的 p12 base64）、`MACOS_CERT_PASSWORD`、`DEPLOY_SSH_KEY`（CI 专用私钥） | 已配置；缺证书→ad-hoc（用户需重授权），缺 SSH key→只出 artifact 不推云端 |
-| CI 专用密钥 | `~/.ssh/islandhop_ci_ed25519`，公钥在服务器 `~/.ssh/authorized_keys`（注释 `islandhop-ci@github-actions`） | 撤销=删该行；换密钥就重跑 `gh secret` 写入 |
+| 产物去向 | GitHub Release `vX.Y.Z`：`IslandHop-vX.Y.Z-macos.zip` + `manifest.json` + `manifest-legacy.json` | 同时留一份 Actions artifact（30 天） |
+| 服务器镜像 | `/opt/ncsai-portal/deploy/sync-islandhop-update.sh`，crontab `*/5`，日志 `/opt/ncsai-portal/data/islandhop-sync.log` | 只拉版本更高的；校验 sha256 + size 后才落盘 |
+| 需要的 Secrets | `MACOS_CERT_P12`（OpenHopSign 的 p12 base64）、`MACOS_CERT_PASSWORD` | 缺了就走 ad-hoc 签名（用户需重新授权辅助功能） |
 
 **两个必须知道的坑：**
 
@@ -111,6 +116,9 @@ bash packaging/push-update.sh "更新说明第一行" "第二行" "第三行"
 2. **自签名证书导出成 p12 会丢 TrustSettings**，CI 里导入后 `find-identity -v` 认为它不受信 → `macos-app.sh`
    静默退回 ad-hoc 签名。workflow 里已用 `security add-trusted-cert -d -r trustRoot` 修掉，并在看不到身份时
    直接报错而不是悄悄降级。
+
+> 本机仍然可以直接推（`bash packaging/push-update.sh "说明"`，走 `ssh ncsai` + rsync，因为本机 IP 不在黑名单里）。
+> 两条路径产出格式一致，客户端无感；CI 里用 `ISLANDHOP_NO_PUBLISH=1` 让它只出包不推。
 
 ---
 
