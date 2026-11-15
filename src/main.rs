@@ -34,6 +34,9 @@ struct Shell {
     placement_key: (String, i32, daozai::model::Dock, bool),
     win_x: f32,
     sys: (Option<u8>, bool, PollClock),
+    /// 视觉验证辅助：设 `ISLANDHOP_HUD_DEMO=1` 启动 3 秒后弹一条电源已连接，
+    /// 用于实测 HUD 弹窗的落位（macOS 下挂到刘海下方）；弹完即清空，无副作用。
+    hud_demo: Option<std::time::Instant>,
     #[cfg(windows)]
     system_state: daozai::system::Snapshot,
     #[cfg(windows)]
@@ -197,6 +200,7 @@ impl Shell {
             placement_key: (String::new(), 0, daozai::model::Dock::Top, true),
             win_x: 0.0,
             sys: (None, false, PollClock::default()),
+            hud_demo: std::env::var_os("ISLANDHOP_HUD_DEMO").is_some().then(std::time::Instant::now),
             #[cfg(windows)]
             system_state,
             #[cfg(windows)] system_ready:false,
@@ -290,6 +294,12 @@ impl Shell {
             if self.app.settings.show_battery && self.sys.0.is_some() && self.sys.1!=c && self.app.settings.system_hud {self.app.alert(if c {"电源已连接"}else{"已切换电池供电"},b.map(|v|format!("当前电量 {v}%")).unwrap_or_else(||"桌面电源状态已更新".into()),5,false);}
             if self.app.settings.show_battery && b.is_some_and(|v|v<=20) && !c && self.sys.0.is_some_and(|v|v>20) {self.app.alert("电量偏低",format!("剩余 {}% · 请连接电源",b.unwrap()),5,true);}
             self.sys = (b, c, PollClock::now());
+        }
+        if let Some(at)=self.hud_demo {
+            if at.elapsed()>=std::time::Duration::from_secs(3) {
+                self.hud_demo=None;
+                self.app.alert("电源已连接","当前电量 100%",5,false);
+            }
         }
         let ppp = ctx.pixels_per_point();
         let origin = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min).unwrap_or(Pos2::new(self.win_x, 0.0));

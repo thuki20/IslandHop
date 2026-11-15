@@ -1935,9 +1935,24 @@ impl App {
                 else {(self.hud_alpha*smoothstep(0.20,0.60,width_progress),1.0-smoothstep(0.05,0.25,width_progress))};
             if !minimal_pill||pc>0.0 {self.resident_header(&base.faded(header_opacity),panel,cx,pc,reveal,env);}
             if let Some(a)=self.hud_notice.clone(){
-                let overlay=Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())).faded(opacity);
-                let overlay=if opacity<0.85||!banner{overlay.ghost()}else{overlay};
-                self.draw_notice(&overlay,panel,&a,&mut cmds);
+                // macOS 菜单栏岛（刘海机型）：HUD 弹窗（充放电 / 音量 / 蓝牙 / 网络等）
+                // 下挂到岛体下方弹出——菜单栏高度那条带被物理刘海（摄像头）挡住，
+                // 画在里面中间部分用户根本看不见；下方才是可见区域。
+                if crate::mac_window::menu_bar_height().is_some() {
+                    let (tw,th)=self.notice_size(&a);
+                    let rect=Rect::from_min_size(Pos2::new(cx-tw/2.0,top+bar_h()+8.0),Vec2::new(tw,th));
+                    let from=crate::skin_paint::shape_count(&ctx,layer);
+                    shape::shadow(&painter,rect,0.0,0.0,12.0,0.5*shadow_k);
+                    painter.rect_filled(rect,12.0,self.glass_fill());
+                    if glass_skin {painter.rect_stroke(rect,12.0,egui::Stroke::new(1.0_f32,self.glass_rim()),egui::StrokeKind::Inside);}
+                    keep_colors.push((from,crate::skin_paint::shape_count(&ctx,layer)));
+                    let overlay=Card::new(ui,rect.min,rect.intersect(ui.max_rect())).faded(opacity).ghost();
+                    self.draw_notice(&overlay,rect,&a,&mut cmds);
+                }else{
+                    let overlay=Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())).faded(opacity);
+                    let overlay=if opacity<0.85||!banner{overlay.ghost()}else{overlay};
+                    self.draw_notice(&overlay,panel,&a,&mut cmds);
+                }
             }
         }else if banner {
             if let Some(a)=self.notice.clone(){self.draw_notice(&Card::new(ui,panel.min+Vec2::new(self.pet_space(),0.0),panel.intersect(ui.max_rect())),panel,&a,&mut cmds);}
