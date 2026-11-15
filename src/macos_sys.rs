@@ -169,9 +169,51 @@ fn query_media() -> Option<crate::smtc::NowPlaying> {
     None
 }
 
-/// 后台采样。每 1.5 秒一次，音量与闲置变化足够跟手，系统命令开销可忽略。
+/// IOKit 电源源事件上下文：回调里立即采一帧快照推送。
+struct PowerNotify { tx: mpsc::Sender<Snapshot>, ctx: egui::Context }
+
+/// 电源源变化回调（插拔电源、充放电状态/电量变化时系统立即触发）。
+/// 参考 status-trio（lingyired/status-trio）的事件驱动方案：通知一到就采样，
+/// 延迟从最多 1.5s 轮询降到毫秒级；采样失败不影响轮询兜底。
+unsafe extern "C" fn on_power_change(context: *mut std::ffi::c_void) {
+    let state = &*(context as *const PowerNotify);
+    let (battery, charging) = power();
+    let snap = Snapshot { battery, charging, volume: volume(), network: network(), idle: idle_seconds() };
+    let _ = state.tx.send(snap);
+    state.ctx.request_repaint();
+}
+
+/// 后台采样。每 1.5 秒一次兜底轮询；充放电变化另有 IOKit IOPS 事件通知
+/// 线程即时推送（见 `on_power_change`），两层保证「无延迟」。
 pub fn start(ctx: egui::Context) -> Receiver<Snapshot> {
     let (tx, rx) = mpsc::channel();
+    {
+        let tx = tx.clone();
+        let ctx = ctx.clone();
+        let _ = std::thread::Builder::new().name("islandhop-power-notify".into()).spawn(move || unsafe {
+            #[link(name = "IOKit", kind = "framework")]
+            extern "C" {
+                fn IOPSNotificationCreateRunLoopSource(
+                    callback: unsafe extern "C" fn(*mut std::ffi::c_void),
+                    context: *mut std::ffi::c_void,
+                ) -> *mut std::ffi::c_void;
+            }
+            #[link(name = "CoreFoundation", kind = "framework")]
+            extern "C" {
+                fn CFRunLoopGetCurrent() -> *mut std::ffi::c_void;
+                fn CFRunLoopAddSource(rl: *mut std::ffi::c_void, source: *mut std::ffi::c_void, mode: *const std::ffi::c_void);
+                fn CFRunLoopRun();
+                /// 必须用真正的 CFString 常量：运行循环模式按 CFString 指针/内容识别，
+                /// 传裸 C 字符串会在 CFRunLoopAddSource 里直接崩溃（实测 SIGTRAP）。
+                static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+            }
+            let state = Box::into_raw(Box::new(PowerNotify { tx, ctx })).cast::<std::ffi::c_void>();
+            let source = IOPSNotificationCreateRunLoopSource(on_power_change, state);
+            if source.is_null() { return; } // 注册失败也不影响轮询兜底
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
+            CFRunLoopRun();
+        });
+    }
     let _ = std::thread::Builder::new().name("islandhop-mac-sys".into()).spawn(move || loop {
         let (battery, charging) = power();
         let snap = Snapshot { battery, charging, volume: volume(), network: network(), idle: idle_seconds() };

@@ -40,7 +40,11 @@ pub const WEATHER_PAGE: usize = 8;
 pub(crate) const WEATHER_H: f32 = 232.0;
 pub(crate) const CALENDAR_H: f32 = 216.0;
 pub const BAR_W: f32 = 163.0; // 收起药丸宽
-pub const BAR_H: f32 = 30.0; // 收起药丸高
+pub const BAR_H: f32 = 30.0; // 收起药丸高（macOS 上被 bar_h() 覆盖，此值为兜底）
+/// 岛体实际高度：macOS 上与系统菜单栏**完全一致**（刘海机型约 37-38pt，
+/// 普通机型约 24-25pt），用户要求岛高不能比菜单栏矮一节，否则菜单栏下缘
+/// 部分区域点不到。其余平台/测试环境用 BAR_H 兜底。
+pub fn bar_h() -> f32 { crate::mac_window::menu_bar_height().unwrap_or(BAR_H) }
 pub(crate) const HUD_W: f32 = 260.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
@@ -811,7 +815,7 @@ impl App {
         });
         let settings = model::Settings::load();
         let clipboard_on = settings.clipboard_history;
-        let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, BAR_H) };
+        let (bw, bh) = if settings.minimal { (BAR_W_MIN, BAR_H_MIN) } else { (BAR_W, bar_h()) };
         let focus_seconds=settings.focus_minutes as f32*60.0;
         let initial_lyrics=settings.lyrics_enabled;
         let initial_page=settings.page_order.iter().copied().find(|page|settings.visible_pages[*page]).unwrap_or(0);
@@ -1642,12 +1646,12 @@ impl App {
             return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.pending_messengers.is_empty()));
         }
         if self.island_lyrics_active() {
-            (self.lyric_bar_width(),BAR_H)
+            (self.lyric_bar_width(),bar_h())
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
             // 有刘海 Mac：岛体向下延长，把整行常驻内容（含充放电）放到刘海下方。
-            (self.resident.target.width.min(WIN_W-32.0), BAR_H + self.resident.target.notch_y)
+            (self.resident.target.width.min(WIN_W-32.0), bar_h() + self.resident.target.notch_y)
         }
     }
 
@@ -1731,13 +1735,13 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS 有刘海机型走**另一套**灵动岛布局：岛体向下延长，常驻内容整行
-        // 落到刘海下方的可见区（含充放电信息），并隐藏时钟（系统菜单栏已有）。
-        // Windows / 无刘海 Mac 保持上游的顶边胶囊布局，两端不共用一套做法。
-        if let Some((gap, notch_h)) = crate::mac_window::notch_layout() {
-            if !self.side() && !self.effective_minimal() && !self.island_lyrics_active() {
-                layout.notch_shelf(gap, notch_h);
-            }
+        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠，
+        // 右=AI额度+天气（+音乐/专注/铃铛）；时钟隐藏。刘海机型中间留物理空洞，
+        // 胶囊机型用固定间距替代。Windows 与测试环境（menu_bar_height=None）不启用。
+        if !self.side() && !self.effective_minimal() && !self.island_lyrics_active()
+            && crate::mac_window::menu_bar_height().is_some() {
+            let gap = crate::mac_window::notch_layout().map(|(gap, _)| gap).unwrap_or(0.0);
+            layout.notch_slots(gap);
         }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {
@@ -1873,7 +1877,7 @@ impl App {
         let minimal_pill = self.effective_minimal() && !self.island_lyrics_active() && self.notice.is_none() && self.t>=self.notification_bell_until && pc < 0.02;
         let flare = if minimal_pill || pill { 0.0 } else { lerp(5.0, FLARE, pc) };
         let k = (w / PW).clamp(0.3, 1.1);
-        let thickness = if side { crate::side_dock::SIDE_BAR_W } else { BAR_H };
+        let thickness = if side { crate::side_dock::SIDE_BAR_W } else { bar_h() };
         let radius = if minimal_pill { BAR_H_MIN / 2.0 } else if pill { (w.min(h) * 0.5).min(lerp(thickness * 0.5, 26.0, pc)) } else { lerp(12.5, RAD * k.min(1.0), pc) };
         let flare_h = lerp(8.0, FLARE_H, pc);
         let thick = glass::thickness(PH);
@@ -1949,7 +1953,7 @@ impl App {
                     paint::bell(&c.scaled(18.0,15.0,0.85),18.0,15.0,theme::WHITE,paint::bell_swing(self.t-a.at));
                     c.circle(22.0,10.5,2.0,Color32::from_rgb(255,72,72));
                 }else{crate::extras::notice_badge(&c,18.0,15.0,&a);}
-                let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,36.0,BAR_H,"notice-badge"),format!("{}\n{}",a.title,a.body));
+                let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,36.0,bar_h(),"notice-badge"),format!("{}\n{}",a.title,a.body));
                 if button.clicked(){self.notice_details=!self.notice_details;}
             }else if self.t<self.notification_bell_until {
                 paint::bell(&c.scaled(20.0,14.0,1.2),20.0,14.0,theme::WHITE,paint::bell_swing(self.t-self.notification_bell_at));
@@ -1985,7 +1989,7 @@ impl App {
         }
         let pet_alpha=self.pet_a*(1.0-smoothstep(0.0,0.3,pc));
         if pet_alpha>0.004 && !minimal_pill {
-            let y=(h.min(self.base_size().1)-BAR_H).max(0.0)/2.0;
+            let y=(h.min(self.base_size().1)-bar_h()).max(0.0)/2.0;
             // 吉祥物跟随皮肤换色：浅色底上变成深色版本，保持清晰。
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             // 吉祥物与常驻行一起下移到刘海下方，收起态才不会一半被物理刘海挡住。
@@ -2199,13 +2203,13 @@ impl App {
         if scale<0.02 || self.open && (self.calendar.draft.is_some() || self.task_dialog.is_some()){return None;}
         let side_column=self.side() && self.notice.is_none();
         let length=self.unread_stack_len(!side_column);
-        let (width,height)=if side_column {(32.0,length)}else{(length,BAR_H)};
+        let (width,height)=if side_column {(32.0,length)}else{(length,bar_h())};
         let (width,height)=(width*scale,height*scale);
         let (x,y)=if side_column {
             (panel.center().x-width/2.0,panel.bottom())
         }else{
             let right=panel.right()+self.notice_width.pos;
-            let y=if self.notice.is_some() && !self.compact_notices(){panel.center().y-BAR_H/2.0}else{panel.top()};
+            let y=if self.notice.is_some() && !self.compact_notices(){panel.center().y-bar_h()/2.0}else{panel.top()};
             (if right+width<=bounds.right(){right}else{panel.left()-width},y)
         };
         Some(Rect::from_min_size(Pos2::new(x,y),Vec2::new(width,height)))
@@ -2264,7 +2268,7 @@ impl App {
         }
         // 每个来源图标右上角一个小红点，不显示数字。
         for k in 0..icons {let (x,y)=at(k);c.circle(x+8.0,y-7.0,2.6,Color32::from_rgb(255,59,48));}
-        let (w,h)=if horizontal {(self.unread_stack_len(true),BAR_H)}else{(32.0,self.unread_stack_len(false))};
+        let (w,h)=if horizontal {(self.unread_stack_len(true),bar_h())}else{(32.0,self.unread_stack_len(false))};
         if count==1 {
             let u=self.pending_messengers[0];
             let button=c.hit(0.0,0.0,w,h,u.source.name()).on_hover_text(format!("查看{}",u.source.name()));
@@ -2284,7 +2288,7 @@ impl App {
     fn notice_rect(&self,cx:f32,top:f32)->Option<Rect>{
         if !self.compact_notices(){return None;}
         let width=self.notice_width.pos-8.0;
-        (width>0.5).then(||Rect::from_min_size(Pos2::new(cx+self.w.pos/2.0+8.0,top),Vec2::new(width,BAR_H)))
+        (width>0.5).then(||Rect::from_min_size(Pos2::new(cx+self.w.pos/2.0+8.0,top),Vec2::new(width,bar_h())))
     }
     fn notice_details_rect(&self,cx:f32,top:f32)->Option<Rect>{
         let a=self.hud_notice.as_ref().filter(|_|self.notice_details&&self.notice.is_some())?;
@@ -2591,7 +2595,7 @@ impl App {
             let content_width=self.lyric_bar_width()-self.lyric_focus_space();
             let width=self.w.pos.max(content_width);
             let left=local_cx-width/2.0;
-            let center_y=BAR_H/2.0;
+            let center_y=bar_h()/2.0;
             if let Some((image,texture))=&self.music_artwork {
                 let [width,height]=image.size;
                 let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};
@@ -2620,9 +2624,9 @@ impl App {
         if lyric_alpha>=0.997 {return;}
         let header=base.faded(1.0-lyric_alpha);
         let base=&header;
-        // macOS 有刘海机型：灵动岛里不显示时间（系统菜单栏右上角本来就有），
-        // 收起态与展开态顶栏都不重复画；天气徽标仍保留。
-        let clock = if self.resident.target.notch_y > 0.0 {
+        // macOS（含刘海与胶囊两种岛形）：灵动岛里不显示时间（系统菜单栏右上角
+        // 本来就有），收起态与展开态顶栏都不重复画；天气徽标仍保留。
+        let clock = if crate::mac_window::menu_bar_height().is_some() {
             String::new()
         } else {
             self.settings.clock_text(&env.clock)

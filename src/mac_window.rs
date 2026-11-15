@@ -261,7 +261,30 @@ mod imp {
             Some((frame.origin.x as f32, top as f32))
         }
     }
+
+    /// 系统菜单栏高度：主屏 frame 与 visibleFrame（去掉菜单栏/程序坞后的可见区）之差。
+    pub fn menu_bar_height() -> Option<f32> {
+        unsafe {
+            let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            if screen.is_null() { return None }
+            let frame: NSRect = msg_send![screen, frame];
+            let visible: NSRect = msg_send![screen, visibleFrame];
+            let h = frame.size.height - visible.size.height;
+            // 合理性护栏：菜单栏高度只可能是几十个点；Dock 在左侧时差值会异常大。
+            (h > 10.0 && h < 64.0).then(|| h as f32)
+        }
+    }
 }
+
+/// macOS 系统菜单栏高度（逻辑点）：刘海机型约 37-38，普通机型约 24-25。
+/// 取 `NSScreen.mainScreen` 的 frame 与 visibleFrame 高度差。
+/// 岛体高度必须与菜单栏完全一致，否则矮一节、菜单栏下缘的部分区域点不到。
+/// 测试构建返回 None（调用方退回 BAR_H 兜底值，与 notch_layout 同一隔离策略）。
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn menu_bar_height() -> Option<f32> { imp::menu_bar_height() }
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn menu_bar_height() -> Option<f32> { None }
 
 /// 主窗口左上角的全局逻辑坐标（顶层转发，实现见 `imp`）。
 #[cfg(target_os = "macos")]

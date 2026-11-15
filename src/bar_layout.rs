@@ -86,76 +86,48 @@ impl Layout {
     }
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
-    /// 刘海机型专用：在中心留出 `gap` 宽的空洞（物理刘海），把常驻组件按
-    /// 原有顺序分成左右两组，**各自紧靠刘海边缘重新排布**，并把胶囊总宽
-    /// 重算成「刘海 + 左组 + 右组 + 边距」。
+    /// **macOS 专用**（刘海与胶囊两种岛形共用）：常驻行按固定槽位左右分列——
+    /// **左组＝电源 + 吉祥宠；右组＝AI 额度环 + 天气 + 音乐 + 专注 + 铃铛**。
+    /// 时钟隐藏（macOS 右上角系统菜单栏本来就有时间，岛里不重复显示）。
     ///
-    /// 旧实现只是把每个 x 平移 ±gap/2，压在中心的组件还额外推 w/2，导致
-    /// 右侧时钟与天气叠在一起、最右内容溢出胶囊边界（用户截图里的
-    /// 「16:20☀20° 重叠 / 界面显示不完整」）。无刘海机型不调用本函数，
-    /// 上游录制测试看到的布局保持原样。
-    pub fn notch_split(&mut self, gap: f32) {
-        if gap <= 0.0 { return; }
-        const PAD: f32 = 14.0;   // 刘海边缘到第一个图标
-        const EDGE: f32 = 16.0;  // 图标组到胶囊圆角
-        const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
-        let mut items: Vec<(usize, f32, f32)> = self.x.iter().enumerate()
-            .filter_map(|(i, x)| x.map(|cx| (i, cx, self.widths.get(i).copied().unwrap_or(0.0))))
-            .collect();
-        if items.is_empty() { return; }
-        items.sort_by(|a, b| a.1.total_cmp(&b.1));
-        // 前半放刘海左侧、后半放右侧；组件少时左侧至少留一个，右侧至少留一个，
-        // 保证两边都有内容可见。只有时钟的极端情况全部放右侧。
-        let cut = if items.len() < 2 { 0 } else { items.len().div_ceil(2).min(items.len() - 1) };
-        let group_width = |group: &[(usize, f32, f32)]| -> f32 {
-            group.iter().map(|(_, _, w)| *w).sum::<f32>()
-                + SPACE * group.len().saturating_sub(1) as f32
-        };
-        let left_w = group_width(&items[..cut]);
-        let right_w = group_width(&items[cut..]);
-        let half = gap / 2.0;
-        // 左组右对齐到 -half-PAD，按原顺序向左排。
-        let mut cursor = -half - PAD - left_w;
-        for &(i, _, w) in &items[..cut] {
-            self.x[i] = Some(cursor + w / 2.0);
-            cursor += w + SPACE;
-        }
-        // 右组左对齐到 +half+PAD，按原顺序向右排。
-        let mut cursor = half + PAD;
-        for &(i, _, w) in &items[cut..] {
-            self.x[i] = Some(cursor + w / 2.0);
-            cursor += w + SPACE;
-        }
-        self.width = gap + 2.0 * (PAD + EDGE) + left_w + right_w;
-    }
-    /// **macOS 刘海机型专用**（Windows / 无刘海机型不调用）。
-    ///
-    /// 与 `notch_split` 的「左右分列、中间留洞」不同，这里改成真正的 macOS 灵动岛：
-    /// 岛体向下延长，常驻内容排成**一整行放到刘海下方**（物理刘海下面那块可见区域），
-    /// 而不是挤在顶部菜单栏里被刘海挡住。中心区域不再放任何图标。
-    ///
-    /// 另外隐藏时钟：macOS 右上角系统菜单栏本来就显示时间，刘海里不重复显示。
-    pub fn notch_shelf(&mut self, gap: f32, notch_h: f32) {
-        // 时间交给系统菜单栏，刘海里的时钟槽位直接撤掉（天气徽标保留）。
+    /// 有刘海机型在中间留出物理刘海空洞（gap=刘海宽+呼吸位）；胶囊模式
+    /// gap=0，两组之间用固定视觉间距替代。弹窗类（歌词 / 充放电 / 实时状态）
+    /// 仍在岛体下方延伸弹出，不受本布局影响。
+    pub fn notch_slots(&mut self, gap: f32) {
+        // 时间交给系统菜单栏，时钟槽位撤掉；天气槽位独立保留（原与时钟成组）。
         self.x[CLOCK] = None;
-        const EDGE: f32 = 16.0;
-        const SPACE: f32 = 12.0;
-        let mut items: Vec<(usize, f32, f32)> = self.x.iter().enumerate()
-            .filter_map(|(i, x)| x.map(|cx| (i, cx, self.widths.get(i).copied().unwrap_or(0.0))))
-            .collect();
-        if items.is_empty() { return; }
-        items.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let row_w: f32 = items.iter().map(|(_, _, w)| *w).sum::<f32>()
-            + SPACE * items.len().saturating_sub(1) as f32;
-        let mut cursor = -row_w / 2.0;
-        for &(i, _, w) in &items {
-            self.x[i] = Some(cursor + w / 2.0);
-            cursor += w + SPACE;
+        const PAD: f32 = 14.0;   // 空洞边缘到第一个图标
+        const EDGE: f32 = 16.0;  // 图标组到岛体圆角
+        const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
+        // 胶囊模式没有物理刘海，两组之间留固定视觉间距。
+        let hole = if gap > 0.0 { gap } else { 48.0 };
+        let left: Vec<usize> = [BATTERY, PET].iter().copied().filter(|&i| self.x[i].is_some()).collect();
+        let right: Vec<usize> = self.quota_slots()
+            .chain([WEATHER, MUSIC, FOCUS, BELL])
+            .filter(|&i| self.x[i].is_some()).collect();
+        if left.is_empty() && right.is_empty() { return; }
+        let group_width = |slots: &[usize]| -> f32 {
+            slots.iter().map(|&i| self.widths[i]).sum::<f32>()
+                + SPACE * slots.len().saturating_sub(1) as f32
+        };
+        let left_w = group_width(&left);
+        let right_w = group_width(&right);
+        let half = hole / 2.0;
+        // 左组右对齐到空洞左缘，按 [电源, 吉祥宠] 顺序向左排。
+        let mut cursor = -half - PAD - left_w;
+        for &i in &left {
+            self.x[i] = Some(cursor + self.widths[i] / 2.0);
+            cursor += self.widths[i] + SPACE;
         }
-        // 胶囊至少覆盖整个物理刘海宽度，看起来才像从刘海长出来的岛；
-        // 同时不超过透明画布，避免被裁切。
-        self.width = (row_w + 2.0 * EDGE).max(gap).min(crate::app::WIN_W - 32.0);
-        self.notch_y = notch_h + 6.0;
+        // 右组左对齐到空洞右缘，按 [额度环…, 天气, …] 顺序向右排。
+        let mut cursor = half + PAD;
+        for &i in &right {
+            self.x[i] = Some(cursor + self.widths[i] / 2.0);
+            cursor += self.widths[i] + SPACE;
+        }
+        self.width = (hole + 2.0 * (PAD + EDGE) + left_w + right_w).max(96.0);
+        // 常驻行保持在菜单栏高度内，不再下挂（下挂方案已废弃）。
+        self.notch_y = 0.0;
     }
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}

@@ -6,6 +6,17 @@ const REPOSITORY: &str = "https://github.com/thuki20/IslandHop";
 const API: &str = "https://api.github.com/repos/thuki20/IslandHop/releases/latest";
 const RELEASES: &str = "https://github.com/thuki20/IslandHop/releases/latest";
 const BACKUP_DOWNLOAD: &str = "https://github.com/thuki20/IslandHop/releases/latest";
+/// 云端私有更新源（自有服务器）：迭代后把 `IslandHop-v*版本*-macos.zip` 与
+/// `manifest.json`（version/notes/url/sha256/size）用 packaging/push-update.sh
+/// 推上去，客户端启动即自动检查、应用内下载并覆盖安装，无需逐台手动替换。
+/// 路径借用 nginx 的 acme-challenge 静态目录（唯一无需 sudo 的可写出口），
+/// 走 http；完整性由 manifest 的 sha256 保证。可用环境变量
+/// `ISLANDHOP_FEED_URL` 覆盖（测试/灰度用）。
+const FEED_URL: &str = "http://203.195.201.85/.well-known/acme-challenge/islandhop/manifest.json";
+
+fn feed_url() -> String { std::env::var("ISLANDHOP_FEED_URL").unwrap_or_else(|_| FEED_URL.to_string()) }
+/// feed 的基地址（去 manifest.json），用于允许对自有源走 http 下载。
+fn feed_base() -> String { feed_url().split("manifest.json").next().unwrap_or("").to_string() }
 
 #[derive(Clone, Debug)]
 struct Release { version: String, notes: String, page: String, package: Option<Package> }
@@ -23,6 +34,8 @@ pub(crate) struct State {
     dialog_open: bool,
     focus_requested: bool,
     logo: Option<egui::TextureHandle>,
+    /// 启动后的自动检查只做一次（每次运行一个生命周期）。
+    auto_checked: bool,
 }
 
 impl Drop for State {
@@ -31,6 +44,15 @@ impl Drop for State {
 
 impl State {
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+        // 启动后自动检查一次更新：发现新版本直接弹更新窗（与手动检查一致）。
+        // 测试构建不自动检查，避免录制测试联网。
+        #[cfg(not(test))]
+        if !self.auto_checked && self.rx.is_none() && self.result.is_none() {
+            self.auto_checked = true;
+            let (tx, rx) = mpsc::channel(); self.rx = Some(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || { let _ = tx.send(Event::Checked(check())); ctx.request_repaint(); });
+        }
         loop {
             let event = match self.rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(event)) => event,
@@ -302,6 +324,12 @@ fn http_agent() -> Result<ureq::Agent, String> {
 }
 
 fn check() -> Result<Option<Release>, String> {
+    // macOS 优先走自有云端 feed（无 GitHub Release 依赖）；feed 不可达再回退 GitHub。
+    #[cfg(target_os = "macos")]
+    match check_feed() {
+        Ok(found) => return Ok(found),
+        Err(_) => {}
+    }
     let response = http_agent()?
         .get(API).set("User-Agent", concat!("IslandHop/", env!("CARGO_PKG_VERSION")))
         .set("Accept", "application/vnd.github+json").call().map_err(|error| match error {
@@ -312,6 +340,38 @@ fn check() -> Result<Option<Release>, String> {
     let value: serde_json::Value = serde_json::from_reader(response.into_reader())
         .map_err(|_| "更新信息格式异常，请稍后重试".to_owned())?;
     release_info(&value, env!("CARGO_PKG_VERSION"))
+}
+
+/// 云端 feed 检查（macOS OTA）。manifest 格式：
+/// `{"version":"0.6.65","notes":"- …","url":"…/IslandHop-v0.6.65-macos.zip","sha256":"…","size":123}`
+/// version 不比本地新返回 Ok(None)；url/sha256/size 齐全才允许应用内安装。
+#[cfg(target_os = "macos")]
+fn check_feed() -> Result<Option<Release>, String> {
+    let response = http_agent()?
+        .get(&feed_url()).set("User-Agent", concat!("IslandHop/", env!("CARGO_PKG_VERSION")))
+        .call().map_err(|_| "feed 不可达".to_owned())?;
+    let value: serde_json::Value = serde_json::from_reader(response.into_reader())
+        .map_err(|_| "feed 清单格式异常".to_owned())?;
+    parse_feed(&value, env!("CARGO_PKG_VERSION"))
+}
+
+/// feed 清单解析（纯函数，单测覆盖）：version 不比本地新返回 Ok(None)；
+/// url/sha256/size 合法齐全才允许应用内安装（package=None 时仅提示）。
+#[cfg(target_os = "macos")]
+fn parse_feed(value: &serde_json::Value, current: &str) -> Result<Option<Release>, String> {
+    let ver = value["version"].as_str().ok_or("feed 清单缺少 version")?;
+    let latest = version(ver).ok_or("feed 清单 version 格式异常")?;
+    let current = version(current).ok_or("本地版本号异常")?;
+    if latest <= current { return Ok(None); }
+    let package = match (value["url"].as_str(), value["sha256"].as_str(), value["size"].as_u64()) {
+        (Some(url), Some(hash), Some(size)) if url.starts_with("http")
+            && hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit())
+            && size > 0 && size <= 200 * 1024 * 1024 =>
+            Some(Package { url: url.to_owned(), size, hash: hash.to_ascii_lowercase() }),
+        _ => None,
+    };
+    Ok(Some(Release { version: format!("v{ver}"), notes: value["notes"].as_str().unwrap_or("").to_owned(),
+        page: REPOSITORY.to_owned(), package }))
 }
 
 fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Release>, String> {
@@ -332,13 +392,15 @@ fn release_info(value: &serde_json::Value, current: &str) -> Result<Option<Relea
 
 fn download(release: &Release, tx: &mpsc::Sender<Event>, cancel: &AtomicBool) -> Result<PathBuf, String> {
     let package = release.package.as_ref().ok_or("请通过浏览器下载此版本")?;
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).ok_or("无法找到更新缓存目录")?.join("IslandHop/Updates");
+    let root = update_cache_root()?;
     let work = root.join(format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
     std::fs::create_dir_all(&work).map_err(|_| "无法创建更新缓存")?;
     let result = (|| {
         let response = http_agent()?
             .get(&package.url).call().map_err(|_| "连接下载服务器失败，请检查网络或代理，或使用网盘下载")?;
-        if !response.get_url().starts_with("https://") { return Err("更新下载未使用安全连接".into()); }
+        // GitHub 必须走 https；自有云端 feed（feed_base 前缀）允许 http（内网自托管）。
+        let url = response.get_url();
+        if !url.starts_with("https://") && !url.starts_with(&feed_base()) { return Err("更新下载未使用安全连接".into()); }
         let mut input = response.into_reader();
         let mut output = std::fs::File::create(work.join("update.zip")).map_err(|_| "无法保存更新包")?;
         transfer(&mut input, &mut output, package, cancel, |progress| { let _ = tx.send(Event::Progress(progress)); })?;
@@ -369,6 +431,16 @@ fn transfer(input: &mut impl Read, output: &mut impl Write, package: &Package, c
     Ok(())
 }
 
+/// 更新包缓存目录：Windows 用 %LOCALAPPDATA%，macOS 用 ~/Library/Caches。
+fn update_cache_root() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    { return std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        .map(|root| root.join("IslandHop/Updates")).ok_or_else(|| "无法找到更新缓存目录".to_owned()); }
+    #[cfg(not(windows))]
+    { return std::env::var_os("HOME").map(PathBuf::from)
+        .map(|root| root.join("Library/Caches/IslandHop/Updates")).ok_or_else(|| "无法找到更新缓存目录".to_owned()); }
+}
+
 #[cfg(windows)]
 fn launch_installer(work: &std::path::Path) -> Result<(), String> {
     let target = std::env::current_exe().map_err(|_| "无法找到当前程序")?;
@@ -387,7 +459,60 @@ fn launch_installer(work: &std::path::Path) -> Result<(), String> {
     let _ = child.kill();
     Err(std::fs::read_to_string(work.join("error.txt")).unwrap_or_else(|_| "无法准备安装，请通过浏览器下载后安装".into()))
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn launch_installer(work: &std::path::Path) -> Result<(), String> {
+    use std::process::Command;
+    // 当前 .app 包路径（如 /Applications/IslandHop.app）。
+    let exe = std::env::current_exe().map_err(|_| "无法找到当前程序".to_owned())?;
+    let target = exe.ancestors()
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
+        .map(PathBuf::from).ok_or("无法定位应用包".to_owned())?;
+    // 先在缓存目录解压验证，再交给覆盖脚本换包，失败不影响现有安装。
+    let new_dir = work.join("new");
+    std::fs::create_dir_all(&new_dir).map_err(|_| "无法创建解压目录".to_owned())?;
+    let status = Command::new("/usr/bin/ditto").args(["-x", "-k"])
+        .arg(work.join("update.zip")).arg(&new_dir).status().map_err(|_| "无法解压更新包".to_owned())?;
+    if !status.success() { return Err("更新包解压失败，请重新下载".into()); }
+    if !new_dir.join("IslandHop.app").is_dir() { return Err("更新包里没有 IslandHop.app".into()); }
+    // 覆盖脚本：先预检并写 ready 放行主程序退出，等父进程退出后换包重启。
+    let script = format!(
+r#"#!/bin/bash
+# IslandHop macOS 覆盖更新
+TARGET="{target}"
+WORK="{work}"
+BACKUP="$TARGET.old"
+if [ ! -w "$(dirname "$TARGET")" ]; then echo "安装目录不可写" > "$WORK/error.txt"; echo fail > "$WORK/ready"; exit 1; fi
+echo ok > "$WORK/ready"
+for i in $(seq 1 150); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done
+sleep 0.5
+rm -rf "$BACKUP"
+if ! mv "$TARGET" "$BACKUP"; then echo "无法移走当前版本" > "$WORK/error.txt"; exit 1; fi
+if ! mv "$WORK/new/IslandHop.app" "$TARGET"; then mv "$BACKUP" "$TARGET"; echo "无法放入新版本，已还原" > "$WORK/error.txt"; exit 1; fi
+open "$TARGET"
+rm -rf "$BACKUP"
+"#, target = target.display(), work = work.display(), pid = std::process::id());
+    let script_path = work.join("apply.sh");
+    std::fs::write(&script_path, script).map_err(|_| "无法准备更新脚本".to_owned())?;
+    let mut command = Command::new("/bin/bash");
+    command.arg(&script_path);
+    let mut child = crate::child_process::spawn(&mut command)
+        .map_err(|_| "无法启动更新程序".to_owned())?;
+    // 脚本先确认安装目录可写（写 ready），再允许主程序退出。
+    for _ in 0..100 {
+        if work.join("ready").exists() {
+            let ok = std::fs::read_to_string(work.join("ready")).unwrap_or_default().trim() == "ok";
+            return if ok { Ok(()) } else {
+                Err(std::fs::read_to_string(work.join("error.txt")).unwrap_or_else(|_| "无法准备安装".into()))
+            };
+        }
+        if child.try_wait().ok().flatten().is_some() { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    Err("无法准备安装，请通过浏览器下载".into())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn launch_installer(_: &std::path::Path) -> Result<(), String> { Err("仅支持 Windows 应用内更新".into()) }
 
 fn version(value: &str) -> Option<[u64; 3]> {
@@ -490,6 +615,32 @@ mod tests {
         for tag in ["v0.6.39", "v0.6.9", "v0.5.99"] {
             assert_eq!(parse_release(&release(tag), "0.6.39"), Ok(None));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn feed_manifest_parsing_requires_newer_version_and_valid_package() {
+        let base = serde_json::json!({
+            "version": "0.6.65", "notes": "- 修复",
+            "url": "http://203.195.201.85/.well-known/acme-challenge/islandhop/IslandHop-v0.6.65-macos.zip",
+            "sha256": "a".repeat(64), "size": 12345,
+        });
+        let parsed = parse_feed(&base, "0.6.64").unwrap().unwrap();
+        assert_eq!(parsed.version, "v0.6.65");
+        assert_eq!(parsed.notes, "- 修复");
+        assert!(parsed.package.as_ref().is_some_and(|p| p.size == 12345 && p.hash.len() == 64));
+        // 同版本/更老版本不更新。
+        assert!(parse_feed(&base, "0.6.65").unwrap().is_none());
+        assert!(parse_feed(&base, "1.0.0").unwrap().is_none());
+        // 缺字段/非法字段：仍提示有新版本，但不允许应用内安装。
+        for field in ["url", "sha256", "size"] {
+            let mut bad = base.clone(); bad[field] = serde_json::Value::Null;
+            assert!(parse_feed(&bad, "0.6.64").unwrap().unwrap().package.is_none(), "{field}");
+        }
+        let mut short = base.clone(); short["sha256"] = "ab".into();
+        assert!(parse_feed(&short, "0.6.64").unwrap().unwrap().package.is_none());
+        let mut missing = base.clone(); missing["version"] = serde_json::Value::Null;
+        assert!(parse_feed(&missing, "0.6.64").is_err());
     }
     #[test]
     fn rejects_invalid_and_unpublished_releases() {
