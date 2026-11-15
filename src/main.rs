@@ -491,7 +491,7 @@ impl eframe::App for Shell {
             let scale=self.app.settings.island_scale();
             // OLED 像素偏移：与 Windows 同一套时间表，收起静止时逐像素挪；macOS 的
             // 定位是自己算 OuterPosition，所以这里把位移叠进坐标并纳入 placement_key。
-            let shift=if self.app.settings.oled_shift && !self.hidden && self.app.oled_shift_idle(ctx) {
+            let shift=if self.app.settings.oled_shift && self.app.oled_shift_idle(ctx) {
                 ctx.request_repaint_after(daozai::oled_shift::until_next_step(self.t0.elapsed()));
                 daozai::oled_shift::toward(self.mac_shift,daozai::oled_shift::shift(true,self.app.settings.dock,self.t0.elapsed()))
             } else {self.mac_shift};
