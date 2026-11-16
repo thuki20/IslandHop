@@ -194,11 +194,12 @@ pub mod autostart {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
     <key>Label</key><string>{LABEL}</string>
-    <key>ProgramArguments</key><array><string>{exe}</string></array>
+    <key>ProgramArguments</key><array><string>{}</string></array>
     <key>RunAtLoad</key><true/>
     <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
-"#
+"#,
+                exe.display()
             );
             std::fs::write(&path, plist).map_err(|e| format!("写 LaunchAgent 失败：{e}"))?;
             let _ = std::process::Command::new("/bin/launchctl").args(["load", &path_text]).output();
