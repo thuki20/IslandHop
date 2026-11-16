@@ -238,7 +238,9 @@ impl Shell {
             native: daozai::native::Window::new(cc),
             #[cfg(windows)]
             tray,
-            #[cfg(windows)]
+            // autostart 字段全平台存在（Windows 读 HKCU\Run、macOS 读 LaunchAgent），
+            // 值已在上方按平台分别初始化；此前误加 cfg(windows) 导致 macOS bin 编译
+            // 报 E0063 missing field，而 CI 只跑 cargo test --lib 一直没暴露。
             autostart,
             #[cfg(windows)]
             bt_rx: None,
