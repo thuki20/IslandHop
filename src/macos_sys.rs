@@ -322,6 +322,28 @@ fn adapter_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     (script.is_file() && framework.is_dir()).then(|| (script, framework))
 }
 
+/// 通过 mediaremote-adapter 向系统「正在播放」应用下发播放控制。
+/// 修复此前 macOS 上 control()/seek() 是空实现——点播放/上下曲/拖进度条全部无效，
+/// worker 还返回成功，配合快速轮询导致界面状态卡住（需去播放器手动操作才恢复）。
+/// 返回 true 仅表示命令成功下发；适配器缺位（开发机直跑）或执行失败返回 false。
+pub fn media_control(cmd: crate::smtc::Transport) -> bool {
+    let (script, framework) = match adapter_paths() {
+        Some(paths) => paths,
+        None => return false,
+    };
+    let (sub, arg) = match crate::smtc::transport_to_adapter(&cmd) {
+        Some(v) => v,
+        None => return false,
+    };
+    Command::new("/usr/bin/perl")
+        .arg(&script)
+        .arg(&framework)
+        .args([sub, arg.as_str()])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 /// 用 mediaremote-adapter 读系统「正在播放」（macOS 15.4+ 对第三方封锁了
 /// MediaRemote；该工具借 /usr/bin/perl 的可信身份 com.apple.perl5 调用，
 /// 因此网易云、QQ音乐等任意播放器都能读到，含播放位置）。

@@ -410,6 +410,52 @@ pub enum Transport {
     SetMute(bool),
 }
 
+/// 播放控制 → mediaremote-adapter 子命令与参数。跨平台纯函数，便于在 Windows 上单测。
+/// 命令码来自 packaging/mra/MediaRemoteAdapter.h 的 MRACommand：
+/// kMRATogglePlayPause=2 / kMRANextTrack=4 / kMRAPreviousTrack=5；seek 参数单位为微秒。
+/// 音量/静音走系统音量（osascript），不属于 MediaRemote 会话控制，返回 None。
+pub(crate) fn transport_to_adapter(cmd: &Transport) -> Option<(&'static str, String)> {
+    match cmd {
+        Transport::Toggle => Some(("send", "2".into())),
+        Transport::Next => Some(("send", "4".into())),
+        Transport::Prev => Some(("send", "5".into())),
+        Transport::Seek(seconds) if seconds.is_finite() && *seconds >= 0.0 => {
+            Some(("seek", ((*seconds * 1_000_000.0) as i64).to_string()))
+        }
+        Transport::Seek(_) | Transport::SetVolume(_) | Transport::SetMute(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod adapter_command_tests {
+    use super::*;
+
+    #[test]
+    fn transport_maps_to_adapter_commands() {
+        // 命令码必须与 MediaRemoteAdapter.h 的 MRACommand 一致，否则 Mac 上按了没反应。
+        assert_eq!(transport_to_adapter(&Transport::Toggle), Some(("send", "2".into())));
+        assert_eq!(transport_to_adapter(&Transport::Next), Some(("send", "4".into())));
+        assert_eq!(transport_to_adapter(&Transport::Prev), Some(("send", "5".into())));
+    }
+
+    #[test]
+    fn seek_maps_seconds_to_microseconds_and_rejects_invalid() {
+        assert_eq!(transport_to_adapter(&Transport::Seek(12.5)), Some(("seek", "12500000".into())));
+        assert_eq!(transport_to_adapter(&Transport::Seek(0.0)), Some(("seek", "0".into())));
+        // 负进度、NaN、无穷大不能下发，否则适配器会异常。
+        assert_eq!(transport_to_adapter(&Transport::Seek(-1.0)), None);
+        assert_eq!(transport_to_adapter(&Transport::Seek(f64::NAN)), None);
+        assert_eq!(transport_to_adapter(&Transport::Seek(f64::INFINITY)), None);
+    }
+
+    #[test]
+    fn volume_and_mute_are_not_media_remote_commands() {
+        // 音量/静音由系统音量处理，不应误走 MediaRemote 会话。
+        assert_eq!(transport_to_adapter(&Transport::SetVolume(50)), None);
+        assert_eq!(transport_to_adapter(&Transport::SetMute(true)), None);
+    }
+}
+
 type ControlRequest=(Transport,String,std::time::Instant,Option<std::sync::mpsc::SyncSender<bool>>);
 pub struct ControlWorker {requests:std::sync::mpsc::SyncSender<ControlRequest>}
 impl ControlWorker {
@@ -475,7 +521,13 @@ pub fn control(cmd: Transport,source:&str) {
 }
 
 #[cfg(not(windows))]
-pub fn control(_cmd: Transport,_source:&str) {}
+pub fn control(cmd: Transport,_source:&str) {
+    // macOS：mediaremote-adapter 下发播放/暂停/上下曲（此前为空实现，按钮全失效）。
+    #[cfg(target_os="macos")]
+    { let _ = crate::macos_sys::media_control(cmd); }
+    #[cfg(not(target_os="macos"))]
+    { let _ = cmd; }
+}
 
 /// 跳转在工作线程执行；专用回退必须回读实际位置，避免播放器接口假成功。
 #[cfg(windows)]
@@ -575,7 +627,14 @@ fn seek_apple(session:&windows::Media::Control::GlobalSystemMediaTransportContro
 }
 
 #[cfg(not(windows))]
-pub fn seek(_seconds:f64,_source:&str)->bool {false}
+pub fn seek(seconds:f64,_source:&str)->bool {
+    // macOS：mediaremote-adapter 的 seek 子命令（微秒）。返回真实执行结果，
+    // 让上层能据实提示"未适配"而不是空成功后界面卡住。
+    #[cfg(target_os="macos")]
+    { return crate::macos_sys::media_control(Transport::Seek(seconds)); }
+    #[cfg(not(target_os="macos"))]
+    { let _ = seconds; false }
+}
 
 fn seek_arrived(current:f64,target:f64,elapsed:f64)->bool {
     current.is_finite() && target.is_finite() && current>=target-3.0 && current<=target+elapsed+3.0
