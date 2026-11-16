@@ -2,8 +2,9 @@
 # 目标：push 到 main 即自动产出可安装的 Win 包，并挂到与 macOS 同一个 GitHub Release。
 #
 # 产物（dist/）：
-#   IslandHop-Setup-v<版本>-x64.exe     安装版（NSIS，日常下载这个）
+#   IslandHop-Setup-v<版本>-x64.exe     安装版（NSIS，日常下载这个：固定目录+快捷方式+覆盖升级保留数据）
 #   IslandHop-v<版本>-windows-x64.zip   便携版（解压即用，应用内更新也认这个包）
+#   manifest-windows.json               应用内更新清单（自有 feed 优先读它，url 指向 zip）
 #   SHA256SUMS.txt                      校验和
 #
 # 与 release-macos.yml 交替上传同一个 tag（v<版本>）的资产：谁先跑完谁先建
@@ -86,12 +87,16 @@ jobs:
         run: |
           $setup = "dist/IslandHop-Setup-v$env:VERSION-x64.exe"
           $zip = "dist/IslandHop-v$env:VERSION-windows-x64.zip"
-          foreach ($f in @($setup, $zip, "dist/SHA256SUMS.txt")) {
+          foreach ($f in @($setup, $zip, "dist/SHA256SUMS.txt", "dist/manifest-windows.json")) {
             if (-not (Test-Path $f)) { throw "缺少产物：$f" }
             $size = (Get-Item $f).Length
-            if ($size -lt 1MB -and $f -ne "dist/SHA256SUMS.txt") { throw "产物过小，疑似构建失败：$f ($size bytes)" }
+            if ($size -lt 1MB -and $f -ne "dist/SHA256SUMS.txt" -and $f -ne "dist/manifest-windows.json") { throw "产物过小，疑似构建失败：$f ($size bytes)" }
             Write-Output ("{0}  {1:N1} MB" -f $f, ($size / 1MB))
           }
+          $mf = Get-Content "dist/manifest-windows.json" -Raw | ConvertFrom-Json
+          $zipLeaf = [IO.Path]::GetFileName($zip)
+          if ($mf.version -ne $env:VERSION -or -not $mf.url.EndsWith($zipLeaf)) { throw "manifest-windows.json 版本或包名不符" }
+          if ($mf.sha256.Length -ne 64 -or $mf.size -le 0) { throw "manifest-windows.json 校验字段缺失" }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -100,6 +105,7 @@ jobs:
             dist/IslandHop-Setup-*.exe
             dist/IslandHop-*-windows-x64.zip
             dist/SHA256SUMS.txt
+            dist/manifest-windows.json
           retention-days: 30
           if-no-files-found: error
 
@@ -113,6 +119,7 @@ jobs:
             dist/IslandHop-Setup-*.exe
             dist/IslandHop-*-windows-x64.zip
             dist/SHA256SUMS.txt
+            dist/manifest-windows.json
           fail_on_unmatched_files: true
           overwrite_files: true
           # 必须标记为 Latest：≤0.6.77 的客户端只查 GitHub releases/latest，

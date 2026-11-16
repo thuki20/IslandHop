@@ -10,6 +10,25 @@
 
 ---
 
+## 下载与安装
+
+### Windows（推荐用安装版，不要用解压包）
+
+到 [Releases](https://github.com/thuki20/IslandHop/releases/latest) 下载 **`IslandHop-Setup-v<版本>-x64.exe`**，双击安装：
+
+- **固定安装目录**：默认 `%LOCALAPPDATA%\Programs\Daozai`，重跑安装包即原地覆盖升级，不会散落成多个文件夹。
+- **快捷方式可重建**：安装时自动创建桌面 + 开始菜单快捷方式；若日后删了桌面图标，重新运行一次安装包即可恢复（开始菜单入口也一直在）。
+- **数据不会丢**：设置、待办、账号、连接记录都存在 `%APPDATA%\Daozai`，与安装目录分离——覆盖安装、甚至卸载重装都保留。设置页有「打开本地数据目录」按钮可直接定位。
+- 无需管理员权限（per-user 安装）。想关掉桌面图标或自启，安装界面有开关，或用静默参数 `/DESKTOP=0` `/AUTOSTART=0`。
+
+> `IslandHop-v<版本>-windows-x64.zip` 是免安装便携版，仅给应用内自动更新使用；手动安装请用上面的 Setup exe。
+
+### macOS
+
+下载 `IslandHop-v<版本>-macos.zip`（或 `.dmg`），把 `IslandHop.app` 拖进 `/Applications` 再启动。数据目录 `~/Library/Application Support/IslandHop`。
+
+---
+
 ## TL;DR（2026-11-15 更新）
 
 | 阶段 | 状态 | 证据 |

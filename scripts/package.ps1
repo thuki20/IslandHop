@@ -54,6 +54,26 @@ try {
         $checksum = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
         "$checksum  $([IO.Path]::GetFileName($_))"
     } | Set-Content -LiteralPath (Join-Path $outputDirectory 'SHA256SUMS.txt') -Encoding ascii
+
+    # 应用内更新清单（客户端优先读自有 feed 的 manifest-windows.json）。
+    # url 指向 zip：update.ps1 按包内 daozai.exe 原地覆盖；Setup exe 只作用户
+    # 手动下载的安装入口（固定目录 + 快捷方式），不参与 OTA 解包。
+    # 服务器端 sync-islandhop-update.sh 会把 url 重写成门户地址并镜像包体。
+    $zipName = [IO.Path]::GetFileName($archive)
+    $zipHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+    $zipSize = (Get-Item -LiteralPath $archive).Length
+    $feedUrl = "https://github.com/thuki20/IslandHop/releases/download/v$version/$zipName"
+    $manifest = [ordered]@{
+        version = $version
+        notes   = "IslandHop v$version`n- 覆盖安装请下载 IslandHop-Setup-v$version-x64.exe：固定安装目录、自动创建桌面/开始菜单快捷方式，升级保留数据。`n- 免安装/应用内更新使用 $zipName。"
+        url     = $feedUrl
+        sha256  = $zipHash
+        size    = $zipSize
+    }
+    $manifestPath = Join-Path $outputDirectory 'manifest-windows.json'
+    ($manifest | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $manifestPath -Encoding utf8
+
     Write-Output $setup
     Write-Output $archive
+    Write-Output $manifestPath
 } finally { Pop-Location }

@@ -58,7 +58,14 @@ pub(crate) fn notch_shelf() -> f32 {
         (h + 16.0).max(bar_h() * 0.5 + 12.0) - bar_h() * 0.5
     }).unwrap_or(0.0)
 }
+/// 检测不到真实刘海尺寸、但确实处于 macOS 菜单栏模式时的兜底空洞宽度。
+/// 必须显著大于物理刘海（本机约 185pt），否则常驻图标会被挤进刘海死区看不到。
+pub(crate) const NOTCH_FALLBACK_GAP: f32 = 200.0;
 pub(crate) const HUD_W: f32 = 260.0;
+/// 刘海机型 HUD 提示（充放电 / 音量 / 蓝牙 / 网络）触发时，岛体从菜单栏下沿
+/// 向下衍出的高度。取 52 以容纳最高的蓝牙卡片（48）并留呼吸；提示文字画在
+/// 这段延长区里，随岛体弹簧一起延长 / 收回，而不是单独弹一个胶囊框。
+pub(crate) const HUD_SHELF: f32 = 52.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
@@ -1613,6 +1620,14 @@ impl App {
             && !self.browser_minimal_active
     }
     pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
+    /// 是否让岛体为当前 HUD 提示向下衍出：仅 macOS 菜单栏刘海机型、收起态、
+    /// 当前提示是系统 HUD（充放电 / 音量 / 蓝牙 / 网络）。歌词激活时走歌词路径，
+    /// 不叠加衍出。独立胶囊框分支据此切换成岛体自身延长。
+    pub(crate) fn hud_shelf_active(&self)->bool {
+        !self.side() && !self.open && !self.compact_notices()
+            && crate::mac_window::notch_layout().is_some()
+            && self.hud_notice.as_ref().is_some_and(|a|a.is_hud())
+    }
 
     /// 换句、分段和展开高亮共用时间调整；正数延后，负数提前。
     pub(crate) fn lyric_position(&self)->f32 {(self.media.position-self.settings.lyric_delay_ms as f64/1000.0)as f32}
@@ -1696,9 +1711,13 @@ impl App {
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
-            // 常驻状态画在刘海黑条内、不下挂：岛体高度就是菜单栏高度。
-            // notch_y 恒为 0（常驻行不再下挂），保留表达式以兼容收起动画过渡。
-            (self.resident.target.width.min(WIN_W-32.0), bar_h() + self.resident.target.notch_y)
+            // 常驻图标留在状态栏高度带的左右两侧、不往下衍（刘海内不放内容）。
+            // HUD 提示例外：岛体本身向下延长 HUD_SHELF，提示画在延长区里，
+            // 随 h 弹簧自然伸出 / 收回，不再单独弹胶囊框。延长量乘 hud_alpha，
+            // 于是淡入即伸长、淡出即收回，与文字透明度同拍。
+            let hud_extra=if self.hud_shelf_active() {HUD_SHELF * self.hud_alpha}else{0.0};
+            let width=self.resident.target.width.min(WIN_W-32.0).max(if hud_extra>0.0 {HUD_W}else{0.0});
+            (width, bar_h() + self.resident.target.notch_y + hud_extra)
         }
     }
 
@@ -1784,16 +1803,22 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+额度环+吉祥宠，
-        // 右=天气(温度)（+音乐/专注/铃铛），时钟隐藏。
-        // **常驻状态（电量/宠物/温度/额度）画在刘海黑条内，不下挂**：drop 恒为 0，
-        // 岛体高度保持菜单栏高度。只有「提示 / 音乐歌词 / 状态」才往下衍出到刘海
-        // 下缘之下——它们走各自独立的下挂路径（歌词 base_size + notch_shelf、
-        // HUD/横幅 top+bar_h()+8），不经过 notch_slots 的 drop。
-        // 胶囊机型没有物理空洞，用固定间距分隔两组。Windows 与测试环境不启用。
+        // macOS 常驻行：图标样式沿用岛仔，位置左右分列——左=电源+额度环+吉祥宠，
+        // 右=天气(温度)（+音乐/专注/铃铛），时钟交给系统菜单栏。
+        // **刘海正中不放任何内容**（物理刘海死区，用户根本看不到），内容只落在
+        // 刘海左右两侧的可见区。drop 恒为 0：常驻行留在状态栏高度带、不往下衍；
+        // 只有「提示 / 音乐歌词 / 状态」才走各自独立的下衍路径（见 HUD 与歌词）。
+        //
+        // 关键：只要处于菜单栏模式就分列，不能只在 menu_bar_height() 成功时做。
+        // gap 也不能退回 0——一旦 notch_layout() 检测失败而菜单栏检测成功，
+        // hole 会退化成 48，左右两组被挤进约 185pt 宽的刘海死区正中，用户就
+        // 「根本看不到」。检测不到真实刘海时给足够大的兜底空洞，把两组推到两边。
         if !self.side() && !self.effective_minimal() && !self.island_lyrics_active()
-            && crate::mac_window::menu_bar_height().is_some() {
-            let gap=crate::mac_window::notch_layout().map(|(gap,_)|gap).unwrap_or(0.0);
+            && (crate::mac_window::notch_layout().is_some()
+                || crate::mac_window::menu_bar_height().is_some()) {
+            let gap=crate::mac_window::notch_layout()
+                .map(|(gap,_)|gap)
+                .unwrap_or(crate::app::NOTCH_FALLBACK_GAP);
             layout.notch_slots(gap,0.0);
         }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
@@ -2006,25 +2031,32 @@ impl App {
         let restoring_lyrics=!self.open&&self.notice.is_none()&&self.island_lyrics_active()&&self.hud_notice.as_ref().is_some_and(|a|a.meeting.is_some()||a.source!=crate::extras::AlertSource::Internal);
         let fading_hud=!self.compact_notices()&&!self.open&&self.hud_notice.as_ref().is_some_and(|a|a.is_hud())&&(banner||self.hud_alpha>0.003);
         if fading_hud {
+            let shelf_mode=self.hud_shelf_active();
             let from=self.resident.target.width;let to=HUD_W+self.pet_space();
             let width_progress=if (to-from).abs()<1.0 {if banner{1.0}else{0.0}}else{((self.w.pos-from)/(to-from)).clamp(0.0,1.0)};
-            let (opacity,header_opacity)=if banner {(self.hud_alpha*smoothstep(0.45,0.85,width_progress),1.0-smoothstep(0.05,0.40,width_progress))}
+            let (opacity,header_opacity)=if shelf_mode {
+                // 一体下衍：常驻图标继续留在上方两侧，提示画在岛体伸出的下半段。
+                // 透明度直接跟 hud_alpha，不再依赖宽度进度（宽度只微涨到容下文字）。
+                (self.hud_alpha,1.0)
+            }else if banner {(self.hud_alpha*smoothstep(0.45,0.85,width_progress),1.0-smoothstep(0.05,0.40,width_progress))}
                 else {(self.hud_alpha*smoothstep(0.20,0.60,width_progress),1.0-smoothstep(0.05,0.25,width_progress))};
             if !minimal_pill||pc>0.0 {self.resident_header(&base.faded(header_opacity),panel,cx,pc,reveal,env);}
             if let Some(a)=self.hud_notice.clone(){
-                // macOS 菜单栏岛（刘海机型）：HUD 弹窗（充放电 / 音量 / 蓝牙 / 网络等）
-                // 下挂到岛体下方弹出——菜单栏高度那条带被物理刘海（摄像头）挡住，
-                // 画在里面中间部分用户根本看不见；下方才是可见区域。
-                if crate::mac_window::menu_bar_height().is_some() {
+                // macOS 刘海机型：充放电 / 音量 / 蓝牙 / 网络等 HUD 提示不再单独弹
+                // 一个胶囊圆框——那样与岛体割裂、过渡生硬。改为岛体本身向下延长
+                // （base_size 已按 hud_alpha 把高度撑到 bar_h()+HUD_SHELF），提示文字
+                // 直接画在这段延长区里，跟着同一根弹簧平滑伸出、平滑收回。
+                if self.hud_shelf_active() {
                     let (tw,th)=self.notice_size(&a);
-                    let rect=Rect::from_min_size(Pos2::new(cx-tw/2.0,top+bar_h()+8.0),Vec2::new(tw,th));
-                    // 只在卡片真的在屏幕上时才登记命中区（本帧重绘即失效）。
+                    // 延长区顶部贴近菜单栏下沿；文字在其中水平居中、垂直留一点呼吸。
+                    let shelf_top=top+bar_h();
+                    let shelf_h=(panel.bottom()-shelf_top).max(th);
+                    let rect=Rect::from_min_size(
+                        Pos2::new(cx-tw/2.0, shelf_top + (shelf_h-th)*0.5),
+                        Vec2::new(tw,th));
+                    // 命中区落在岛体延长区上（本帧重绘即失效）。
                     self.hud_drop=Some(rect);
-                    let from=crate::skin_paint::shape_count(&ctx,layer);
-                    shape::shadow(&painter,rect,0.0,0.0,12.0,0.5*shadow_k);
-                    painter.rect_filled(rect,12.0,self.glass_fill());
-                    if glass_skin {painter.rect_stroke(rect,12.0,egui::Stroke::new(1.0_f32,self.glass_rim()),egui::StrokeKind::Inside);}
-                    keep_colors.push((from,crate::skin_paint::shape_count(&ctx,layer)));
+                    // 延长区没有独立底色/描边——它就是岛体 body 的一部分，随形变一体过渡。
                     let overlay=Card::new(ui,rect.min,rect.intersect(ui.max_rect())).faded(opacity).ghost();
                     self.draw_notice(&overlay,rect,&a,&mut cmds);
                 }else{

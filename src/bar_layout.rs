@@ -91,9 +91,12 @@ impl Layout {
     /// 正常态左右各三个图标（额度环一个、音乐/专注按需出现），即「左三右三」。
     /// 额度环夹在电量与宠物之间；多环时继续往左排，超宽由边距自适应兜底。
     ///
-    /// 两组分别贴在空洞两侧。常驻行**不下挂**：`drop` 恒为 0，内容画在
-    /// 刘海黑条内（状态栏高度带）；「提示 / 音乐歌词 / 状态」另走各自独立的
-    /// 下挂路径（见 app.rs 的 notch_shelf / HUD），不经过这里的 drop。
+    /// 两组分别贴在空洞两侧，**正中（物理刘海死区）永不放内容**——用户看不到。
+    /// 常驻行**不下挂**：`drop` 恒为 0，图标留在状态栏高度带的左右两侧；
+    /// 「提示 / 音乐歌词 / 状态」另走各自独立的下衍路径（见 app.rs 的 HUD / 歌词），
+    /// 不经过这里的 drop。
+    /// 空洞宽度 `gap` 即使在检测失败时也必须给足够大的兜底值（见
+    /// app.rs::NOTCH_FALLBACK_GAP），否则两组会被挤回刘海正中看不见。
     /// 胶囊机型没有物理空洞，靠固定视觉间距分隔两组。
     /// 宽度超预算（窗口可用宽）时先收紧边距与间距（PAD 14→9、SPACE 12→8），
     /// 仍超出的部分交给绘制层的等比缩放（shared_header 的 fit）。
@@ -318,15 +321,22 @@ mod tests {
         assert!(layout.width<=crate::app::WIN_W-32.0+0.01,"6 图标时收紧边距应压回预算内：{}",layout.width);
     }
     #[test]
-    fn resident_row_never_drops_when_caller_passes_zero(){
-        // .app.rs 的常驻行调用点现在恒传 drop=0：电量/额度/宠物/温度都留在
-        // 刘海黑条内，不下挂。提示/歌词/状态另走独立下挂路径，不受此约束。
+    fn resident_row_splits_to_both_sides_without_dropping(){
+        // 调用点恒传 drop=0 + 兜底空洞：常驻图标不下挂、留在状态栏高度带，
+        // 但左右两组必须落在刘海死区之外（>= 兜底空洞半宽），用户才看得到。
+        // 提示/歌词/状态另走独立下衍路径，不受此约束。
+        let hole=crate::app::NOTCH_FALLBACK_GAP;
         let mut layout=Layout::new(true,2,true,true,false,true,true);
-        layout.notch_slots(200.0,0.0);
-        assert_eq!(layout.notch_y,0.0,"常驻行默认不下挂");
+        layout.notch_slots(hole,0.0);
+        assert_eq!(layout.notch_y,0.0,"常驻行不下挂");
         assert!(layout.x[BATTERY].is_some()&&layout.x[PET].is_some()&&layout.x[WEATHER].is_some());
         assert!(layout.quota_slots().all(|i|layout.x[i].is_some()),"额度环保留在常驻行");
-        assert!(layout.x[BATTERY]<layout.x[PET]&&layout.x[WEATHER]>layout.x[PET],"左电量宠物、右温度");
+        // 左组整体在死区左侧、右组整体在死区右侧，正中不放内容。
+        let left_max=f32::max(layout.x[BATTERY].unwrap_or(f32::NEG_INFINITY),layout.x[PET].unwrap_or(f32::NEG_INFINITY))
+            .max(layout.quota_slots().filter_map(|i|layout.x[i]).fold(f32::NEG_INFINITY,f32::max));
+        let right_min=f32::min(layout.x[WEATHER].unwrap_or(f32::INFINITY),layout.x[MUSIC].unwrap_or(f32::INFINITY));
+        assert!(left_max < -hole/2.0,"左组必须落在刘海死区左侧");
+        assert!(right_min > hole/2.0,"右组必须落在刘海死区右侧");
     }
     #[test]
     fn replacing_battery_moves_continuously_and_supports_an_instant_state(){

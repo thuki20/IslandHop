@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# 把 GitHub Release 上的 IslandHop macOS 包镜像到门户更新目录。
+# 把 GitHub Release 上的 IslandHop macOS / Windows 包镜像到门户更新目录。
 #
 # 为什么需要它：GitHub Actions runner 的出口 IP 每次都变，服务器安全软件
 # （YJ-FIREWALL）会按 IP 封 22 端口，CI 没法直接 ssh 推包。改成 CI 只负责
 # 出包并发 Release，本脚本定时把最新 Release 拉回来，客户端仍从服务器更新。
 #
-# 幂等：版本不高于本地就什么都不做。由 crontab 每 5 分钟调用。
+# 幂等：每个平台版本不高于本地就跳过该平台。由 crontab 每 5 分钟调用。
+# Windows 还额外镜像安装版 Setup exe 到门户目录，供下载页直接给出固定链接。
 set -euo pipefail
 
 REPO="thuki20/IslandHop"
@@ -17,21 +18,20 @@ LEGACY_URL="http://203.195.201.85/.well-known/acme-challenge/islandhop"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# 没有 Release 时静默退出（首次部署、或 release 被删）
-curl -fsSL --max-time 30 "https://github.com/$REPO/releases/latest/download/manifest.json" \
-  -o "$TMP/manifest.json" 2>/dev/null || exit 0
+# 两个平台的清单都尝试拉取：谁存在就镜像谁（缺一个不影响另一个）。
+got_any = 0
+for mf in manifest.json manifest-windows.json; do
+  if curl -fsSL --max-time 30 "https://github.com/$REPO/releases/latest/download/$mf" \
+       -o "$TMP/$mf" 2>/dev/null; then
+    got_any=1
+  fi
+done
+[ "$got_any" -eq 1 ] || exit 0
 
 python3 - "$TMP" "$PORTAL_DIR" "$LEGACY_DIR" "$BASE_URL" "$LEGACY_URL" "$REPO" <<'PY'
-import json, os, shutil, sys, urllib.request
+import hashlib, json, os, shutil, sys, urllib.request
 
 tmp, portal_dir, legacy_dir, base_url, legacy_url, repo = sys.argv[1:7]
-remote_path = os.path.join(tmp, "manifest.json")
-
-with open(remote_path, encoding="utf-8") as fh:
-    remote = json.load(fh)
-version = str(remote.get("version", "")).strip()
-if not version:
-    sys.exit(0)
 
 
 def parse(text):
@@ -41,59 +41,86 @@ def parse(text):
         return (0,)
 
 
-local_path = os.path.join(portal_dir, "manifest.json")
-local_version = "0.0.0"
-if os.path.exists(local_path):
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mirror(manifest_name):
+    remote_path = os.path.join(tmp, manifest_name)
+    if not os.path.exists(remote_path):
+        return
+    with open(remote_path, encoding="utf-8") as fh:
+        remote = json.load(fh)
+    version = str(remote.get("version", "")).strip()
+    if not version:
+        return
+
+    local_path = os.path.join(portal_dir, manifest_name)
+    local_version = "0.0.0"
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, encoding="utf-8") as fh:
+                local_version = str(json.load(fh).get("version", "0.0.0"))
+        except (OSError, ValueError):
+            pass
+    if parse(version) <= parse(local_version):
+        return
+
+    asset = os.path.basename(str(remote.get("url", "")))
+    if not asset.endswith(".zip") or not remote.get("sha256"):
+        return
+
+    print(f"[islandhop-sync] {manifest_name}: {local_version} -> {version}（{asset}）", flush=True)
+    asset_path = os.path.join(tmp, asset)
+    download = f"https://github.com/{repo}/releases/download/v{version}/{asset}"
     try:
-        with open(local_path, encoding="utf-8") as fh:
-            local_version = str(json.load(fh).get("version", "0.0.0"))
-    except (OSError, ValueError):
-        pass
+        urllib.request.urlretrieve(download, asset_path)
+    except Exception as error:                                # noqa: BLE001
+        print(f"[islandhop-sync] 下载失败：{error}", flush=True)
+        return
 
-if parse(version) <= parse(local_version):
-    sys.exit(0)
+    actual = sha256(asset_path)
+    if actual != str(remote["sha256"]).lower():
+        print(f"[islandhop-sync] sha256 不符，丢弃：{actual[:16]} != {remote['sha256'][:16]}", flush=True)
+        return
+    expected_size = remote.get("size")
+    if isinstance(expected_size, int) and expected_size > 0 and os.path.getsize(asset_path) != expected_size:
+        print("[islandhop-sync] 包大小不符，丢弃", flush=True)
+        return
 
-zip_name = os.path.basename(str(remote.get("url", "")))
-if not zip_name.endswith(".zip") or not remote.get("sha256"):
-    sys.exit(0)
+    for directory in (portal_dir, legacy_dir):
+        os.makedirs(directory, exist_ok=True)
 
-print(f"[islandhop-sync] {local_version} -> {version}（{zip_name}）", flush=True)
-zip_path = os.path.join(tmp, zip_name)
-download = f"https://github.com/{repo}/releases/download/v{version}/{zip_name}"
-try:
-    urllib.request.urlretrieve(download, zip_path)
-except Exception as error:                                    # noqa: BLE001
-    print(f"[islandhop-sync] 下载失败：{error}", flush=True)
-    sys.exit(1)
+    # manifest 的 url 改写成门户目录（与本机 push-update.sh 的产物一致）。
+    main = dict(remote, url=f"{base_url.rstrip('/')}/{asset}")
+    legacy = dict(remote, url=f"{legacy_url.rstrip('/')}/{asset}")
+    shutil.copyfile(asset_path, os.path.join(portal_dir, asset))
+    shutil.copyfile(asset_path, os.path.join(legacy_dir, asset))
+    for path, payload in ((os.path.join(portal_dir, manifest_name), main),
+                          (os.path.join(legacy_dir, manifest_name), legacy)):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
-import hashlib
-digest = hashlib.sha256()
-with open(zip_path, "rb") as fh:
-    for chunk in iter(lambda: fh.read(1 << 20), b""):
-        digest.update(chunk)
-actual = digest.hexdigest()
-if actual != str(remote["sha256"]).lower():
-    print(f"[islandhop-sync] sha256 不符，丢弃：{actual[:16]} != {remote['sha256'][:16]}", flush=True)
-    sys.exit(1)
+    # Windows：额外把安装版 Setup exe 镜像到门户，供下载页给固定链接。
+    # 名字从 manifest notes 里取（package.ps1 写入），找不到就用版本拼默认名。
+    if manifest_name == "manifest-windows.json":
+        setup = f"IslandHop-Setup-v{version}-x64.exe"
+        setup_path = os.path.join(tmp, setup)
+        try:
+            urllib.request.urlretrieve(
+                f"https://github.com/{repo}/releases/download/v{version}/{setup}", setup_path)
+            for directory in (portal_dir, legacy_dir):
+                shutil.copyfile(setup_path, os.path.join(directory, setup))
+        except Exception as error:                            # noqa: BLE001
+            print(f"[islandhop-sync] Setup exe 镜像失败（zip 已就绪）：{error}", flush=True)
 
-expected_size = remote.get("size")
-if isinstance(expected_size, int) and expected_size > 0 and os.path.getsize(zip_path) != expected_size:
-    print("[islandhop-sync] 包大小不符，丢弃", flush=True)
-    sys.exit(1)
+    print(f"[islandhop-sync] 已镜像 {manifest_name} v{version}", flush=True)
 
-for directory in (portal_dir, legacy_dir):
-    os.makedirs(directory, exist_ok=True)
 
-# 主 manifest 的 url 指向门户目录（与本机 push-update.sh 的产物一致）
-main = dict(remote, url=f"{base_url.rstrip('/')}/{zip_name}")
-legacy = dict(remote, url=f"{legacy_url.rstrip('/')}/{zip_name}")
-
-shutil.copyfile(zip_path, os.path.join(portal_dir, zip_name))
-shutil.copyfile(zip_path, os.path.join(legacy_dir, zip_name))
-for path, payload in ((os.path.join(portal_dir, "manifest.json"), main),
-                      (os.path.join(legacy_dir, "manifest.json"), legacy)):
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-print(f"[islandhop-sync] 已镜像 v{version}", flush=True)
+for name in ("manifest.json", "manifest-windows.json"):
+    mirror(name)
 PY
