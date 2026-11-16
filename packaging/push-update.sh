@@ -35,7 +35,9 @@ LEGACY_URL="${ISLANDHOP_LEGACY_URL:-http://203.195.201.85/.well-known/acme-chall
 [ $# -ge 1 ] || { echo "用法: $0 \"更新说明\" [\"更多说明\"]..." >&2; exit 1; }
 
 echo "==> cargo build --release"
-cargo build --release --bin IslandHop 2>&1 | tail -1
+# 不要把输出接给 tail：编译失败时只剩最后一行 "could not compile"，定位不了
+# 具体错误（CI 上必须看到完整 rustc 报错）。
+cargo build --release --bin IslandHop
 
 echo "==> 打包 .app"
 bash packaging/macos-app.sh --app-only
