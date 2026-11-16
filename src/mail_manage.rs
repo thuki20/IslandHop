@@ -11,7 +11,6 @@ pub struct Snapshot{pub validity:u32,pub entries:Vec<(u32,bool)>,pub items:Vec<I
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub struct Completed{pub request:Request,pub result:Result<Snapshot,String>}
 
-#[cfg(windows)]
 mod protocol{
     use super::*;
     use std::io::{Read,Write};
@@ -164,7 +163,7 @@ mod protocol{
         }
     }
 }
-#[cfg(windows)]pub fn start()->(std::sync::mpsc::Sender<Request>,std::sync::mpsc::Receiver<Completed>){
+pub fn start()->(std::sync::mpsc::Sender<Request>,std::sync::mpsc::Receiver<Completed>){
     let(tx,rx)=std::sync::mpsc::channel::<Request>();let(done,out)=std::sync::mpsc::channel();
     std::thread::spawn(move||while let Ok(request)=rx.recv(){let result=protocol::run(&request);let _=done.send(Completed{request,result});});(tx,out)
 }

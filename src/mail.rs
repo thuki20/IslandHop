@@ -1,14 +1,13 @@
 //! 邮件（v0.5.5）：六类邮箱的账号模型、IMAP 收取、正文解析。
 //!
 //! 轻量化约束：只用 Rust 原生 crate（`imap` + `native-tls` + `mailparse`），
-//! 不引 Node/Go/Electron。凭据一律进 Windows 凭据管理器（`keyring`），
+//! 不引 Node/Go/Electron。凭据进系统凭据库（Windows 凭据管理器 / macOS 钥匙串，`keyring`），
 //! 账号清单只存「邮箱 + 类型 + 是否监控」，不存密码。
 //!
 //! 收信优先 `Session::idle()` 长连接；服务器不支持 IDLE 时退回轮询（60/120/300 秒）。
 //! 正文只在内存里解析，不落盘、不缓存。
 
 use std::collections::HashMap;
-#[cfg(windows)]
 #[path="mail_fetch.rs"]
 pub(crate) mod fetch;
 
@@ -641,7 +640,6 @@ pub mod secrets {
 
 // ---------------------------------------------------------------- 收信服务
 
-#[cfg(windows)]
 pub(crate) mod net {
     //! TLS 连接 + 163/126 的 pre-login `ID` 握手。
     //!
@@ -800,7 +798,6 @@ pub(crate) mod net {
     }
 }
 
-#[cfg(windows)]
 mod service {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1475,25 +1472,6 @@ mod service {
             *last = (*last).max(uid);
         }
         Ok(())
-    }
-}
-
-#[cfg(not(windows))]
-mod service {
-    use super::*;
-
-    pub struct Service;
-
-    impl Service {
-        pub fn start() -> Self {
-            Self
-        }
-        pub fn sync(&self, _accounts: &[Account], _interval_secs: u32) {}
-        pub fn test(&self, _account: Account, _password: String) {}
-        pub fn manage(&self,_request:crate::mail_manage::Request){}
-        pub fn try_recv(&self) -> Option<Event> {
-            None
-        }
     }
 }
 

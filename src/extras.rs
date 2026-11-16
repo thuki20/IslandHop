@@ -1953,7 +1953,7 @@ impl App {
                                 }
                             }
                             ui.add_space(5.0);
-                            ui.label(egui::RichText::new("连接成功后保存，密码存储在 Windows 凭据管理器中。").size(11.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
+                            ui.label(egui::RichText::new(if cfg!(windows){"连接成功后保存，密码存储在 Windows 凭据管理器中。"}else{"连接成功后保存，密码存储在 macOS 钥匙串中。"}).size(11.0).color(settings_color(ctx,Color32::from_gray(180),Color32::from_gray(75))));
                             if !self.calendar.note.is_empty(){
                                 ui.add_space(5.0);
                                 let color=if self.calendar.note_error{settings_color(ctx,Color32::from_rgb(255,125,125),Color32::from_rgb(184,34,34))}else{settings_color(ctx,Color32::from_gray(210),Color32::from_gray(55))};
