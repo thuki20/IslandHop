@@ -63,6 +63,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 raw-window-handle = "0.6"
 # v0.5.5 邮件：MIME 解析与验证码打分是纯逻辑，保持跨平台。
 mailparse = "0.18"
+# v0.6.x 邮箱 macOS 适配：IMAP 与系统 TLS 移入公共依赖，Windows 走 Schannel、
+# macOS 走 Security.framework，双端同一套收信实现。
+imap = "2.4"
+imap-proto = "0.10.2"
+native-tls = "0.2"
 regex = "1"
 url = "2"
 chrono = "0.4"
@@ -126,10 +131,7 @@ windows = { version = "0.58", features = [
   "Win32_Devices_Bluetooth",
   "Devices_Bluetooth", "Devices_Enumeration",
 ] }
-# v0.5.5 邮件：IMAP 走系统 TLS，凭据进 Windows 凭据管理器。
-imap = "2.4"
-imap-proto = "0.10.2"
-native-tls = "0.2"
+# v0.5.5 邮件凭据：Windows 凭据管理器（macOS 钥匙串见上方 macos target 段）。
 keyring = { version = "3", features = ["windows-native"] }
 
 [profile.release]
