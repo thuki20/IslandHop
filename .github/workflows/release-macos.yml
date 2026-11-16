@@ -153,6 +153,9 @@ jobs:
             dist/manifest.json
             dist/manifest-legacy.json
           fail_on_unmatched_files: true
+          # 单独只跑 macOS（无 Windows push）时也要把该 release 标为 Latest，
+          # 否则 releases/latest 停留旧版，≤旧版客户端永远提示"已是最新"（#4）。
+          make_latest: true
 
       - uses: actions/upload-artifact@v4
         with:

@@ -370,8 +370,7 @@ impl App {
     pub(crate) fn draw_quota_bar(&mut self,c:&Card,cx:f32,layout:&crate::bar_layout::Layout){
         let indices=self.quota_bar_indices();let mut chosen=None;
         for (position,i)in indices.iter().enumerate(){
-            // macOS 刘海常驻行不放额度环：notch_slots 会把这些槽位清空，
-            // 直接跳过（额度仍在展开后的额度页可见）。
+            // 额度环在刘海常驻行左组（电量与宠物之间）显示；槽位未就位时才跳过。
             let Some(slot_x)=layout.x[crate::bar_layout::quota_slot(position)] else {continue};
             let alpha=layout.pet_clearance(crate::bar_layout::quota_slot(position));
             let faded=c.faded(alpha);let faded=if alpha<0.8{faded.ghost()}else{faded};let c=&faded;

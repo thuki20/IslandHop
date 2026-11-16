@@ -1696,7 +1696,8 @@ impl App {
         } else if self.effective_minimal()&&self.t>=self.notification_bell_until {
             (BAR_W_MIN, BAR_H_MIN)
         } else {
-            // 有刘海 Mac：岛体向下延长，把整行常驻内容（含充放电）放到刘海下方。
+            // 常驻状态画在刘海黑条内、不下挂：岛体高度就是菜单栏高度。
+            // notch_y 恒为 0（常驻行不再下挂），保留表达式以兼容收起动画过渡。
             (self.resident.target.width.min(WIN_W-32.0), bar_h() + self.resident.target.notch_y)
         }
     }
@@ -1783,17 +1784,17 @@ impl App {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
             else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
         }
-        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+吉祥宠，
-        // 右=天气(温度)（+音乐/专注/铃铛）；AI 额度环不进常驻行（避免撑宽岛体），
-        // 时钟隐藏。刘海机型中间留物理空洞，整行再下挂到刘海下缘之下，
-        // 胶囊机型用固定间距替代且不下挂。Windows 与测试环境不启用。
+        // macOS（刘海与胶囊两种岛形统一）：常驻行左右分列——左=电源+额度环+吉祥宠，
+        // 右=天气(温度)（+音乐/专注/铃铛），时钟隐藏。
+        // **常驻状态（电量/宠物/温度/额度）画在刘海黑条内，不下挂**：drop 恒为 0，
+        // 岛体高度保持菜单栏高度。只有「提示 / 音乐歌词 / 状态」才往下衍出到刘海
+        // 下缘之下——它们走各自独立的下挂路径（歌词 base_size + notch_shelf、
+        // HUD/横幅 top+bar_h()+8），不经过 notch_slots 的 drop。
+        // 胶囊机型没有物理空洞，用固定间距分隔两组。Windows 与测试环境不启用。
         if !self.side() && !self.effective_minimal() && !self.island_lyrics_active()
             && crate::mac_window::menu_bar_height().is_some() {
-            let (gap,drop)=match crate::mac_window::notch_layout(){
-                Some((gap,_))=>(gap,notch_shelf()),
-                None=>(0.0,0.0),
-            };
-            layout.notch_slots(gap,drop);
+            let gap=crate::mac_window::notch_layout().map(|(gap,_)|gap).unwrap_or(0.0);
+            layout.notch_slots(gap,0.0);
         }
         self.resident.step(layout,dt,ctx.style().animation_time>0.0&&bar::animations_enabled());
         if self.opts.fetch_lyrics {

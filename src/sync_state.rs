@@ -13,15 +13,17 @@
 //!   `shelf.txt`、`ai-quota.json` 的**账号元数据**（镜像时按 id 回填本机
 //!   `source` 登录路径与 `slot` 凭据槽位）、邮件账号清单（`mail-accounts.json`，
 //!   本身无密码）、日历账号配置（`calendar.json`）、本机日程事件
-//!   （`local-calendar.json`），以及**跨机凭据克隆**（邮箱授权码 / 日历密码 /
-//!   AI 额度 API Key，经加密通道写入从端本机 keyring；主端删除的凭据
-//!   同步后从端也跟着清掉）。
-//! * **不同步什么**：`display_id` / `dock` / `island_offset` / `avoid_apps` 等
+//!   （`local-calendar.json`）——**只同步账号"信息"（清单/别名/平台），不再克隆
+//!   任何账号密码 / 授权码**（2026-11-16 用户拍板：从端不登录账号、不获取信息，
+//!   凭据一律留在各自本机 keyring，永不推送、永不写入从端）。
+//! * **不同步什么**：账号密码 / 邮箱授权码 / 日历密码 / AI 额度 API Key（凭据）；
+//!   `display_id` / `dock` / `island_offset` / `avoid_apps` 等
 //!   设备相关键；天气缓存（两台出口 IP 不同，各机自拉）；久坐计时与番茄钟剩余
 //!   时间（纯本地会话）；剪贴板历史（OpenHop 已有实时剪贴板同步）；以及
 //!   DPAPI / 登录文件路径绑定的凭据文件 `credentials/*.bin`（豆包等需要各自重登）。
-//! * **从端只读**：账号 / 邮箱 / 日历的增删改入口在从端一律禁用
-//!   （`is_slave()`），信息完全来自主跨屏；邮件收取等本机读操作照常执行。
+//! * **从端可删改**：账号 / 邮箱 / 日历的删除入口在从端可用（`request_deletion`
+//!   本地立即生效并把删除键转发主端执行，队列落盘持久化，重启/离线都不丢）；
+//!   信息本身整表镜像自主跨屏；邮件收取等本机读操作照常执行。
 //! * **落盘**：一律「先写盘、再刷新内存」。上游 `App::new()` 与跨天 `tick()` 都会
 //!   用磁盘文件覆盖内存，不落盘会在重启/跨天后回退。
 
@@ -89,9 +91,33 @@ pub struct SyncPayload {
 /// 从端删除请求队列：(待发主端, 待确认)。从端 UI 删除账号时调用 `request_deletion`，
 /// `SyncManager::tick` 把待发键注入下一帧控制帧；主端删除完成、快照里不再出现
 /// 该条目后，待确认键才清除——期间镜像会跳过这些条目，杜绝「删了又复活」。
+///
+/// **持久化**（2026-11-16）：此前队列纯内存，从端删完若在主端确认前重启（或离线
+/// 删除后一直没连上），pending/outbox 全丢，下次主端心跳又把账号镜像回来——
+/// 即用户反馈的「删了立马同步回来」。现在每次变更都写 `deletions.json`，启动时
+/// 加载，删除请求跨重启、跨离线持久保留，直到主端确认执行。
+fn deletions_path() -> PathBuf { model::config_dir().join("deletions.json") }
+
+fn load_deletions(path: &Path) -> (Vec<String>, Vec<String>) {
+    let Ok(raw) = std::fs::read(path) else { return (Vec::new(), Vec::new()); };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) else { return (Vec::new(), Vec::new()); };
+    let list = |key: &str| -> Vec<String> {
+        v.get(key).and_then(|a| a.as_array()).map(|arr| arr.iter()
+            .filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default()
+    };
+    (list("outbox"), list("pending"))
+}
+
+fn save_deletions(path: &Path, outbox: &[String], pending: &[String]) {
+    let body = serde_json::json!({"outbox": outbox, "pending": pending});
+    if let Ok(raw) = serde_json::to_vec_pretty(&body) {
+        let _ = model::atomic_write(path, &raw);
+    }
+}
+
 fn deletion_queue() -> &'static Mutex<(Vec<String>, Vec<String>)> {
     static QUEUE: OnceLock<Mutex<(Vec<String>, Vec<String>)>> = OnceLock::new();
-    QUEUE.get_or_init(|| Mutex::new((Vec::new(), Vec::new())))
+    QUEUE.get_or_init(|| Mutex::new(load_deletions(&deletions_path())))
 }
 
 /// 从端请求删除一个账号：本地立即生效（UI 已改），删除键转发主端执行。
@@ -99,6 +125,7 @@ pub fn request_deletion(key: String) {
     let Ok(mut queue) = deletion_queue().lock() else { return; };
     if !queue.0.contains(&key) { queue.0.push(key.clone()); }
     if !queue.1.contains(&key) { queue.1.push(key); }
+    save_deletions(&deletions_path(), &queue.0, &queue.1);
 }
 
 /// 仍待主端确认的删除键（镜像时跳过这些条目，不复活）。
@@ -108,13 +135,18 @@ fn pending_deletions() -> Vec<String> {
 
 /// 取走待发的删除键。
 fn drain_deletion_outbox() -> Vec<String> {
-    deletion_queue().lock().map(|mut q| std::mem::take(&mut q.0)).unwrap_or_default()
+    let Ok(mut queue) = deletion_queue().lock() else { return Vec::new(); };
+    let out = std::mem::take(&mut queue.0);
+    save_deletions(&deletions_path(), &queue.0, &queue.1);
+    out
 }
 
 /// 主端已执行删除（快照里不再出现）→ 从待确认列表移除，镜像恢复正常跟随。
 fn confirm_deletions(confirmed: &[String]) {
     let Ok(mut queue) = deletion_queue().lock() else { return; };
+    let before_len = queue.1.len();
     queue.1.retain(|k| !confirmed.contains(k));
+    if queue.1.len() != before_len { save_deletions(&deletions_path(), &queue.0, &queue.1); }
 }
 
 /// 主端快照里是否还有这个键（用于确认从端删除请求已被主端执行）。
@@ -189,7 +221,8 @@ pub fn is_data_master() -> bool {
     cfg!(target_os = "macos")
 }
 
-/// 从端只读判定：账号 / 邮箱 / 日历的增删改入口在从端一律禁用。
+/// 从端判定：账号/邮箱/日历信息整表镜像自数据主端。删除入口在从端可用
+/// （转主端执行），不再一概禁用。
 pub fn is_slave() -> bool {
     !is_data_master()
 }
@@ -416,7 +449,10 @@ pub fn snapshot() -> String {
         mail: read_text(&dir.join("mail-accounts.json")),
         calendar: read_text(&dir.join("calendar.json")),
         local_calendar: read_text(&dir.join("local-calendar.json")),
-        secrets: collect_secrets(),
+        // 账号密码/授权码不再跨机同步（2026-11-16 用户拍板）：Windows 从端
+        // 不登录账号、不获取信息，只镜像账号"信息"供查看/删改；凭据留在各自
+        // 本机 keyring，永不推送、永不克隆。故快照恒不含 secrets。
+        secrets: Vec::new(),
         version: env!("CARGO_PKG_VERSION").into(),
         // 快照不带删除请求：删除键只出现在从端的控制帧里。
         deletions: Vec::new(),
@@ -432,6 +468,9 @@ fn secret_cache() -> &'static Mutex<(String, Vec<(String, String)>)> {
 
 /// 收集跨机可克隆的凭据（邮箱授权码 / 日历密码 / AI 额度 API Key）。
 /// keyring 读取有成本（macOS 还可能弹授权），按账号清单指纹缓存，清单不变就复用。
+/// **已停用**（2026-11-16）：账号密码不再跨机同步，snapshot 恒发空 secrets；
+/// 保留实现仅供对照，勿再接入同步链路。
+#[allow(dead_code)]
 fn collect_secrets() -> Vec<(String, String)> {
     let mail = read_text(&model::config_dir().join("mail-accounts.json")).unwrap_or_default();
     let calendar = read_text(&model::config_dir().join("calendar.json")).unwrap_or_default();
@@ -473,6 +512,8 @@ fn collect_secrets() -> Vec<(String, String)> {
 }
 
 /// 把对端克隆来的凭据写进本机 keyring。返回成功写入的数量。
+/// **已停用**（2026-11-16）：账号密码不再跨机同步；保留实现仅供对照。
+#[allow(dead_code)]
 fn apply_secrets(secrets:&[(String,String)])->usize {
     let mut saved=0;
     for (key,value) in secrets {
@@ -562,20 +603,17 @@ pub fn apply_mirror(app: &mut App, payload: &str, today: &str, now: f64) -> bool
         | mirror_mail(&dir.join("mail-accounts.json"), doc.mail.as_deref(), &pending)
         | mirror_calendar(&dir.join("calendar.json"), doc.calendar.as_deref(), &pending)
         | mirror_local_calendar(&dir.join("local-calendar.json"), doc.local_calendar.as_deref());
-    // 待删除条目的凭据不克隆（等主端执行删除后自然消失）。
-    let master_secrets: Vec<(String, String)> = doc.secrets.iter()
-        .filter(|(k, _)| !pending.contains(k)).cloned().collect();
-    let secrets = apply_secrets(&master_secrets);
-    // 主端删掉的账号凭据：本机 keyring 同步剪除。
+    // 账号密码/授权码不再跨机克隆（2026-11-16 用户拍板）：从端只接收账号
+    // "信息"（清单/别名/平台），凭据一律留在各自本机 keyring。主端快照已不含
+    // secrets，这里不再写入；从端历史遗留的克隆凭据用空 master_keys 剪除干净。
     let master_keys: Vec<String> = doc.secrets.iter().map(|(k, _)| k.clone()).collect();
     prune_slave_secrets(&pre_mail, &pre_calendar, &pre_apiq_slots, &master_keys);
-    if secrets > 0 { set_status(format!("已从主端克隆 {secrets} 个账号凭据")); }
     // 主端已执行删除 → 从待确认列表移除。
     let confirmed: Vec<String> = pending.iter().filter(|k| !master_still_has(&doc, k)).cloned().collect();
     confirm_deletions(&confirmed);
 
     // 只在确实有变化时刷新内存，避免 15 秒心跳反复重载打断编辑。
-    let changed = mirrored || secrets > 0 || union_fingerprint(&dir) != before;
+    let changed = mirrored || union_fingerprint(&dir) != before;
     if changed { app.apply_synced_state(today, now); }
     changed
 }
@@ -776,6 +814,36 @@ mod merge_tests {
         let _=std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn deletion_queue_survives_restart_and_clears_on_confirm(){
+        let dir=tmpdir("deletions");
+        let path=dir.join("deletions.json");
+        // 从端删除两个账号后重启（重新 load）：pending/outbox 都还在，不复活。
+        save_deletions(&path,&["acct:a".into(),"mail:b@x.com".into()].to_vec(),
+                       &["acct:a".into(),"mail:b@x.com".into()].to_vec());
+        let (outbox,pending)=load_deletions(&path);
+        assert_eq!(outbox,vec!["acct:a","mail:b@x.com"]);
+        assert_eq!(pending,vec!["acct:a","mail:b@x.com"]);
+        // 主端确认执行后清空 pending，但 outbox 已 drain（模拟 tick 已转发）。
+        save_deletions(&path,&[],&["acct:a".into()].to_vec());
+        let (outbox2,pending2)=load_deletions(&path);
+        assert!(outbox2.is_empty());
+        assert_eq!(pending2,vec!["acct:a"],"未确认的删除跨重启仍屏蔽，不复活");
+        // 全部确认。
+        save_deletions(&path,&[],&[]);
+        assert_eq!(load_deletions(&path),(Vec::new(),Vec::new()));
+        let _=std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_never_carries_account_passwords(){
+        // 账号密码/授权码永不进快照：从端只镜像账号信息，不克隆凭据。
+        let raw=super::snapshot();
+        let payload:serde_json::Value=serde_json::from_str(&raw).unwrap();
+        assert!(payload.get("secrets").and_then(|s|s.as_array()).is_some_and(|a|a.is_empty()),
+                "快照 secrets 必须恒空：{payload}");
     }
 
     #[test]

@@ -62,8 +62,11 @@ fn smart_from(
         pct.round().clamp(0.0, 100.0) as u8
     });
     let watts = match (amperage, voltage) {
-        // 充电中：电流取绝对值（兼容充电为负/为正两种固件符号约定）
-        (Some(a), Some(v)) if is_charging && a != 0.0 && v > 0.0 => {
+        // 接电源就算功率（电流取绝对值，兼容充电为负/正两种固件符号约定）。
+        // 不再要求 is_charging：满电 / 优化电池充电时 IsCharging=false 但依然插着
+        // 电源，此时用户要的是看实时功率（含涓流），而不是退回百分比。
+        // 未接电源（用电池）时 external=false，一律不算功率 → 绘制层显示百分比。
+        (Some(a), Some(v)) if external && a != 0.0 && v > 0.0 => {
             let w = (a.abs() * v / 1.0e6) as f32;
             (w >= 0.5).then_some(w)
         },
@@ -202,7 +205,16 @@ pub mod autostart {
                 exe.display()
             );
             std::fs::write(&path, plist).map_err(|e| format!("写 LaunchAgent 失败：{e}"))?;
-            let _ = std::process::Command::new("/bin/launchctl").args(["load", &path_text]).output();
+            // 不要吞掉 launchctl 的返回码：plist 写成功但加载失败时若返回 Ok，
+            // UI 会误报"已开启开机自启"而实际没生效——正是"打不开自启"的静默失败。
+            let result = std::process::Command::new("/bin/launchctl")
+                .args(["load", &path_text]).output()
+                .map_err(|e| format!("执行 launchctl load 失败：{e}"))?;
+            if !result.status.success() {
+                let err = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+                return Err(format!("开机自启未生效（launchctl load 失败）：{}",
+                    if err.is_empty() { "未知错误".into() } else { err }));
+            }
             Ok(())
         } else {
             // 卸载当前会话里已加载的 Agent（未加载时报错没关系），再删 plist。
@@ -473,6 +485,18 @@ mod battery_tests {
         assert!(!b.external && !b.charging_now && b.watts.is_none());
         let full = smart_from(Some(100.0), None, Some(0.0), Some(12800.0), false, true);
         assert!(full.external && !full.charging_now && full.watts.is_none(), "充满挂机不算充电");
+    }
+
+    // 用户实测：优化电池充电 / 满电附近 IsCharging=false，但依然插着电源且有
+    // 涓流电流——这种情形也要显示实时功率，不能退回百分比。
+    #[test]
+    fn external_but_not_flagged_charging_still_reports_watts() {
+        let b = smart_from(Some(92.0), None, Some(-235.0), Some(11800.0), false, true);
+        assert!(b.external && !b.charging_now, "未报充电标志");
+        assert!(b.watts.is_some_and(|w| (w - 2.77).abs() < 0.1), "235mA×11.8V≈2.77W：{:?}", b.watts);
+        // 同样电流但拔掉电源 → 不显示功率，绘制层走百分比。
+        let off = smart_from(Some(92.0), None, Some(-235.0), Some(11800.0), false, false);
+        assert!(off.watts.is_none(), "用电池时显示百分比");
     }
 
     // 个别固件 CurrentCapacity 给 mAh（>100），要按 MaxCapacity 换算成百分比。

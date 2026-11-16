@@ -91,9 +91,10 @@ impl Layout {
     /// 正常态左右各三个图标（额度环一个、音乐/专注按需出现），即「左三右三」。
     /// 额度环夹在电量与宠物之间；多环时继续往左排，超宽由边距自适应兜底。
     ///
-    /// 两组分别贴在空洞两侧，整行再整体下挂 `drop`（刘海机型的
-    /// `notch_shelf()`），让所有内容落到物理刘海**下缘之下**的可见区；
-    /// 胶囊机型 drop=0，靠固定视觉间距分隔两组。
+    /// 两组分别贴在空洞两侧。常驻行**不下挂**：`drop` 恒为 0，内容画在
+    /// 刘海黑条内（状态栏高度带）；「提示 / 音乐歌词 / 状态」另走各自独立的
+    /// 下挂路径（见 app.rs 的 notch_shelf / HUD），不经过这里的 drop。
+    /// 胶囊机型没有物理空洞，靠固定视觉间距分隔两组。
     /// 宽度超预算（窗口可用宽）时先收紧边距与间距（PAD 14→9、SPACE 12→8），
     /// 仍超出的部分交给绘制层的等比缩放（shared_header 的 fit）。
     pub fn notch_slots(&mut self, gap: f32, drop: f32) {
@@ -141,8 +142,8 @@ impl Layout {
             cursor += self.widths[i] + space;
         }
         self.width = (hole + 2.0 * (pad + EDGE) + left_w + right_w).max(96.0);
-        // 常驻行整体下挂：base_size() 会把岛体高度延长到 bar_h()+notch_y，
-        // shared_header()/resident_header() 按展开进度把整行平滑收回顶栏。
+        // drop 由调用点决定：常驻行调用点恒传 0（画在刘海黑条内，不下挂）；
+        // base_size() 按 bar_h()+notch_y 延长岛体，shared_header() 按展开进度收回。
         self.notch_y = drop;
     }
     pub fn reorder(&mut self,order:&[usize]) {
@@ -315,6 +316,17 @@ mod tests {
         assert!(layout.width>=200.0+2.0*(9.0+16.0));
         // 多图标（本例 6 个）自适应收紧后仍不超窗口可用宽度预算。
         assert!(layout.width<=crate::app::WIN_W-32.0+0.01,"6 图标时收紧边距应压回预算内：{}",layout.width);
+    }
+    #[test]
+    fn resident_row_never_drops_when_caller_passes_zero(){
+        // .app.rs 的常驻行调用点现在恒传 drop=0：电量/额度/宠物/温度都留在
+        // 刘海黑条内，不下挂。提示/歌词/状态另走独立下挂路径，不受此约束。
+        let mut layout=Layout::new(true,2,true,true,false,true,true);
+        layout.notch_slots(200.0,0.0);
+        assert_eq!(layout.notch_y,0.0,"常驻行默认不下挂");
+        assert!(layout.x[BATTERY].is_some()&&layout.x[PET].is_some()&&layout.x[WEATHER].is_some());
+        assert!(layout.quota_slots().all(|i|layout.x[i].is_some()),"额度环保留在常驻行");
+        assert!(layout.x[BATTERY]<layout.x[PET]&&layout.x[WEATHER]>layout.x[PET],"左电量宠物、右温度");
     }
     #[test]
     fn replacing_battery_moves_continuously_and_supports_an_instant_state(){

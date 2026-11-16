@@ -2553,7 +2553,11 @@ fn server_handshake(stream: TcpStream, psk: &[u8; 32], my_name: &str, id: u64, n
     let Msg::Hello { version, name, os, screen } = hello else { bail!("unexpected first message") };
     if !(PROTOCOL_FLOOR..=PROTOCOL_VERSION).contains(&version) {
         let _ = tx.send(&Msg::Welcome { version: PROTOCOL_VERSION, name: my_name.to_string(), os: Os::current() });
-        bail!("{name} runs OpenHop protocol v{version}, this computer runs v{PROTOCOL_VERSION}: update both to the same version");
+        // 把协议版本翻译成用户能操作的动作：这正是"能搜到但连不上"的最常见原因
+        // （对端还是 0.6.77 及更早的 v16）。端口/口令问题另见设置页提示。
+        bail!("能搜到但连不上：{name} 用的协议是 v{version}，本机是 v{PROTOCOL_VERSION}。\
+ 请把两台电脑的 IslandHop 都升级到 0.6.78 或更高版本再连（协议 v16 与 v17 的屏幕名\
+ 载荷不兼容，无法混跑）。若已同版本，请确认两端口令一致、防火墙放行 TCP 24950 / UDP 24951");
     }
     tx.send(&Msg::Welcome { version: PROTOCOL_VERSION, name: my_name.to_string(), os: Os::current() })?;
     rx.set_timeout(Some(PEER_TIMEOUT))?;
@@ -2853,7 +2857,9 @@ impl Client {
         let (server_name, server_os) = match rx.recv().map_err(|_| anyhow!(refused))? {
             Msg::Welcome { version, name, os } if (PROTOCOL_FLOOR..=PROTOCOL_VERSION).contains(&version) => (name, os),
             Msg::Welcome { version, .. } => {
-                bail!("the server runs OpenHop protocol v{version}, this computer runs v{PROTOCOL_VERSION}: update both to the same version")
+                bail!("能搜到但连不上：服务器用的协议是 v{version}，本机是 v{PROTOCOL_VERSION}。\
+ 请把两台电脑的 IslandHop 都升级到 0.6.78 或更高版本再连（v16 与 v17 的屏幕名载荷\
+ 不兼容）。若已同版本，请确认两端口令一致、防火墙放行 TCP 24950 / UDP 24951")
             }
             _ => bail!("unexpected reply"),
         };
