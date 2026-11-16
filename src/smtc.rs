@@ -173,7 +173,7 @@ impl ArtworkCache {
     }
 }
 
-fn decode_artwork(bytes:&[u8])->Option<eframe::egui::ColorImage> {
+pub(crate) fn decode_artwork(bytes:&[u8])->Option<eframe::egui::ColorImage> {
     let decoded=(||{
         if bytes.len()>8*1024*1024{return None;}
         let mut reader=image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;

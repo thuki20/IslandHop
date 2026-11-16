@@ -119,20 +119,23 @@ impl State {
         if self.rx.is_some() { ctx.request_repaint_after(Duration::from_millis(100)); }
     }
 
+    /// 设置页「关于」里的手动更新入口。桌面端（Windows / macOS）共享同一套：
+    /// 应用启动会自动查一次并每 6 小时复查，但用户随时可以点这里手动立即检查。
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui) {
-        if ui.add_enabled(self.rx.is_none(), egui::Button::new("检查更新")).clicked() {
+        if ui.add_enabled(self.rx.is_none(), egui::Button::new("🔄 手动检查更新")).clicked() {
             let (tx, rx) = mpsc::channel(); self.rx = Some(rx);
             self.message.clear(); self.result = None; self.dialog_open = false;
             let ctx = ui.ctx().clone();
             std::thread::spawn(move || { let _ = tx.send(Event::Checked(check())); ctx.request_repaint(); });
         }
+        ui.label(egui::RichText::new("启动时自动检查，每 6 小时复查一次").size(10.5).color(egui::Color32::from_gray(140)));
         match &self.result {
             Some(Ok(Some(release))) => {
                 if ui.button(format!("发现新版本 {} · 查看更新", release.version)).clicked() {
                     self.dialog_open = true; self.focus_requested = true;
                 }
             }
-            Some(Ok(None)) => { ui.label("当前已是最新版本"); }
+            Some(Ok(None)) => { ui.label(egui::RichText::new("✓ 当前已是最新版本").color(egui::Color32::from_rgb(60, 170, 110))); }
             Some(Err(message)) => { ui.label(message); ui.hyperlink_to("打开发布页", RELEASES); }
             None if self.rx.is_some() => { ui.label("正在检查…"); }
             _ => {}

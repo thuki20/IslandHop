@@ -327,11 +327,37 @@ fn adapter_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
 /// 因此网易云、QQ音乐等任意播放器都能读到，含播放位置）。
 fn adapter_now_playing() -> Option<crate::smtc::NowPlaying> {
     let (script, framework) = adapter_paths()?;
+    // 不带 --no-artwork：让适配器返回 artworkData(base64 图片)，
+    // 这样网易云 / QQ / Apple Music 的歌曲封面才能显示。此前显式关掉封面
+    // 是"检索不到歌曲图片"的根因。
     let out = Command::new("/usr/bin/perl").arg(&script).arg(&framework)
-        .args(["get", "--now", "--no-artwork"]).output().ok()?;
+        .args(["get", "--now"]).output().ok()?;
     if !out.status.success() { return None; }
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     adapter_json_to_now_playing(value)
+}
+
+/// 封面解码缓存：适配器每 2 秒推一次 artworkData（几百 KB base64），同一首歌
+/// 字节不变。缓存上一次的 base64 与解码结果，未变化直接复用同一个 Arc，
+/// 这样 app.rs 的 Arc::ptr_eq 能命中、不会每 2 秒重新上传 GPU 纹理。
+static ARTWORK_CACHE: Mutex<Option<(String, Option<std::sync::Arc<eframe::egui::ColorImage>>)>> = Mutex::new(None);
+
+fn decode_artwork_cached(data: Option<&str>) -> Option<std::sync::Arc<eframe::egui::ColorImage>> {
+    let data = data?;
+    if let Ok(cache) = ARTWORK_CACHE.lock() {
+        if let Some((prev, image)) = cache.as_ref() {
+            if prev == data { return image.clone(); }
+        }
+    }
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+        .ok();
+    let image = bytes.as_deref().and_then(crate::smtc::decode_artwork).map(std::sync::Arc::new);
+    if let Ok(mut cache) = ARTWORK_CACHE.lock() {
+        *cache = Some((data.to_string(), image.clone()));
+    }
+    image
 }
 
 /// 适配器 JSON → NowPlaying。键名来自上游 v0.7.7（packaging/mra/LICENSE）。
@@ -355,7 +381,8 @@ fn adapter_json_to_now_playing(value: serde_json::Value) -> Option<crate::smtc::
         sampled_at: Some(Instant::now()),
         event_time_ms: None,
         duration: num("duration"),
-        artwork: None,
+        // 解析适配器返回的 base64 封面（去掉 --no-artwork 后才有）。
+        artwork: decode_artwork_cached(object.get("artworkData").and_then(Value::as_str)),
         playback_type: crate::smtc::MediaKind::Music,
         volume: None,
     })

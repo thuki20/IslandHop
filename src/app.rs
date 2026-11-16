@@ -1801,7 +1801,11 @@ impl App {
         if let Some(extra)=self.weather_pill_extra(&ctx){ layout.widen(bar::WEATHER,extra); }
         if self.pet_enabled() {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
-            else if self.island_lyrics_active() {layout.x[bar::PET]=Some(60.0-self.lyric_bar_width()/2.0);}
+            // 歌词态：刘海岛的宠物回到常驻行正中（封面在左、节奏条在右，三者并排），
+            // 下衍只放居中歌词；无刘海平台保持原样（那里歌词与常驻行同高，居中会重叠）。
+            else if self.island_lyrics_active() && crate::mac_window::notch_layout().is_some() {
+                layout.x[bar::PET]=Some(0.0);
+            }
         }
         // macOS 常驻行：图标样式沿用岛仔，位置左右分列——左=电源+额度环+吉祥宠，
         // 右=天气(温度)（+音乐/专注/铃铛），时钟交给系统菜单栏。
@@ -2133,6 +2137,33 @@ impl App {
             if ctx.input(|i|i.pointer.any_pressed()&&i.pointer.interact_pos().is_some_and(|p|!rect.contains(p)&&!notice_rect.is_some_and(|r|r.contains(p)))){self.notice_details=false;}
         }
         let pet_alpha=self.pet_a*(1.0-smoothstep(0.0,0.3,pc));
+        // 歌词态：封面 + 宠物 + 播放节奏条三者并排画在上方常驻行。下衍区只留歌词。
+        // 三者共用宠物的锚点与弹簧位置，保证开合动画同步；宠物组在歌词态被移到正中
+        // （见 update() 里 layout.x[PET]=0），封面取左侧、节奏条取右侧。
+        // 三者并排只在 macOS 刘海岛启用：无刘海平台 notch_shelf()=0，下衍歌词
+        // 与常驻行同高，再画封面/节奏条会重叠。用户反馈的正是刘海岛场景。
+        let lyrics_row=self.island_lyrics_active() && crate::mac_window::notch_layout().is_some()
+            && pet_alpha>0.004 && !minimal_pill;
+        if lyrics_row {
+            let y=if crate::mac_window::notch_layout().is_some(){0.0}else{(h.min(self.base_size().1)-bar_h()).max(0.0)/2.0};
+            let shelf=self.resident.target.notch_y*(1.0-anim::ease_in_out(smoothstep(0.0,0.85,pc)));
+            let row=base.scaled(cx-origin.x,15.0,1.0).shifted(0.0,y+shelf);
+            let anchor=cx-origin.x+self.resident.position(bar::PET);
+            // 封面（有则用真实歌曲封面，无则音符占位），画在宠物左侧。
+            if let Some((image,texture))=&self.music_artwork {
+                let [iw,ih]=image.size;
+                let uv_size=if iw>ih {egui::vec2(ih as f32/iw as f32,1.0)}else{egui::vec2(1.0,iw as f32/ih as f32)};
+                let uv=Rect::from_center_size(Pos2::new(0.5,0.5),uv_size);
+                row.painter.add(egui::epaint::RectShape::filled(row.rect(anchor-42.0,y+5.0,20.0,20.0),5.0*row.s,Color32::WHITE).with_texture(texture.id(),uv));
+            } else if self.media.is_music() {
+                row.fill(anchor-42.0,y+5.0,20.0,20.0,5.0,theme::CARD);
+                paint::note(&row,anchor-32.0,y+15.0,13.0,theme::WHITE);
+            }
+            // 播放节奏条，画在宠物右侧。
+            if self.media.is_music() {
+                paint::playback_bars(&row,anchor+34.0,y+15.0,self.t,self.media.playing,theme::WHITE);
+            }
+        }
         if pet_alpha>0.004 && !minimal_pill {
             // 刘海机型：宠物与电量/天气同行下挂（shelf），不能再用「岛体拉高量的一半」
             // 往下多挪 notch_y/2 —— 那正是下挂时宠物比电量、天气低一截、不在同一条
@@ -2774,19 +2805,24 @@ impl App {
         let lyric_alpha=if self.island_lyrics_active() {1.0-smoothstep(0.0,0.35,p)}else{0.0};
         if let Some(galley)=self.island_lyric_layout.clone().filter(|_|lyric_alpha>0.003) {
             let c=base.faded(lyric_alpha);
-            let content_width=self.lyric_bar_width()-self.lyric_focus_space();
-            let width=self.w.pos.max(content_width);
-            let left=local_cx-width/2.0;
             // 刘海机型下挂：内容中线移到刘海下缘之下（notch_shelf），不再压在死区上。
             let center_y=bar_h()/2.0+notch_shelf();
-            if let Some((image,texture))=&self.music_artwork {
-                let [width,height]=image.size;
-                let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};
-                let uv=Rect::from_center_size(Pos2::new(0.5,0.5),uv_size);
-                c.painter.add(egui::epaint::RectShape::filled(c.rect(left+12.0,center_y-10.0,20.0,20.0),5.0*c.s,Color32::WHITE).with_texture(texture.id(),uv));
-            } else {
-                c.fill(left+12.0,center_y-10.0,20.0,20.0,5.0,theme::CARD);
-                paint::note(&c,left+22.0,center_y,13.0,theme::WHITE);
+            // macOS 刘海岛：封面 + 宠物 + 节奏条已并排画在上方常驻行（见 frame()），
+            // 下衍只显示歌词并真正居中；无刘海平台保留原有下衍组合布局不动。
+            let lyric_only=crate::mac_window::notch_layout().is_some();
+            if !lyric_only {
+                let content_width=self.lyric_bar_width()-self.lyric_focus_space();
+                let width=self.w.pos.max(content_width);
+                let left=local_cx-width/2.0;
+                if let Some((image,texture))=&self.music_artwork {
+                    let [width,height]=image.size;
+                    let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};
+                    let uv=Rect::from_center_size(Pos2::new(0.5,0.5),uv_size);
+                    c.painter.add(egui::epaint::RectShape::filled(c.rect(left+12.0,center_y-10.0,20.0,20.0),5.0*c.s,Color32::WHITE).with_texture(texture.id(),uv));
+                } else {
+                    c.fill(left+12.0,center_y-10.0,20.0,20.0,5.0,theme::CARD);
+                    paint::note(&c,left+22.0,center_y,13.0,theme::WHITE);
+                }
             }
             let index=lyric.unwrap_or(0);
             let id=egui::Id::new("island-lyric-line");
@@ -2796,12 +2832,26 @@ impl App {
             }
             let shown=c.ui.ctx().animate_value_with_time(id,index as f32,0.18);
             let fade=1.0-(index as f32-shown).abs().min(1.0);
-            let position=c.pos(left+content_width-LYRIC_BAR_W/2.0,center_y-galley.size().y/2.0+(1.0-fade)*3.0);
+            // 刘海岛"下衍只歌词"用 local_cx 真正居中：galley 以 Align::Center 排版，
+            // pos.x 即文字视觉中心。旧算法 left+content_width-LYRIC_BAR_W/2 在开启
+            // 宠物时会多算 48pt 预留、偏右约 24pt，即"下衍歌词靠右"根因。
+            let lyric_x=if lyric_only {local_cx} else {
+                let content_width=self.lyric_bar_width()-self.lyric_focus_space();
+                let width=self.w.pos.max(content_width);
+                let left=local_cx-width/2.0;
+                left+content_width-LYRIC_BAR_W/2.0
+            };
+            let position=c.pos(lyric_x,center_y-galley.size().y/2.0+(1.0-fade)*3.0);
             c.painter.galley(position,galley,if lyric.is_some(){theme::WHITE}else{theme::GRAY});
-            paint::playback_bars(&c,left+content_width-21.0,center_y,self.t,self.media.playing,theme::WHITE);
-            if self.pomo.running {
-                let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
-                crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
+            if !lyric_only {
+                let content_width=self.lyric_bar_width()-self.lyric_focus_space();
+                let width=self.w.pos.max(content_width);
+                let left=local_cx-width/2.0;
+                paint::playback_bars(&c,left+content_width-21.0,center_y,self.t,self.media.playing,theme::WHITE);
+                if self.pomo.running {
+                    let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
+                    crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
+                }
             }
         }
         if lyric_alpha>=0.997 {return;}
