@@ -4,11 +4,16 @@
 use crate::layout::{Layout, Side};
 use serde::{Deserialize, Serialize};
 
-// 16: IslandHop 新增 `Ext::IslandState`，旧版收到未知枚举会整帧 decode 失败，
-// 因此握手阶段就拒绝协议不一致的对端（双端都用同一版 IslandHop 即可互联）。
+// 16: IslandHop 新增 `Ext::IslandState`，旧版收到未知枚举会整帧 decode 失败。
 // 17: `DriveStart` 携带被驱动屏幕名——客户端屏幕排列画布的「光标当前在」
 // 指示要靠它指向正确的对端（此前客户端永远显示「本机」）。
 pub const PROTOCOL_VERSION: u32 = 17;
+/// 握手可接受的最低对端协议版本。定在 17 而不是 16：bincode 按变体号 +
+/// 定长编码，17 的 `DriveStart`（结构体形态）与 16（裸单元变体）在同一
+/// 变体号上载荷不同，混跑会中途 decode 失败断流；两端升到 0.6.78+ 即可
+/// 互联（错误信息会明确提示升级）。放宽成区间是为了 18+ 时代只在真正
+/// 改消息时才重新收紧，不再重蹈「一个字段改动全网互踢」的覆辙。
+pub const PROTOCOL_FLOOR: u32 = 17;
 // IslandHop 使用独立的端口组，避免与仍在运行的旧版 OpenHop
 // （TCP 24850 / UDP 24851）抢占端口和组播发现组。双端都用 IslandHop 即可互联。
 pub const DEFAULT_PORT: u16 = 24950;
@@ -111,6 +116,18 @@ pub struct FolderEntry {
     pub size: u64,
     pub mtime: u64,
     pub offer: u64,
+}
+
+/// `DriveStart` 的线格式：17+ 发送结构体形态（`{"DriveStart":{"target":…}}`），
+/// 16 发送裸字符串单元变体（`"DriveStart"`）。untagged 让 17+ 客户端两代都解得开；
+/// 序列化端按对端版本选择形态（向 16 对端干脆不发——老画布本就不显示目标）。
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum DriveStartWire {
+    Targeted {
+        target: Option<String>,
+    },
+    Legacy(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -632,5 +649,18 @@ mod tests {
         assert_eq!(decode(&encode(&m)).unwrap(), m);
         // Mouse moves are the hot path: keep them tiny.
         assert!(encode(&Msg::Move { x: 100, y: 200 }).len() <= 12);
+    }
+
+    #[test]
+    fn drive_start_wire_matches_v17_and_is_rejected_below_floor() {
+        // 与 0.6.78（v17）的 bincode 编码逐字节一致：变体号 25 + Some 标记 + 字符串。
+        // 变体号若因增删变体而漂移，新旧版本将中途 decode 失败——这是线格式红线。
+        let mut expected = vec![25u8, 0, 0, 0, 1];
+        expected.extend_from_slice(&11u64.to_le_bytes());
+        expected.extend_from_slice(b"MacBook Pro");
+        assert_eq!(encode(&Msg::DriveStart { target: Some("MacBook Pro".into()) }), expected);
+        assert_eq!(encode(&Msg::DriveStart { target: None }), vec![25u8, 0, 0, 0, 0]);
+        let m = Msg::DriveStart { target: Some("屏幕".into()) };
+        assert_eq!(decode(&encode(&m)).unwrap(), m);
     }
 }

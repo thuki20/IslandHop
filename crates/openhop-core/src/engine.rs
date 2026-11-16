@@ -15,7 +15,7 @@ use crate::keys;
 use crate::layout::{apply_delta_mon, edge_fraction, entry_point, touching_edge_mon, Layout, Side, SERVER};
 use crate::net::{derive_psk, handshake, Link, SecureReceiver, CHUNK};
 use crate::platform::{self, dnd, Capture, Injector, InputEvent};
-use crate::protocol::{ClipData, DriveEv, Ext, FileMeta, MouseButton, Msg, OfferKind, Os, Rect, WinInfo, DEFAULT_PORT, PROTOCOL_VERSION};
+use crate::protocol::{ClipData, DriveEv, Ext, FileMeta, MouseButton, Msg, OfferKind, Os, Rect, WinInfo, DEFAULT_PORT, PROTOCOL_FLOOR, PROTOCOL_VERSION};
 use crate::wol;
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{select, tick, Receiver, Sender};
@@ -940,6 +940,8 @@ enum NetEvent {
         addr: SocketAddr,
         link: Link,
         device: Option<String>,
+        /// 对端协议版本：决定 `DriveStart` 的发送形态（17+ 带 target，16 不发）。
+        version: u32,
     },
     /// A computer just paired with the code; remember its key.
     Paired {
@@ -962,6 +964,8 @@ struct Peer {
     screen: Rect,
     addr: SocketAddr,
     link: Link,
+    /// 对端协议版本（Hello 里的 version）。
+    version: u32,
 }
 
 /// A file drag carried from one screen to another.
@@ -1309,7 +1313,7 @@ impl Server {
                 self.ctx.note(note(format!("已与 {name} 配对"), "今后将自动连接。", vec![]));
                 self.update_status();
             }
-            NetEvent::Connected { id, mut name, os, screen, addr, link, device } => {
+            NetEvent::Connected { id, mut name, os, screen, addr, link, device, version } => {
                 // A reconnect from the same computer replaces the stale session
                 // (keeps its place in the arrangement).
                 if let Some(old) = self.peer_by_name(&name) {
@@ -1341,7 +1345,7 @@ impl Server {
                         l.send_bulk_wait(Msg::Ext { to: to.clone(), from: from.to_string(), ext });
                     });
                 }
-                self.peers.insert(id, Peer { name, device, os, screen, addr, link });
+                self.peers.insert(id, Peer { name, device, os, screen, addr, link, version });
                 self.send_group(true);
                 self.update_status();
             }
@@ -2018,7 +2022,10 @@ impl Server {
                 self.drive_enter(d, side, frac);
             }
         }
-        self.send(c, Msg::DriveStart { target: Some(target.clone()) });
+        // 握手门控保证对端 ≥ 17，线格式必然一致；对端版本号留作 18+ 时代的降级开关。
+        if self.peers.get(&c).map(|p| p.version).unwrap_or(PROTOCOL_VERSION) >= PROTOCOL_FLOOR {
+            self.send(c, Msg::DriveStart { target: Some(target.clone()) });
+        }
         self.update_status();
     }
 
@@ -2386,7 +2393,7 @@ fn spawn_acceptor(listener: TcpListener, ctx: Ctx, routes: Routes, net_tx: Sende
                 let _ = stream.set_nonblocking(false);
                 let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                 let me = ctx.cfg.name.clone();
-                let (link, mut rx, name, os, screen, device) = match accept_peer(stream, &ctx, id, net_tx.clone()) {
+                let (link, mut rx, name, os, screen, device, version) = match accept_peer(stream, &ctx, id, net_tx.clone()) {
                     Ok(v) => v,
                     Err(e) => {
                         log::warn!("rejected connection from {addr}: {e:#}");
@@ -2394,7 +2401,7 @@ fn spawn_acceptor(listener: TcpListener, ctx: Ctx, routes: Routes, net_tx: Sende
                     }
                 };
                 let peer_name = name.clone();
-                if net_tx.send(NetEvent::Connected { id, name, os, screen, addr, link, device }).is_err() {
+                if net_tx.send(NetEvent::Connected { id, name, os, screen, addr, link, device, version }).is_err() {
                     return;
                 }
                 loop {
@@ -2423,7 +2430,7 @@ fn spawn_acceptor(listener: TcpListener, ctx: Ctx, routes: Routes, net_tx: Sende
 /// Work out which secret the connecting computer must prove, run the
 /// handshake, and (for a pairing) hand it a key of its own.
 #[allow(clippy::type_complexity)]
-fn accept_peer(mut stream: TcpStream, ctx: &Ctx, id: u64, net_tx: Sender<NetEvent>) -> Result<(Link, SecureReceiver, String, Os, Rect, Option<String>)> {
+fn accept_peer(mut stream: TcpStream, ctx: &Ctx, id: u64, net_tx: Sender<NetEvent>) -> Result<(Link, SecureReceiver, String, Os, Rect, Option<String>, u32)> {
     let auth = crate::net::read_auth(&mut stream)?;
     let me = ctx.cfg.name.clone();
     match auth {
@@ -2431,14 +2438,14 @@ fn accept_peer(mut stream: TcpStream, ctx: &Ctx, id: u64, net_tx: Sender<NetEven
             if ctx.cfg.passphrase.trim().is_empty() {
                 bail!("this computer uses pairing codes, not a passphrase");
             }
-            let (link, rx, name, os, screen) = server_handshake(stream, &derive_psk(&ctx.cfg.passphrase), &me, id, net_tx)?;
-            Ok((link, rx, name, os, screen, None))
+            let (link, rx, name, os, screen, version) = server_handshake(stream, &derive_psk(&ctx.cfg.passphrase), &me, id, net_tx)?;
+            Ok((link, rx, name, os, screen, None, version))
         }
         crate::net::Auth::Key { device } => {
             let key = ctx.trust.lock().get(&device).and_then(|t| crate::config::hex_key(&t.key));
             let Some(key) = key else { bail!("unknown computer {device}: pair it again with the code") };
-            let (link, rx, name, os, screen) = server_handshake(stream, &key, &me, id, net_tx)?;
-            Ok((link, rx, name, os, screen, Some(device)))
+            let (link, rx, name, os, screen, version) = server_handshake(stream, &key, &me, id, net_tx)?;
+            Ok((link, rx, name, os, screen, Some(device), version))
         }
         crate::net::Auth::Pair { device, .. } => {
             let code = {
@@ -2449,7 +2456,7 @@ fn accept_peer(mut stream: TcpStream, ctx: &Ctx, id: u64, net_tx: Sender<NetEven
                 p.code.clone()
             };
             match server_handshake(stream, &crate::net::pairing_psk(&code), &me, id, net_tx.clone()) {
-                Ok((link, rx, name, os, screen)) => {
+                Ok((link, rx, name, os, screen, version)) => {
                     let key = crate::config::random_hex(32);
                     link.send(Msg::Paired { server_device: ctx.cfg.device_id.clone(), key: key.clone() });
                     ctx.trust.lock().insert(device.clone(), crate::config::Trusted { name: name.clone(), key: key.clone() });
@@ -2459,7 +2466,7 @@ fn accept_peer(mut stream: TcpStream, ctx: &Ctx, id: u64, net_tx: Sender<NetEven
                         p.failures = 0;
                     }
                     let _ = net_tx.send(NetEvent::Paired { device: device.clone(), name: name.clone(), key });
-                    Ok((link, rx, name, os, screen, Some(device)))
+                    Ok((link, rx, name, os, screen, Some(device), version))
                 }
                 Err(e) => {
                     let mut p = ctx.pair.lock();
@@ -2539,12 +2546,12 @@ fn route_or_handle(m: Msg, me: &str, inbox: &Inbox, routes: &Routes, emit: impl 
     }
 }
 
-fn server_handshake(stream: TcpStream, psk: &[u8; 32], my_name: &str, id: u64, net_tx: Sender<NetEvent>) -> Result<(Link, SecureReceiver, String, Os, Rect)> {
+fn server_handshake(stream: TcpStream, psk: &[u8; 32], my_name: &str, id: u64, net_tx: Sender<NetEvent>) -> Result<(Link, SecureReceiver, String, Os, Rect, u32)> {
     let (tx, mut rx) = handshake(stream, psk, false)?;
     rx.set_timeout(Some(Duration::from_secs(10)))?;
     let hello = rx.recv().context("client did not say hello (wrong passphrase?)")?;
     let Msg::Hello { version, name, os, screen } = hello else { bail!("unexpected first message") };
-    if version != PROTOCOL_VERSION {
+    if !(PROTOCOL_FLOOR..=PROTOCOL_VERSION).contains(&version) {
         let _ = tx.send(&Msg::Welcome { version: PROTOCOL_VERSION, name: my_name.to_string(), os: Os::current() });
         bail!("{name} runs OpenHop protocol v{version}, this computer runs v{PROTOCOL_VERSION}: update both to the same version");
     }
@@ -2553,7 +2560,7 @@ fn server_handshake(stream: TcpStream, psk: &[u8; 32], my_name: &str, id: u64, n
     let link = Link::new(tx, move || {
         let _ = net_tx.send(NetEvent::Disconnected(id));
     });
-    Ok((link, rx, name, os, screen))
+    Ok((link, rx, name, os, screen, version))
 }
 
 // ---------------------------------------------------------------- client
@@ -2844,7 +2851,7 @@ impl Client {
             crate::net::Auth::Pair { .. } => "wrong pairing code",
         };
         let (server_name, server_os) = match rx.recv().map_err(|_| anyhow!(refused))? {
-            Msg::Welcome { version, name, os } if version == PROTOCOL_VERSION => (name, os),
+            Msg::Welcome { version, name, os } if (PROTOCOL_FLOOR..=PROTOCOL_VERSION).contains(&version) => (name, os),
             Msg::Welcome { version, .. } => {
                 bail!("the server runs OpenHop protocol v{version}, this computer runs v{PROTOCOL_VERSION}: update both to the same version")
             }
