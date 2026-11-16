@@ -595,6 +595,9 @@ mod tests {
             let start = std::time::Instant::now();
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // macOS 的 accept 会继承 listener 的 O_NONBLOCK，直接 read 会立即
+                    // 返回 WouldBlock（Linux/Windows 不继承），这里显式切回阻塞模式。
+                    let _ = stream.set_nonblocking(false);
                     stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
                     let mut request = [0; 4096];
                     let n = stream.read(&mut request).unwrap();

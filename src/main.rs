@@ -872,7 +872,7 @@ impl eframe::App for Shell {
                         let want=!daozai::macos_sys::autostart::enabled();
                         match daozai::macos_sys::autostart::set(want) {
                             Ok(())=>{self.autostart=want;self.app.say(if want {"已开启开机自启（下次登录自动打开）"}else{"已关闭开机自启"});}
-                            Err(e)=>self.app.say(&e),
+                            Err(e)=>self.app.say(e),
                         }
                     }
                 },
