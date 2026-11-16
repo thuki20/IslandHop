@@ -129,6 +129,10 @@ enum Action {
     PairAddr(String, String),
     Place(String, i32),
     AddScreen(String),
+    /// 删除一条对端屏幕名（改名 / 换机后的旧名残留）。本机占位块不可删。
+    RemoveScreen(String),
+    /// 重命名一条对端屏幕名：保留位置，只改显示名（如 MacBook → MacBook-Pro）。
+    RenameScreen(String, String),
 }
 
 pub struct CrossScreen {
@@ -146,6 +150,9 @@ pub struct CrossScreen {
     pair_code: String,
     direct_addr: String,
     new_screen: String,
+    /// 对端重命名：当前正在改的名字 + 输入框缓冲。None 表示未进入重命名。
+    rename_target: Option<String>,
+    rename_buf: String,
     last_notes: Vec<String>,
     /// 用户勾选「不再显示权限相关提示」后，不再每次启动刷一屏授权指引。
     hide_permission_hint: bool,
@@ -180,6 +187,8 @@ impl CrossScreen {
             pair_code: String::new(),
             direct_addr: String::new(),
             new_screen: String::new(),
+            rename_target: None,
+            rename_buf: String::new(),
             last_notes: Vec::new(),
             hide_permission_hint: read_hide_permission_hint(),
             path,
@@ -269,6 +278,33 @@ impl CrossScreen {
                     self.cfg.layout.place(name.trim(), next, 0);
                     if let Some(e) = &self.engine { e.set_layout(self.cfg.layout.clone()); }
                     if self.cfg_loaded { let _ = self.cfg.save(&self.path); }
+                }
+            }
+            Action::RemoveScreen(name) => {
+                // 只删对端条目：本机是布局里的隐含 SERVER(0,0)，从不落在
+                // layout.screens 里，这里 remove 只可能命中历史残留的对端名。
+                self.cfg.layout.remove(&name);
+                if let Some(e) = &self.engine { e.set_layout(self.cfg.layout.clone()); }
+                if self.cfg_loaded { let _ = self.cfg.save(&self.path); }
+                self.last_notes.retain(|line| !line.starts_with(&format!("{name} · ")));
+            }
+            Action::RenameScreen(from, to) => {
+                let to = to.trim().to_string();
+                if to.is_empty() || to == from || is_loopback_entry(&to) { return; }
+                let Some(pos) = self.cfg.layout.screens.iter().position(|s| s.name == from) else { return; };
+                let (x, y) = { let s = &self.cfg.layout.screens[pos]; (s.x, s.y) };
+                // 先清掉旧名与目标名的残留，再用 place 放回原坐标；place 内部
+                // 自带同名去重，避免改名后出现两条显示器。对端不会落在 (0,0)
+                // （那是本机 SERVER 位），所以 place 不会被 (0,0) 守卫跳过。
+                self.cfg.layout.remove(&from);
+                self.cfg.layout.remove(&to);
+                self.cfg.layout.place(&to, x, y);
+                if let Some(e) = &self.engine { e.set_layout(self.cfg.layout.clone()); }
+                if self.cfg_loaded { let _ = self.cfg.save(&self.path); }
+                for line in &mut self.last_notes {
+                    if line.starts_with(&format!("{from} · ")) {
+                        *line = line.replacen(from.as_str(), to.as_str(), 1);
+                    }
                 }
             }
         }
@@ -423,14 +459,19 @@ impl CrossScreen {
         };
         if s.discovered.is_empty() && s.peers.is_empty() {
             let dots = ".".repeat((ui.input(|i| i.time) * 2.0) as usize % 4);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 54.0), egui::Sense::hover());
-            let p = ui.painter();
-            p.rect_filled(rect, 10.0, card);
-            p.rect_stroke(rect, 10.0, egui::Stroke::new(1.0, border), egui::StrokeKind::Inside);
-            p.text(rect.left_center() + egui::vec2(16.0, 0.0), egui::Align2::LEFT_CENTER,
-                format!("◌ 正在扫描局域网{dots}  请确认对端已启动、口令一致、防火墙放行 TCP {} / UDP {}",
-                    DEFAULT_PORT, DISCOVERY_PORT),
-                egui::FontId::proportional(11.0), ui.visuals().weak_text_color());
+            ui.label(RichText::new(format!("◌ 正在扫描局域网{dots} · 暂未发现对端")).size(11.5).color(strong));
+            // 空扫描结果几乎都是环境问题（防火墙 / 网段 / 虚拟网卡），不是口令：
+            // 发现包不携带口令，口令只在后续 TCP 握手校验。给出可逐项核对的清单，
+            // 并把"直连兜底"入口点明，避免用户对着"正在扫描"无限等待。
+            ui.add_space(2.0);
+            for line in [
+                "1. 对端也要打开本机开关并保持在同一个 Wi-Fi / 网段（不能用访客网络或 AP 隔离）。".to_string(),
+                format!("2. 两台机器都放行防火墙入站：UDP {}（发现）与 TCP {}（连接）。", DISCOVERY_PORT, DEFAULT_PORT),
+                "3. 暂时退出 VPN / 加速器 / 虚拟网卡，它们会抢走广播出口。".to_string(),
+                "4. 仍搜不到：用下方「直接输入地址连接」填对端 IP 手动连一次。".to_string(),
+            ] {
+                ui.label(RichText::new(line).size(10.5).color(ui.visuals().weak_text_color()));
+            }
             return;
         }
         let needs_code = s.needs_pairing;
@@ -573,6 +614,9 @@ impl CrossScreen {
         p.text(rect.left_bottom() + egui::vec2(12.0, -10.0), egui::Align2::LEFT_BOTTOM,
             format!("● 光标当前在：{}", if active.is_empty() { "本机" } else { &active }),
             egui::FontId::proportional(10.0), Color32::from_rgb(52, 178, 116));
+        let peer_count = self.cfg.layout.screens.iter().filter(|s| !is_loopback_entry(&s.name)).count();
+        ui.label(RichText::new(format!("对端屏幕（{} 台）· 可重命名 / 删除", peer_count))
+            .size(11.5).color(Color32::from_rgb(150, 165, 185)));
         let screens = self.cfg.layout.screens.clone();
         for s in &screens {
             if is_loopback_entry(&s.name) { continue; }
@@ -580,7 +624,26 @@ impl CrossScreen {
                 ui.label(RichText::new(format!("{}  x={}", s.name, s.x)).size(10.5));
                 if ui.small_button("◀").clicked() { actions.push(Action::Place(s.name.clone(), s.x - 1)); }
                 if ui.small_button("▶").clicked() { actions.push(Action::Place(s.name.clone(), s.x + 1)); }
+                if ui.small_button("✎").on_hover_text("重命名（改成对端真实主机名）").clicked() {
+                    self.rename_target = Some(s.name.clone());
+                    self.rename_buf = s.name.clone();
+                }
+                if ui.small_button("✕").on_hover_text("删除这条对端屏幕名").clicked() {
+                    actions.push(Action::RemoveScreen(s.name.clone()));
+                    if self.rename_target.as_deref() == Some(s.name.as_str()) { self.rename_target = None; }
+                }
             });
+            // 该条目正在重命名：就地展开输入框，避免每台机器各占一个状态字段。
+            if self.rename_target.as_deref() == Some(s.name.as_str()) {
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(150.0));
+                    if ui.small_button("确定").clicked() {
+                        actions.push(Action::RenameScreen(s.name.clone(), self.rename_buf.clone()));
+                        self.rename_target = None;
+                    }
+                    if ui.small_button("取消").clicked() { self.rename_target = None; }
+                });
+            }
         }
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.new_screen).desired_width(120.0).hint_text("加入对端屏幕名"));
@@ -589,6 +652,8 @@ impl CrossScreen {
                 self.new_screen.clear();
             }
         });
+        ui.label(RichText::new(format!("本机：{}（居中固定，无需添加；鼠标移到画布边缘切到相邻对端）", self.cfg.name.trim()))
+            .size(10.0).color(Color32::from_rgb(120, 140, 165)));
     }
     /// 权限状态一目了然；系统授权窗口只在用户主动点按钮时才弹。
     fn view_permissions(&mut self, ui: &mut Ui) {

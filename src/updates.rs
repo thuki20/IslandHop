@@ -1,6 +1,6 @@
 //! 用户主动检查、下载并安装正式版更新。
 use eframe::egui;
-use std::{io::{Read, Write}, path::PathBuf, sync::{mpsc::{self, Receiver}, Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
+use std::{io::{Read, Write}, path::PathBuf, sync::{mpsc::{self, Receiver}, Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
 const REPOSITORY: &str = "https://github.com/thuki20/IslandHop";
 const API: &str = "https://api.github.com/repos/thuki20/IslandHop/releases/latest";
@@ -52,9 +52,13 @@ pub(crate) struct State {
     dialog_open: bool,
     focus_requested: bool,
     logo: Option<egui::TextureHandle>,
-    /// 启动后的自动检查只做一次（每次运行一个生命周期）。
-    auto_checked: bool,
+    /// 上次自动检查的时间。常驻软件可能在后台开很久，只在启动时查一次会让
+    /// 用户长时间收不到新版本；改为按 TTL 定时复查（手动检查不重置它）。
+    last_auto_check: Option<Instant>,
 }
+
+/// 自动复查间隔：常驻桌面软件开几周是常态，6 小时一次足够及时又不打扰。
+const AUTO_CHECK_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 impl Drop for State {
     fn drop(&mut self) { if let Some(cancel) = &self.cancel { cancel.store(true, Ordering::Relaxed); } }
@@ -62,11 +66,14 @@ impl Drop for State {
 
 impl State {
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        // 启动后自动检查一次更新：发现新版本直接弹更新窗（与手动检查一致）。
-        // 测试构建不自动检查，避免录制测试联网。
+        // 启动即查一次，此后按 AUTO_CHECK_TTL 定时复查：桌面软件常驻数周，
+        // 只在启动时查一次会让用户长期停在旧版本。发现新版本弹更新窗，
+        // 与手动检查走同一条路径。测试构建不自动检查，避免录制测试联网。
         #[cfg(not(test))]
-        if !self.auto_checked && self.rx.is_none() && self.result.is_none() {
-            self.auto_checked = true;
+        if self.rx.is_none()
+            && self.last_auto_check.map_or(true, |t| t.elapsed() >= AUTO_CHECK_TTL)
+        {
+            self.last_auto_check = Some(Instant::now());
             let (tx, rx) = mpsc::channel(); self.rx = Some(rx);
             let ctx = ctx.clone();
             std::thread::spawn(move || { let _ = tx.send(Event::Checked(check())); ctx.request_repaint(); });

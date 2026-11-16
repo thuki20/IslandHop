@@ -26,13 +26,13 @@ $entries=@(
 )
 foreach($entry in $entries){
     $link=$shell.CreateShortcut($entry[0]);$link.TargetPath=$exePath;$link.Arguments=$entry[1]
-    $link.WorkingDirectory=$installDir;$link.IconLocation=$exePath+',0';$link.Description='IslandHop Daozai';$link.Save()
+    $link.WorkingDirectory=$installDir;$link.IconLocation=$exePath+',0';$link.Description='IslandHop';$link.Save()
 }
 $key='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Daozai'
 New-Item -Path $key -Force | Out-Null
 $version=(Get-Item -LiteralPath $exePath).VersionInfo.FileVersion
 $psExe=Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$values=@{DisplayName='IslandHop Daozai';DisplayVersion=$version;Publisher='IslandHop';InstallLocation=$installDir;DisplayIcon=$exePath+',0';UninstallString=('"'+$psExe+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $installDir 'uninstall.ps1')+'"')}
+$values=@{DisplayName='IslandHop';DisplayVersion=$version;Publisher='IslandHop';InstallLocation=$installDir;DisplayIcon=$exePath+',0';UninstallString=('"'+$psExe+'" -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $installDir 'uninstall.ps1')+'"')}
 foreach($name in $values.Keys){New-ItemProperty -Path $key -Name $name -Value $values[$name] -PropertyType String -Force | Out-Null}
 foreach($name in @('NoModify','NoRepair')){New-ItemProperty -Path $key -Name $name -Value 1 -PropertyType DWord -Force | Out-Null}
 Start-Process -FilePath $exePath -WorkingDirectory $installDir -WindowStyle Hidden
