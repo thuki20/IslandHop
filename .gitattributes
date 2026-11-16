@@ -1,0 +1,5 @@
+# 所有 shell 脚本强制 LF：macOS /bin/sh(bash 3.2 POSIX) 不支持 CRLF，
+# shebang 变成 "#!/usr/bin/env bash\r" 会被 env 当成 bash\r 找不到，
+# 回退到 /bin/sh 后 `set -euo pipefail` 报 invalid option name，CI 直接挂。
+*.sh text eol=lf
+*.ps1 text eol=crlf
