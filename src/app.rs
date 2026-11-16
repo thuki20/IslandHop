@@ -1801,10 +1801,16 @@ impl App {
         if let Some(extra)=self.weather_pill_extra(&ctx){ layout.widen(bar::WEATHER,extra); }
         if self.pet_enabled() {
             if let Some(a)=self.notice.as_ref().filter(|_|!self.compact_notices()&&!self.open){layout.x[bar::PET]=Some(22.0-(self.notice_size(a).0+self.pet_space())/2.0);}
-            // 歌词态：刘海岛的宠物回到常驻行正中（封面在左、节奏条在右，三者并排），
-            // 下衍只放居中歌词；无刘海平台保持原样（那里歌词与常驻行同高，居中会重叠）。
+            // 歌词态：物理刘海是死区，正中画什么用户都看不见。宠物必须落在刘海
+            // 左侧可见区（封面紧随其左），节奏条落到右侧可见区——沿袭不听歌时
+            // 「图标分列刘海两侧」的观感；下衍只放居中歌词。无刘海平台保持原样
+            // （那里歌词与常驻行同高，居中会重叠）。
             else if self.island_lyrics_active() && crate::mac_window::notch_layout().is_some() {
-                layout.x[bar::PET]=Some(0.0);
+                let half=crate::mac_window::notch_layout()
+                    .map(|(gap,_)|gap/2.0)
+                    .unwrap_or(crate::app::NOTCH_FALLBACK_GAP/2.0);
+                // 宠物贴刘海左缘外侧（可见带内），封面再往左 42；右缘外侧留给节奏条。
+                layout.x[bar::PET]=Some(-half-14.0);
             }
         }
         // macOS 常驻行：图标样式沿用岛仔，位置左右分列——左=电源+额度环+吉祥宠，
@@ -2137,17 +2143,17 @@ impl App {
             if ctx.input(|i|i.pointer.any_pressed()&&i.pointer.interact_pos().is_some_and(|p|!rect.contains(p)&&!notice_rect.is_some_and(|r|r.contains(p)))){self.notice_details=false;}
         }
         let pet_alpha=self.pet_a*(1.0-smoothstep(0.0,0.3,pc));
-        // 歌词态：封面 + 宠物 + 播放节奏条三者并排画在上方常驻行。下衍区只留歌词。
-        // 三者共用宠物的锚点与弹簧位置，保证开合动画同步；宠物组在歌词态被移到正中
-        // （见 update() 里 layout.x[PET]=0），封面取左侧、节奏条取右侧。
-        // 三者并排只在 macOS 刘海岛启用：无刘海平台 notch_shelf()=0，下衍歌词
-        // 与常驻行同高，再画封面/节奏条会重叠。用户反馈的正是刘海岛场景。
+        // 歌词态（macOS 刘海岛）：物理刘海是死区，正中画什么用户都看不见。图标必须
+        // 和不听歌时一样分列刘海左右两侧可见区——左＝封面+宠物，右＝播放节奏条；
+        // 下衍只留居中歌词（见 shared_header）。三者共用宠物锚点保证开合动画同步。
+        // 仅刘海岛启用：无刘海平台 notch_shelf()=0，下衍歌词与常驻行同高，再画会重叠。
         let lyrics_row=self.island_lyrics_active() && crate::mac_window::notch_layout().is_some()
             && pet_alpha>0.004 && !minimal_pill;
         if lyrics_row {
             let y=if crate::mac_window::notch_layout().is_some(){0.0}else{(h.min(self.base_size().1)-bar_h()).max(0.0)/2.0};
             let shelf=self.resident.target.notch_y*(1.0-anim::ease_in_out(smoothstep(0.0,0.85,pc)));
             let row=base.scaled(cx-origin.x,15.0,1.0).shifted(0.0,y+shelf);
+            // 宠物锚点已在布局阶段移到刘海左侧可见区（-half-14），封面紧随其左。
             let anchor=cx-origin.x+self.resident.position(bar::PET);
             // 封面（有则用真实歌曲封面，无则音符占位），画在宠物左侧。
             if let Some((image,texture))=&self.music_artwork {
@@ -2159,9 +2165,12 @@ impl App {
                 row.fill(anchor-42.0,y+5.0,20.0,20.0,5.0,theme::CARD);
                 paint::note(&row,anchor-32.0,y+15.0,13.0,theme::WHITE);
             }
-            // 播放节奏条，画在宠物右侧。
+            // 播放节奏条画在刘海右侧可见区（与不听歌时音乐图标同侧），正中死区留空。
             if self.media.is_music() {
-                paint::playback_bars(&row,anchor+34.0,y+15.0,self.t,self.media.playing,theme::WHITE);
+                let half=crate::mac_window::notch_layout()
+                    .map(|(gap,_)|gap/2.0)
+                    .unwrap_or(crate::app::NOTCH_FALLBACK_GAP/2.0);
+                paint::playback_bars(&row,cx-origin.x+half+14.0,y+15.0,self.t,self.media.playing,theme::WHITE);
             }
         }
         if pet_alpha>0.004 && !minimal_pill {
