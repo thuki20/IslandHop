@@ -2,7 +2,7 @@
 # 目标：push 到 main 即自动产出可安装的 Win 包，并挂到与 macOS 同一个 GitHub Release。
 #
 # 产物（dist/）：
-#   Daozai-Setup-v<版本>-x64.exe        安装版（NSIS，日常下载这个）
+#   IslandHop-Setup-v<版本>-x64.exe     安装版（NSIS，日常下载这个）
 #   IslandHop-v<版本>-windows-x64.zip   便携版（解压即用，应用内更新也认这个包）
 #   SHA256SUMS.txt                      校验和
 #
@@ -84,7 +84,7 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          $setup = "dist/Daozai-Setup-v$env:VERSION-x64.exe"
+          $setup = "dist/IslandHop-Setup-v$env:VERSION-x64.exe"
           $zip = "dist/IslandHop-v$env:VERSION-windows-x64.zip"
           foreach ($f in @($setup, $zip, "dist/SHA256SUMS.txt")) {
             if (-not (Test-Path $f)) { throw "缺少产物：$f" }
@@ -97,7 +97,7 @@ jobs:
         with:
           name: IslandHop-windows-${{ github.run_number }}
           path: |
-            dist/Daozai-Setup-*.exe
+            dist/IslandHop-Setup-*.exe
             dist/IslandHop-*-windows-x64.zip
             dist/SHA256SUMS.txt
           retention-days: 30
@@ -110,9 +110,11 @@ jobs:
           name: v${{ steps.meta.outputs.version }}
           # 不写 body：更新说明由 macOS 工作流维护，这里只补 Windows 资产
           files: |
-            dist/Daozai-Setup-*.exe
+            dist/IslandHop-Setup-*.exe
             dist/IslandHop-*-windows-x64.zip
             dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
           overwrite_files: true
-          make_latest: false
+          # 必须标记为 Latest：≤0.6.77 的客户端只查 GitHub releases/latest，
+          # 不标记的话它们永远看到旧版本、提示「当前已是最新版本」。
+          make_latest: true
