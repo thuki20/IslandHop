@@ -19,7 +19,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # 两个平台的清单都尝试拉取：谁存在就镜像谁（缺一个不影响另一个）。
-got_any = 0
+got_any=0
 for mf in manifest.json manifest-windows.json; do
   if curl -fsSL --max-time 30 "https://github.com/$REPO/releases/latest/download/$mf" \
        -o "$TMP/$mf" 2>/dev/null; then
