@@ -530,6 +530,18 @@ impl CrossScreen {
             return;
         }
         let needs_code = s.needs_pairing;
+        if s.discovered.is_empty() {
+            // 广播被路由器过滤（AP 隔离 / 无线组播过滤）时，发现列表是空的但已经直连上了，
+            // 这里说清楚，免得用户以为列表坏了。
+            let names: Vec<&str> = s.peers.iter().map(|p| p.name.as_str()).collect();
+            ui.label(RichText::new(format!(
+                "已直连 {}。没收到它的局域网广播（对端没在广播，或被网络/防火墙拦了），当前用记住的地址连接。",
+                names.join("、")
+            ))
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()));
+            ui.add_space(4.0);
+        }
         for d in &s.discovered {
             let connected = s.peers.iter().any(|p| p.name == d.name || p.addr == d.addr.to_string());
             let paired = s.paired.iter().any(|p| p.device == d.device);

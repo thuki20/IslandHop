@@ -2605,6 +2605,8 @@ struct Client {
     /// When this computer's own mouse last reported the edge / its position.
     edge_sent: Instant,
     pos_sent: Instant,
+    /// 上一次向「记得的地址」单播信标的时间（广播被过滤时的兜底）。
+    last_announce: Instant,
 }
 
 /// Where and how the client connects.
@@ -2671,6 +2673,7 @@ impl Client {
             last_local: (0, 0),
             edge_sent: Instant::now(),
             pos_sent: Instant::now(),
+            last_announce: Instant::now() - Duration::from_secs(60),
         };
         // This computer's keyboard and mouse can drive the others too
         // (not on Wayland, which doesn't allow capturing them).
@@ -2693,6 +2696,12 @@ impl Client {
                 None => c.pick_server(&last_failed),
             };
             let Some(t) = target else {
+                // 广播被路由器过滤时发现列表恒为空：定期向「记得的地址」单播一条信标，
+                // 对端收到后会回一条单播，双方的设备列表就都能恢复。
+                if c.last_announce.elapsed() > Duration::from_secs(5) {
+                    c.last_announce = Instant::now();
+                    c.ctx.discovery.announce_to(&c.seed_addrs());
+                }
                 let needs = c.needs_pairing();
                 {
                     let mut st = c.ctx.status.lock();
@@ -2783,7 +2792,9 @@ impl Client {
                 let found = match self.manual_addr() {
                     Some((addr, _)) => Some(addr),
                     None => self.ctx.discovery.servers().into_iter().find(|s| s.device == dev).map(|s| s.addr),
-                };
+                }
+                // 广播被路由器过滤时，靠上次连过的地址也能回到这台服务器。
+                .or_else(|| self.remembered_addr(&name));
                 return found.map(|addr| Target { addr, label: name, auth: crate::net::Auth::Key { device: me }, psk: key, pairing: None });
             }
         }
@@ -2796,13 +2807,54 @@ impl Client {
             return Some(Target { addr, label, auth: crate::net::Auth::Passphrase, psk, pairing: None });
         }
         let recently_failed = |a: &SocketAddr| failed.get(a).map(|t| t.elapsed() < Duration::from_secs(5)).unwrap_or(false);
-        self.ctx
+        if let Some(t) = self
+            .ctx
             .discovery
             .servers()
             .into_iter()
             .filter(|s| self.ctx.cfg.server_name.as_ref().map(|n| n == &s.name).unwrap_or(true))
             .find(|s| !recently_failed(&s.addr))
             .map(|s| Target { addr: s.addr, label: s.name, auth: crate::net::Auth::Passphrase, psk, pairing: None })
+        {
+            return Some(t);
+        }
+        // 3. 广播被路由器/防火墙过滤时的兜底：直连上次连过的地址。
+        //    Windows 上实测过「UDP 24951 广播发得出去、对端广播进不来」（AP 隔离 /
+        //    无线组播过滤），此时发现列表恒为空，但 TCP 24950 一直通。
+        //    兜底地址的连接失败退避更长（20 秒），避免把日志刷爆。
+        let stale = |a: &SocketAddr| failed.get(a).map(|t| t.elapsed() < Duration::from_secs(20)).unwrap_or(false);
+        self.ctx
+            .cfg
+            .last_ips
+            .iter()
+            .filter(|(n, _)| self.ctx.cfg.server_name.as_ref().map(|s| s == *n).unwrap_or(true))
+            .filter_map(|(name, ip)| ip.parse::<IpAddr>().ok().map(|ip| (name.clone(), SocketAddr::new(ip, self.ctx.cfg.port))))
+            .find(|(_, addr)| !stale(addr))
+            .map(|(name, addr)| Target { addr, label: name, auth: crate::net::Auth::Passphrase, psk, pairing: None })
+    }
+
+    /// 上次连过的地址（广播被过滤时也能直连回去）。
+    fn remembered_addr(&self, name: &str) -> Option<SocketAddr> {
+        let ip = self.ctx.cfg.last_ips.get(name)?.parse::<IpAddr>().ok()?;
+        Some(SocketAddr::new(ip, self.ctx.cfg.port))
+    }
+
+    /// 兜底单播目标：上次连过的地址 + 手动填的地址。
+    fn seed_addrs(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self
+            .ctx
+            .cfg
+            .last_ips
+            .values()
+            .filter_map(|ip| ip.parse::<IpAddr>().ok())
+            .map(|ip| SocketAddr::new(ip, self.ctx.cfg.port))
+            .collect();
+        if let Some((addr, _)) = self.manual_addr() {
+            out.push(addr);
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn pair_target(&mut self, with: &PairWith, code: &str) -> Option<Target> {
