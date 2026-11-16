@@ -43,7 +43,9 @@ try {
     @('LICENSE','THIRD_PARTY_NOTICES.txt') | ForEach-Object {
         Copy-Item -LiteralPath (Join-Path $projectRoot $_) -Destination $stagingDirectory -Recurse
     }
-    $setup = Join-Path $outputDirectory "Daozai-Setup-v$version-x64.exe"
+    # 品牌统一为 IslandHop（页面按文件名解析版本号，混用 Daozai/IslandHop 会显得混乱）。
+    # 注册表键 HKCU\...\Uninstall\Daozai 与压缩包内的 daozai.exe 是历史承载名，暂不动。
+    $setup = Join-Path $outputDirectory "IslandHop-Setup-v$version-x64.exe"
     & $NsisCompiler /V2 /WX "/DAPP_VERSION=$version" "/DPROJECT_DIR=$projectRoot" "/DSOURCE_EXE=$($binary.FullName)" "/DOUTPUT_FILE=$setup" (Join-Path $projectRoot 'installer\setup.nsi')
     if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
     $archive = Join-Path $outputDirectory "$packageName.zip"
