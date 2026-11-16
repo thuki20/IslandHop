@@ -388,10 +388,138 @@ fn adapter_json_to_now_playing(value: serde_json::Value) -> Option<crate::smtc::
     })
 }
 
+/// 网络封面缓存：key = "title\u{1}fartist"，value = 已解码的封面 Arc。
+/// None 表示"搜过但确实没有"，避免切歌来回时反复联网。
+static COVER_NET_CACHE: Mutex<Option<std::collections::HashMap<String, Option<std::sync::Arc<eframe::egui::ColorImage>>>>> = Mutex::new(None);
+/// 正在搜索中的 key，避免后台线程重复请求同一首歌。
+static COVER_INFLIGHT: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn cover_key(title: &str, artist: &str) -> String {
+    format!("{}\u{1}{}", title.trim().to_lowercase(), artist.trim().to_lowercase())
+}
+
+/// 按歌名+歌手从网络取封面（QQ 音乐 → iTunes 兜底），供后台线程调用。
+/// Electron 播放器（汽水音乐）不通过 MediaRemote 上报 artwork，只能靠这条路。
+fn fetch_cover_online(title: &str, artist: &str) -> Option<std::sync::Arc<eframe::egui::ColorImage>> {
+    let query = if artist.trim().is_empty() { title.trim().to_string() } else { format!("{} {}", title.trim(), artist.trim()) };
+    let q = percent_encode(&query);
+
+    // 1) QQ 音乐搜索：client_search_cp（项目歌词链路已在用，中文曲库覆盖最好）。
+    let qq_json = ureq::get(&format!(
+        "https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w={q}&format=json&p=1&n=10"
+    )).set("Referer", "https://y.qq.com/")
+      .set("User-Agent", concat!("Daozai/", env!("CARGO_PKG_VERSION")))
+      .timeout(Duration::from_secs(6))
+      .call().ok().and_then(|r| r.into_string().ok())
+      .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    if let Some(value) = qq_json {
+        if value.get("code").and_then(|v| v.as_i64()) == Some(0) {
+            if let Some(list) = value.pointer("/data/song/list").and_then(|v| v.as_array()) {
+                let want_artist = artist.trim().to_lowercase();
+                for song in list {
+                    let name = song.get("songname").and_then(|v| v.as_str()).unwrap_or_default().to_lowercase();
+                    let want_title = title.trim().to_lowercase();
+                    // 双向包含匹配：汽水上报标题常带 " (Live)" / " feat.xxx" 等后缀，
+                    // 严格相等会漏；有歌手时再要求歌手名命中，避免拿错封面。
+                    if !name.contains(&want_title) && !want_title.contains(&name.trim()) { continue; }
+                    if !want_artist.is_empty() {
+                        let hit = song.get("singer").and_then(|v| v.as_array()).is_some_and(|singers| {
+                            singers.iter().filter_map(|s| s.get("name").and_then(|n| n.as_str()))
+                                .any(|n| n.to_lowercase().contains(&want_artist) || want_artist.contains(&n.to_lowercase()))
+                        });
+                        if !hit { continue; }
+                    }
+                    // 封面 URL 必须用 albummid（专辑 ID），用 songmid 会 404。
+                    let mid = song.get("albummid").and_then(|v| v.as_str()).unwrap_or_default();
+                    if mid.is_empty() { continue; }
+                    let url = format!("https://y.qq.com/music/photo_new/T002R300x300M000{mid}.jpg");
+                    if let Some(img) = download_artwork(&url) { return Some(img); }
+                }
+            }
+        }
+    }
+
+    // 2) iTunes Search 兜底：海外/小众曲目，artworkUrl100 换成 600x600。
+    let itunes = ureq::get(&format!("https://itunes.apple.com/search?term={q}&media=music&entity=song&limit=5"))
+        .timeout(Duration::from_secs(6))
+        .call().ok().and_then(|r| r.into_string().ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    if let Some(value) = itunes {
+        if let Some(results) = value.get("results").and_then(|v| v.as_array()) {
+            let want_title = title.trim().to_lowercase();
+            for item in results {
+                let name = item.get("trackName").and_then(|v| v.as_str()).unwrap_or_default().to_lowercase();
+                if !name.contains(&want_title) && !want_title.contains(&name.as_str()) { continue; }
+                if let Some(url) = item.get("artworkUrl100").and_then(|v| v.as_str()) {
+                    let big = url.replace("100x100bb", "600x600bb");
+                    if let Some(img) = download_artwork(&big) { return Some(img); }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn download_artwork(url: &str) -> Option<std::sync::Arc<eframe::egui::ColorImage>> {
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    ureq::get(url).timeout(Duration::from_secs(6)).call().ok()?
+        .into_reader().take(2 * 1024 * 1024).read_to_end(&mut bytes).ok()?;
+    crate::smtc::decode_artwork(&bytes).map(std::sync::Arc::new)
+}
+
+/// 最小百分号编码：只编码非 unreserved 字符，够用于搜索词。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// 若 media 没有封面，查缓存命中则填入；否则后台线程搜索（下一步轮询命中）。
+fn finalize_cover(mut media: crate::smtc::NowPlaying) -> crate::smtc::NowPlaying {
+    if media.artwork.is_some() || media.title.trim().is_empty() { return media; }
+    let key = cover_key(&media.title, &media.artist);
+
+    if let Ok(cache) = COVER_NET_CACHE.lock() {
+        if let Some(hit) = cache.as_ref().and_then(|c| c.get(&key)) {
+            media.artwork = hit.clone();
+            return media;
+        }
+    }
+
+    // 后台搜索：先占位，避免并发重复请求。
+    let claimed = COVER_INFLIGHT.lock().ok().is_some_and(|mut guard| {
+        guard.get_or_insert_with(std::collections::HashSet::new).insert(key.clone())
+    });
+    if claimed {
+        let title = media.title.clone();
+        let artist = media.artist.clone();
+        let k = key.clone();
+        std::thread::spawn(move || {
+            let image = fetch_cover_online(&title, &artist);
+            if let Ok(mut cache) = COVER_NET_CACHE.lock() {
+                cache.get_or_insert_with(std::collections::HashMap::new).insert(k.clone(), image);
+            }
+            if let Ok(mut guard) = COVER_INFLIGHT.lock() {
+                if let Some(set) = guard.as_mut() { set.remove(&k); }
+            }
+        });
+    }
+    media
+}
+
 fn query_media() -> Option<crate::smtc::NowPlaying> {
     // 首选 mediaremote-adapter：覆盖全部播放器（含网易云/QQ 音乐），带实时进度；
     // 适配器缺失（旧包/开发机直跑）或失败时退回 Music / Spotify 的 AppleScript。
-    if let Some(media) = adapter_now_playing() { return Some(media); }
+    if let Some(media) = adapter_now_playing() { return Some(finalize_cover(media)); }
     for app in ["Music", "Spotify"] {
         if !process_running(app) { continue; }
         let script = format!(
@@ -406,7 +534,7 @@ fn query_media() -> Option<crate::smtc::NowPlaying> {
         if parts.len() < 5 || parts[0].trim().is_empty() { continue; }
         let duration = parts[2].trim().replace(',', ".").parse::<f64>().unwrap_or(0.0);
         let position = parts[3].trim().replace(',', ".").parse::<f64>().unwrap_or(0.0);
-        return Some(crate::smtc::NowPlaying {
+        return Some(finalize_cover(crate::smtc::NowPlaying {
             title: parts[0].trim().to_string(),
             artist: parts[1].trim().to_string(),
             album: String::new(),
@@ -420,7 +548,7 @@ fn query_media() -> Option<crate::smtc::NowPlaying> {
             artwork: None,
             playback_type: crate::smtc::MediaKind::Music,
             volume: None,
-        });
+        }));
     }
     None
 }
@@ -588,5 +716,31 @@ mod adapter_tests {
     fn adapter_json_rejects_null_and_empty_title() {
         assert!(adapter_json_to_now_playing(serde_json::Value::Null).is_none(), "无媒体播放时适配器输出 null");
         assert!(adapter_json_to_now_playing(json!({"title": "  "})).is_none(), "空标题不能当成有效媒体");
+    }
+
+    #[test]
+    fn cover_key_normalizes_case_and_whitespace() {
+        assert_eq!(cover_key("  Hello ", "Soda"), cover_key("hello", "  SODA"));
+        assert_ne!(cover_key("A", "B"), cover_key("A", "C"));
+    }
+
+    #[test]
+    fn percent_encode_escapes_non_unreserved() {
+        assert_eq!(percent_encode("a b-c_d.e~f"), "a%20b-c_d.e~f");
+        assert_eq!(percent_encode("汽水&音乐"), "%E6%B1%BD%E6%B0%B4%26%E9%9F%B3%E4%B9%90");
+    }
+
+    #[test]
+    fn finalize_cover_skips_when_artwork_present_or_title_empty() {
+        // 已有封面时不应触发网络搜索（key 不会进入 inflight）。
+        let fake = std::sync::Arc::new(eframe::egui::ColorImage::new([1, 1], eframe::egui::Color32::WHITE));
+        let mut media = adapter_json_to_now_playing(json!({"title":"t","artist":"a"})).unwrap();
+        media.artwork = Some(fake.clone());
+        let out = finalize_cover(media);
+        assert!(std::sync::Arc::ptr_eq(out.artwork.as_ref().unwrap(), &fake));
+        // 空标题也不触发。
+        let mut empty = adapter_json_to_now_playing(json!({"title":"t","artist":"a"})).unwrap();
+        empty.title.clear();
+        assert!(finalize_cover(empty).artwork.is_none());
     }
 }
