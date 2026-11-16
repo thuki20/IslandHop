@@ -121,6 +121,46 @@ pub fn open_settings_tab(app: &mut crate::app::App) {
     app.open_settings_tab(13);
 }
 
+// ---------------- 屏幕镜像（单向看对端） ----------------
+
+/// 发起观看对端整屏。返回 Err 时在界面提示。
+pub fn open_view(peer: &str) -> Result<(), String> {
+    with(|cross| {
+        let Some(engine) = &cross.engine else {
+            return Err("跨屏引擎未启动，请先在设置里启动".into());
+        };
+        cross.viewer.open_screen(&engine.hub(), peer)
+    })
+}
+
+/// 当前在线对端名字（供"看屏幕"按钮判断谁能看）。
+pub fn connected_peers() -> Vec<String> {
+    with(|cross| {
+        cross.engine.as_ref()
+            .map(|e| e.status().peers.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// 每帧调用：消费引擎推来的画面事件（如对方请求看本机屏幕）。
+pub fn poll_view_events() -> Option<String> {
+    with(|cross| {
+        let Some(engine) = &cross.engine else { return None; };
+        cross.viewer.poll_events(&engine.hub());
+        cross.viewer.take_notice()
+    })
+}
+
+/// 每帧调用：渲染所有画面窗口。
+pub fn paint_views(ctx: &eframe::egui::Context) {
+    with(|cross| cross.viewer.paint(ctx));
+}
+
+/// 是否有正在观看的画面流（用于提高刷新率到 20fps）。
+pub fn view_active() -> bool {
+    with(|cross| !cross.viewer.is_empty())
+}
+
 enum Action {
     Start,
     Stop,
@@ -133,6 +173,8 @@ enum Action {
     RemoveScreen(String),
     /// 重命名一条对端屏幕名：保留位置，只改显示名（如 MacBook → MacBook-Pro）。
     RenameScreen(String, String),
+    /// 看对端整屏画面（单向屏幕镜像最小原型）。
+    ViewScreen(String),
 }
 
 pub struct CrossScreen {
@@ -156,6 +198,8 @@ pub struct CrossScreen {
     last_notes: Vec<String>,
     /// 用户勾选「不再显示权限相关提示」后，不再每次启动刷一屏授权指引。
     hide_permission_hint: bool,
+    /// 屏幕镜像（单向看对端）：管理画面流与 egui 窗口。
+    pub viewer: crate::remote_view::ViewerHub,
 }
 
 impl CrossScreen {
@@ -191,6 +235,7 @@ impl CrossScreen {
             rename_buf: String::new(),
             last_notes: Vec::new(),
             hide_permission_hint: read_hide_permission_hint(),
+            viewer: crate::remote_view::ViewerHub::default(),
             path,
             cfg,
             engine: None,
@@ -288,6 +333,16 @@ impl CrossScreen {
                 if self.cfg_loaded { let _ = self.cfg.save(&self.path); }
                 self.last_notes.retain(|line| !line.starts_with(&format!("{name} · ")));
             }
+            Action::ViewScreen(peer) => {
+                let result = match self.engine.as_ref() {
+                    Some(e) => self.viewer.open_screen(&e.hub(), &peer),
+                    None => Err("跨屏引擎未启动，请先启动".to_string()),
+                };
+                match result {
+                    Ok(()) => self.last_notes.push(format!("正在连接 {peer} 的屏幕…")),
+                    Err(msg) => self.last_notes.push(format!("看屏幕失败：{msg}")),
+                }
+            }
             Action::RenameScreen(from, to) => {
                 let to = to.trim().to_string();
                 if to.is_empty() || to == from || is_loopback_entry(&to) { return; }
@@ -349,7 +404,7 @@ impl CrossScreen {
             });
         egui::CollapsingHeader::new("运行状态与日志")
             .default_open(false).show(ui, |ui| {
-                self.view_status(ui, status.as_ref());
+                self.view_status(ui, status.as_ref(), &mut actions);
                 self.view_platform_hint(ui);
             });
 
@@ -674,6 +729,12 @@ impl CrossScreen {
                 if ui.small_button("辅助功能设置").clicked() { open_privacy_pane("Privacy_Accessibility"); }
                 if ui.small_button("输入监控设置").clicked() { open_privacy_pane("Privacy_ListenEvent"); }
             });
+            ui.add_space(4.0);
+            ui.label(RichText::new("让别的电脑看到本机屏幕：").size(11.0).strong());
+            ui.label(RichText::new(crate::remote_view::screen_record_permission_hint()).size(10.5));
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button("屏幕录制设置").clicked() { open_privacy_pane("Privacy_ScreenCapture"); }
+            });
         }
         let mut hide = self.hide_permission_hint;
         if ui.checkbox(&mut hide, "不再显示权限相关提示").changed() {
@@ -685,7 +746,7 @@ impl CrossScreen {
         }
     }
 
-    fn view_status(&self, ui: &mut Ui, status: Option<&Status>) {
+    fn view_status(&self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
         ui.label(RichText::new("运行状态").size(13.0).strong());
         let Some(s) = status else {
             ui.label(RichText::new("● 未启动").color(Color32::from_rgb(215, 85, 80)));
@@ -719,7 +780,15 @@ impl CrossScreen {
         });
         ui.label(format!("已连接 {} 台 · 发现 {} 台 · 已配对 {} 台", s.peers.len(), s.discovered.len(), s.paired.len()));
         for p in &s.peers {
-            ui.label(RichText::new(format!("  ▸ {} ({:?}) @ {}", p.name, p.os, p.addr)).size(11.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("  ▸ {} ({:?}) @ {}", p.name, p.os, p.addr)).size(11.0));
+                if ui.small_button("🖥 看屏幕").clicked() {
+                    actions.push(Action::ViewScreen(p.name.clone()));
+                }
+            });
+        }
+        if !s.peers.is_empty() {
+            ui.label(RichText::new("「看屏幕」单向查看对端整屏。前提：对端勾选「允许对端控制本机屏幕」，Mac 被看时需授予屏幕录制权限。").size(10.0).color(Color32::from_gray(130)));
         }
         if !s.active.is_empty() {
             ui.label(RichText::new(format!("光标当前在：{}", s.active)).size(11.0).color(Color32::from_rgb(45, 110, 190)));

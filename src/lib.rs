@@ -8,6 +8,8 @@
 pub mod display_layout;
 /// IslandHop 新增：OpenHop 跨屏引擎 + 内嵌在设置窗口的面板。
 pub mod cross_screen;
+/// IslandHop 新增：屏幕镜像最小原型（复用 OpenHop 引擎的 SCREEN 采集 / WinFrame 链路）。
+pub mod remote_view;
 /// IslandHop 新增：两台电脑互联后同步岛仔业务数据（喝水 / 天气 / 久坐 / 待办 / 账号清单）。
 pub mod sync_state;
 /// IslandHop 新增：macOS 窗口层级 / 点击穿透 / 刘海几何（岛仔上游 0 处 macOS 分支）。

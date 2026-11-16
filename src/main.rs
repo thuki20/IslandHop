@@ -933,10 +933,15 @@ impl eframe::App for Shell {
         if ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::K)) {
             self.app.open_settings_tab(13);
         }
+        // IslandHop 屏幕镜像：消费引擎推来的画面事件（如对方请求看本机屏幕），
+        // 再渲染画面窗口。都只在主线程做（Engine/ViewerHub 在 thread_local）。
+        if let Some(notice)=daozai::cross_screen::poll_view_events(){self.app.say(notice);}
+        daozai::cross_screen::paint_views(ctx);
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         // 穿透时主窗口收不到 mousemove，用 20fps 轮询全局坐标以保证移回岛上立即恢复。
         #[cfg(not(windows))] let repaint_after=if passthrough{Duration::from_millis(50)}else{out.repaint_after};
-        // 双机数据同步需要无交互时也每秒醒一次，取两者较小值。
+        // 双机数据同步需要无交互时也每秒醒一次；有画面流时按 20fps 刷新画面。
+        let repaint_after=if daozai::cross_screen::view_active(){Duration::from_millis(50)}else{repaint_after};
         schedule_repaint(ctx,repaint_after.min(Duration::from_secs(1)));
     }
 }
