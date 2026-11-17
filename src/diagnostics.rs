@@ -23,6 +23,9 @@ fn message(directory: &Path, title: &str, details: &str) -> String {
 
 pub fn report(title: &str, details: &str) {
     let text = message(&daozai::model::config_dir().join("diagnostics"), title, details);
+    // 更新交接期间绝不能弹模态框：主程序必须尽快退出，让安装脚本接管并拉起新版本；
+    // 模态框会卡住退出，安装脚本等不到退出就超时回滚（日志已写盘，不丢现场）。
+    if daozai::update_handoff_active() { return; }
     #[cfg(windows)]
     {
         use windows::core::{w, PCWSTR};
@@ -78,6 +81,8 @@ pub fn spawn_replacement() -> bool {
 
 /// 异常退出后自动重新拉起（受频率限制）；返回是否已安排重启。
 fn relaunch_after_failure(reason: &str) -> bool {
+    // 更新交接期间退出由安装脚本接管拉起新版本，这里绝不插手（见 lib.rs 的 UPDATE_HANDOFF）。
+    if daozai::update_handoff_active() { return false; }
     let uptime = STARTED.get().map(|at| at.elapsed()).unwrap_or_default();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let path = diagnostics_dir().join("auto-restart.log");

@@ -1222,10 +1222,20 @@ fn run() -> eframe::Result<()> {
     // 单实例（与原版同名互斥体）
     #[cfg(windows)]
     if !daozai::tray::single_instance() {
-        if !daozai::tray::activate_existing(std::env::args().any(|arg|arg=="--calendar")) {
-            diagnostics::report("IslandHop已在运行，但暂时无法打开窗口。\n请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe 后重试。", "已有实例可能正在启动或已无响应。请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe，再重新启动。");
+        // 互斥体可能只是被短暂占用：更新脚本拉起新实例的交接瞬间、崩溃自动重启
+        // 的替补尚未完全退出等。先重试约 4 秒，仍拿不到才判定真的已有实例在跑，
+        // 避免把正常交接的瞬间当成「已在运行，无法打开窗口」故障弹窗（v0.6.84 实测）。
+        let mut acquired = false;
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            if daozai::tray::single_instance() { acquired = true; break; }
         }
-        return Ok(());
+        if !acquired {
+            if !daozai::tray::activate_existing(std::env::args().any(|arg|arg=="--calendar")) {
+                diagnostics::report("IslandHop已在运行，但暂时无法打开窗口。\n请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe 后重试。", "已有实例可能正在启动或已无响应。请稍后重试；若仍无法打开，请在任务管理器的“详细信息”中结束 daozai.exe，再重新启动。");
+            }
+            return Ok(());
+        }
     }
     #[cfg(windows)]
     std::thread::spawn(daozai::record_install_size);

@@ -5,6 +5,22 @@
 //! - `model` / `lyrics` / `smtc` / `icons`：数据、歌词、系统媒体、文件图标
 //! - `native` / `tray`：仅 Windows 的窗口区域、命中穿透与托盘
 
+/// 更新交接进行中标志。交接期间（安装包校验通过、update.ps1 已启动）主程序的
+/// 任何异常退出都由安装脚本负责拉起新版本——绝不能触发自动重启：替补实例会跟
+/// 安装脚本拉起的新实例抢单实例互斥体，弹出「已在运行，但暂时无法打开窗口」
+/// 错误框（v0.6.84 实测）。标志放在 lib 侧，bin 的 diagnostics 与 lib 的 updates 共用。
+static UPDATE_HANDOFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 进入更新交接时调用（进程生命周期内不可逆：交接成功后主程序必然退出）。
+pub fn begin_update_handoff() {
+    UPDATE_HANDOFF.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// bin 侧 diagnostics 据此跳过自动重启与模态弹窗，让主程序尽快退出交给安装脚本。
+pub fn update_handoff_active() -> bool {
+    UPDATE_HANDOFF.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub mod display_layout;
 /// IslandHop 新增：OpenHop 跨屏引擎 + 内嵌在设置窗口的面板。
 pub mod cross_screen;

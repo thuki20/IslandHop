@@ -51,6 +51,11 @@ pub(crate) struct State {
     message: String,
     dialog_open: bool,
     focus_requested: bool,
+    /// 安装脚本已接手：倒计时归零后再关 ROOT 视口（隔两帧，确保更新弹窗
+    /// 的 immediate 视口先完整拆除）。绝不能在更新弹窗还开着时直接关 ROOT——
+    /// v0.6.84 实测交接瞬间主线程异常，自动重启的替补实例又跟安装脚本拉起的
+    /// 新实例抢单实例互斥体，弹出「已在运行」错误框。两步解耦，彻底消除竞态。
+    installed_close: u32,
     logo: Option<egui::TextureHandle>,
     /// 上次自动检查的时间。常驻软件可能在后台开很久，只在启动时查一次会让
     /// 用户长时间收不到新版本；改为按 TTL 定时复查（手动检查不重置它）。
@@ -66,6 +71,13 @@ impl Drop for State {
 
 impl State {
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
+        // 安装脚本已接手：等更新弹窗的视口拆除干净（倒计时两帧）再关 ROOT 视口。
+        if self.installed_close > 0 {
+            self.installed_close -= 1;
+            if self.installed_close == 0 {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+            }
+        }
         // 启动即查一次，此后按 AUTO_CHECK_TTL 定时复查：桌面软件常驻数周，
         // 只在启动时查一次会让用户长期停在旧版本。发现新版本弹更新窗，
         // 与手动检查走同一条路径。测试构建不自动检查，避免录制测试联网。
@@ -104,6 +116,9 @@ impl State {
                     }
                     let (tx, rx) = mpsc::channel(); self.rx = Some(rx); self.cancel = None;
                     self.message = "正在准备重启…".into();
+                    // 从此刻起交给安装脚本接管：交接期间禁止自动重启、禁止弹模态框
+                    // （见 lib.rs 的 UPDATE_HANDOFF），让主程序能干净退出、由脚本拉起新版本。
+                    crate::begin_update_handoff();
                     let ctx = ctx.clone();
                     std::thread::spawn(move || {
                         let event = match launch_installer(&work) { Ok(()) => Event::Installed, Err(error) => Event::Failed(error) };
@@ -112,7 +127,10 @@ impl State {
                 }
                 Event::Installed => {
                     self.rx = None;
-                    ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+                    // 先收起更新弹窗，倒计时两帧后由 poll 关 ROOT 视口（两步解耦，
+                    // 避免 immediate 视口存活时关主视口导致交接异常）。
+                    self.dialog_open = false;
+                    self.installed_close = 2;
                 }
             }
         }
