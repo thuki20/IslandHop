@@ -92,8 +92,31 @@ impl Discovery {
     }
 }
 
+/// Windows：独占绑定（SO_EXCLUSIVEADDRUSE）。本机的 SO_REUSEADDR 在 Windows 语义
+/// 是「任何进程都能再绑同一端口」，正是残留/重复实例互相抢占 UDP 发现端口、
+/// beacon 被投给已死 socket 导致「永远扫描不到」的根源。独占后第二个绑定者
+/// 会明确拿到 AddrInUse，而不是静默变聋。Unix 语义安全，保持 reuse 不变。
+#[cfg(windows)]
+fn set_exclusive_bind(s: &Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SO_EXCLUSIVEADDRUSE, SOL_SOCKET};
+    let val: i32 = 1;
+    let rc = unsafe {
+        setsockopt(
+            SOCKET(s.as_raw_socket() as usize),
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            Some(&val.to_ne_bytes()),
+        )
+    };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 fn bind_v4() -> std::io::Result<UdpSocket> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    #[cfg(windows)]
+    set_exclusive_bind(&s)?;
+    #[cfg(not(windows))]
     s.set_reuse_address(true)?;
     #[cfg(all(unix, not(target_os = "solaris")))]
     s.set_reuse_port(true)?;
@@ -107,6 +130,9 @@ fn bind_v4() -> std::io::Result<UdpSocket> {
 fn bind_v6() -> std::io::Result<UdpSocket> {
     let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     s.set_only_v6(true)?;
+    #[cfg(windows)]
+    set_exclusive_bind(&s)?;
+    #[cfg(not(windows))]
     s.set_reuse_address(true)?;
     #[cfg(all(unix, not(target_os = "solaris")))]
     s.set_reuse_port(true)?;
@@ -140,7 +166,18 @@ pub fn is_link_local(ip: IpAddr) -> bool {
 impl Discovery {
     /// Start announcing this computer and listening for others.
     pub fn start(device: String, name: String, role: Role, port: u16) -> std::io::Result<Discovery> {
-        let v4 = bind_v4()?;
+        let v4 = bind_v4().map_err(|e| {
+            // 端口被占（独占绑定后第二个实例会到这里）：给一条可行动的提示，
+            // 而不是裸系统错误码。
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("发现端口 {DISCOVERY_PORT} 已被占用：可能有另一个本应用实例正在运行（含异常退出残留），或端口被其他程序抢占。请结束旧实例（任务管理器结束 daozai.exe）或重启后再试。"),
+                )
+            } else {
+                e
+            }
+        })?;
         let v6 = match bind_v6() {
             Ok(s) => Some(s),
             Err(e) => {
