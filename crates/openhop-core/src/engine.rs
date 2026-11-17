@@ -314,6 +314,18 @@ impl Engine {
         };
         let announce_port = listeners.as_ref().map(|l| l.2).unwrap_or(cfg.port);
         let discovery = Arc::new(Discovery::start(cfg.device_id.clone(), cfg.name.clone(), cfg.role, announce_port).context("starting network discovery")?);
+        // 启动时把已知对端地址作为单播兜底目标注入。
+        // 路由器 AP 常不转发无线客户端之间的广播，单播 beacon 仍能到达对端：
+        // - 客户端：上次成功连接的 / 手动配置的对端 IP；
+        // - 服务端：历史客户端 IP（对方曾连过本机，反向发 beacon 让它能发现我）。
+        for raw in [cfg.server_addr.as_ref(), cfg.last_server_addr.as_ref()]
+            .into_iter().flatten()
+        {
+            if let Some(addr) = parse_addr(raw) { discovery.add_unicast_target(addr.ip()); }
+        }
+        for ip in cfg.last_ips.values() {
+            if let Ok(addr) = ip.parse::<IpAddr>() { discovery.add_unicast_target(addr); }
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let (ctl_tx, ctl_rx) = crossbeam_channel::unbounded();
         let notes: Arc<Mutex<Vec<Note>>> = Default::default();
@@ -2774,6 +2786,13 @@ impl Client {
         parse_addr(&a).map(|sa| (sa, a))
     }
 
+    /// 上次成功连接的对端地址。与 manual_addr 不同，它只在发现为空时兜底，
+    /// 绝不抢在实时发现之前，避免对端换了 IP 后一直连旧地址。
+    fn last_addr(&self) -> Option<SocketAddr> {
+        let a = self.ctx.cfg.last_server_addr.as_ref()?.trim();
+        parse_addr(a)
+    }
+
     fn pick_server(&self, failed: &HashMap<SocketAddr, Instant>) -> Option<Target> {
         let me = self.ctx.cfg.device_id.clone();
         // 1. The server we're paired with (by its device id).
@@ -2782,7 +2801,9 @@ impl Client {
                 let name = self.ctx.cfg.trusted[&dev].name.clone();
                 let found = match self.manual_addr() {
                     Some((addr, _)) => Some(addr),
-                    None => self.ctx.discovery.servers().into_iter().find(|s| s.device == dev).map(|s| s.addr),
+                    None => self.ctx.discovery.servers().into_iter().find(|s| s.device == dev).map(|s| s.addr)
+                        // 广播被 AP 过滤、发现列表为空时，直连上次成功的地址兜底。
+                        .or_else(|| self.last_addr()),
                 };
                 return found.map(|addr| Target { addr, label: name, auth: crate::net::Auth::Key { device: me }, psk: key, pairing: None });
             }
@@ -2796,13 +2817,17 @@ impl Client {
             return Some(Target { addr, label, auth: crate::net::Auth::Passphrase, psk, pairing: None });
         }
         let recently_failed = |a: &SocketAddr| failed.get(a).map(|t| t.elapsed() < Duration::from_secs(5)).unwrap_or(false);
-        self.ctx
+        let discovered = self.ctx
             .discovery
             .servers()
             .into_iter()
             .filter(|s| self.ctx.cfg.server_name.as_ref().map(|n| n == &s.name).unwrap_or(true))
-            .find(|s| !recently_failed(&s.addr))
-            .map(|s| Target { addr: s.addr, label: s.name, auth: crate::net::Auth::Passphrase, psk, pairing: None })
+            .find(|s| !recently_failed(&s.addr));
+        // 广播被 AP 过滤、发现列表为空 → 直连上次成功地址兜底（同样避开刚失败的地址）。
+        let target_addr = discovered.map(|s| (s.addr, s.name)).or_else(|| {
+            self.last_addr().filter(|a| !recently_failed(a)).map(|a| (a, a.to_string()))
+        });
+        target_addr.map(|(addr, label)| Target { addr, label, auth: crate::net::Auth::Passphrase, psk, pairing: None })
     }
 
     fn pair_target(&mut self, with: &PairWith, code: &str) -> Option<Target> {
@@ -2865,6 +2890,16 @@ impl Client {
         };
         rx.set_timeout(Some(PEER_TIMEOUT))?;
         log::info!("connected to {server_name} ({}) at {addr}", server_os.label());
+        // 记住本次成功连接的对端地址：下次广播被 AP 过滤时，用它单播 beacon + 直连兜底。
+        // 只在自动/口令连接时记，配对流程本就把地址写进了 server_addr。
+        if t.pairing.is_none() {
+            let recorded = addr.to_string();
+            if self.ctx.cfg.last_server_addr.as_deref() != Some(recorded.as_str()) {
+                self.ctx.cfg.last_server_addr = Some(recorded);
+                self.ctx.save_config();
+            }
+        }
+        self.ctx.discovery.add_unicast_target(addr.ip());
         self.ctx.set_error(None);
         {
             let mut st = self.ctx.status.lock();

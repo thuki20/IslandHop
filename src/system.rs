@@ -52,7 +52,8 @@ pub fn observe(ctx:eframe::egui::Context,initial:Snapshot,input:Option<crate::in
             if changed || crate::input::switch_recent() || input_at.ready(std::time::Duration::from_secs(1)){
                 current.input=crate::input::State::read();input_at=crate::poll_clock::PollClock::now();
             }
-            if sampled.ready(std::time::Duration::from_millis(500)){
+            // 电池省电：系统快照采样间隔放宽（500ms→1s），输入法/全屏检测仍在 100ms 循环的交互路径上不变。
+            if sampled.ready(crate::power_saving::sample_interval(std::time::Duration::from_millis(500))){
                 current.system=Snapshot::read();current.fullscreen=fullscreen();sampled=crate::poll_clock::PollClock::now();
             }
             if delivered.as_ref()!=Some(&current) {

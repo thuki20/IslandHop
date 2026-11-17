@@ -64,6 +64,32 @@ pub struct Discovered {
 pub struct Discovery {
     peers: Arc<Mutex<HashMap<u64, Discovered>>>,
     stop: Arc<AtomicBool>,
+    /// 已知对端 IPv4（上次成功连接的地址 / 手动地址）。路由器不转发客户端间
+    /// 广播时，靠向这些地址单播 beacon 兜底发现。
+    unicast: Arc<Mutex<Vec<Ipv4Addr>>>,
+}
+
+/// 单播兜底目标是否可加入：只接受可路由的普通 IPv4，过滤掉 unspecified / 广播 / 回环 / 组播。
+fn valid_unicast_target(ip: IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(v4) if !v4.is_unspecified() && !v4.is_broadcast()
+            && !v4.is_loopback() && !v4.is_multicast() => Some(v4),
+        _ => None,
+    }
+}
+
+impl Discovery {
+    /// 运行时加入一个单播兜底目标（对端的 IPv4）。重复加入会去重。
+    /// 广播/组播照常发，单播是额外兜底，不冲突。
+    pub fn add_unicast_target(&self, ip: IpAddr) {
+        if let Some(v4) = valid_unicast_target(ip) {
+            let mut list = self.unicast.lock();
+            if !list.contains(&v4) {
+                list.push(v4);
+                log::info!("discovery: 加入单播兜底目标 {v4}");
+            }
+        }
+    }
 }
 
 fn bind_v4() -> std::io::Result<UdpSocket> {
@@ -127,16 +153,20 @@ impl Discovery {
         let payload = bincode::serialize(&beacon).expect("beacon");
         let peers: Arc<Mutex<HashMap<u64, Discovered>>> = Default::default();
         let stop = Arc::new(AtomicBool::new(false));
+        let unicast: Arc<Mutex<Vec<Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Sender: every interface, both IP versions.
         {
             let v4 = v4.try_clone()?;
             let v6 = v6.as_ref().map(|s| s.try_clone()).transpose()?;
             let stop = stop.clone();
+            let unicast = unicast.clone();
             std::thread::Builder::new().name("discovery-tx".into()).spawn(move || {
                 let mut joined: HashSet<u32> = HashSet::new();
                 while !stop.load(Ordering::Relaxed) {
                     let mut targets: HashSet<Ipv4Addr> = HashSet::from([Ipv4Addr::BROADCAST]);
+                    // 单播兜底：路由器AP 常丢弃客户端之间的广播，直接向已知对端 IP 发 beacon。
+                    targets.extend(unicast.lock().iter().copied());
                     for (idx6, bcasts) in interfaces() {
                         targets.extend(bcasts);
                         if let (Some(idx), Some(s6)) = (idx6, v6.as_ref()) {
@@ -180,7 +210,7 @@ impl Discovery {
                 }
             })?;
         }
-        Ok(Discovery { peers, stop })
+        Ok(Discovery { peers, stop, unicast })
     }
 
     pub fn peers(&self) -> Vec<Discovered> {
@@ -269,5 +299,16 @@ mod tests {
         let p = peers.lock()[&7].clone();
         assert_eq!(p.addr, "192.168.1.9:24950".parse::<SocketAddr>().unwrap());
         assert_eq!(p.link, "network");
+    }
+
+    // 单播兜底目标：只接受可路由 IPv4，过滤掉广播/回环/组播/unspecified/IPv6。
+    #[test]
+    fn unicast_target_filters_invalid_addresses() {
+        assert_eq!(valid_unicast_target("192.168.1.20".parse().unwrap()), Some("192.168.1.20".parse().unwrap()));
+        assert_eq!(valid_unicast_target("0.0.0.0".parse().unwrap()), None);
+        assert_eq!(valid_unicast_target("255.255.255.255".parse().unwrap()), None);
+        assert_eq!(valid_unicast_target("127.0.0.1".parse().unwrap()), None);
+        assert_eq!(valid_unicast_target("224.0.0.1".parse().unwrap()), None);
+        assert_eq!(valid_unicast_target("fe80::1".parse().unwrap()), None);
     }
 }

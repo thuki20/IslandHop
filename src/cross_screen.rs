@@ -523,7 +523,7 @@ impl CrossScreen {
                 "1. 对端也要打开本机开关并保持在同一个 Wi-Fi / 网段（不能用访客网络或 AP 隔离）。".to_string(),
                 format!("2. 两台机器都放行防火墙入站：UDP {}（发现）与 TCP {}（连接）。", DISCOVERY_PORT, DEFAULT_PORT),
                 "3. 暂时退出 VPN / 加速器 / 虚拟网卡，它们会抢走广播出口。".to_string(),
-                "4. 仍搜不到：用下方「直接输入地址连接」填对端 IP 手动连一次。".to_string(),
+                "4. 路由器若不转发无线设备间的广播：用下方「直接输入地址连接」填对端 IP 连一次，之后会自动记住该地址、改用单播发现，无需再手动。".to_string(),
             ] {
                 ui.label(RichText::new(line).size(10.5).color(ui.visuals().weak_text_color()));
             }

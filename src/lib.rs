@@ -16,6 +16,8 @@ pub mod sync_state;
 pub mod mac_window;
 mod mail_privacy;
 pub mod poll_clock;
+/// IslandHop 新增：电池供电省电（通电全速 / 用电池降帧降刷新，交互档不降）。
+pub mod power_saving;
 pub mod resources;
 pub mod anim;
 pub mod oled_shift;

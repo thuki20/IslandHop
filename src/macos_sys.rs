@@ -5,7 +5,9 @@
 //! 灵动岛收起状态只剩时钟和天气。本模块补上这些数据源：
 //!
 //! - 电池：IOKit 直读 IORegistry `AppleSmartBattery`（借鉴 StatusTrio，零子进程、
-//!   事件级实时，且能拿充电功率）；读不到才回退 `/usr/bin/pmset -g batt`
+//!   事件级实时，且能拿充电功率）；显示口径为系统面板头条「充电器输入」=
+//!   `InstantAmperage×Voltage`（充入电池）+ `PowerTelemetryData.SystemPowerIn`（系统负载）；
+//!   读不到才回退 `/usr/bin/pmset -g batt`
 //! - 音量：`/usr/bin/osascript` 读写系统输出音量与静音
 //! - 网络：`/sbin/route -n get default`（有默认网关即视为在线）
 //! - 闲置：`CGEventSourceSecondsSinceLastEventType`（无需辅助功能权限）
@@ -40,12 +42,35 @@ struct SmartBattery {
     external: bool,
     /// 正在充电（IsCharging）。
     charging_now: bool,
+    /// 充入电池的功率（InstantAmperage × Voltage）。
     watts: Option<f32>,
+    /// 系统实时负载（PowerTelemetryData.SystemPowerIn，mW→W）。
+    /// 「充电器输入」= 充入电池功率 + 系统负载，与系统设置电池面板头条一致。
+    system_load: Option<f32>,
+}
+
+/// 由「充入电池功率」与「系统负载」算出系统面板头条的「充电器输入功率」。
+/// 纯函数，便于单测：67.56W + 12.69W = 80.25W（对应用户截图）。
+/// 读不到系统负载（Intel Mac / 老固件无 PowerTelemetryData）时退回电池端功率，
+/// 保证显示不会比旧版更差；对异常数值做钳制，避免单位错乱时显示荒谬的瓦数。
+fn charger_input_watts(battery_watts: Option<f32>, system_load: Option<f32>) -> Option<f32> {
+    let battery = battery_watts?;
+    match system_load {
+        Some(load) if load > 0.0 => {
+            let total = battery + load;
+            // 适配器输入钳制：MagSafe 最高 140W，留一倍余量到 300W；
+            // 超出视为单位/字段误读，退回电池端功率。
+            if (0.5..300.0).contains(&total) { Some(total) } else { Some(battery) }
+        }
+        _ => Some(battery),
+    }
 }
 
 /// 从 AppleSmartBattery 属性字典挑出的标量 → 电池状态（纯函数，可测）。
 /// - 百分比：`CurrentCapacity` 直接是 0-100；个别固件给 mAh 时按 `MaxCapacity` 换算。
-/// - 功率：|Amperage(mA)| × Voltage(mV) / 1e6，仅在 IsCharging 时给出，<0.5W 视为未充电。
+/// - 电池端功率：|Amperage(mA)| × Voltage(mV) / 1e6，接电时给出，<0.5W 视为未充电。
+///   注意这只是「充入电池」的功率；UI 显示的「充电器输入」还要在此之上叠加
+///   `PowerTelemetryData.SystemPowerIn`（系统实时负载），见 [`read_smart_battery`]。
 ///   注意 AppleSmartBattery 的电流**符号约定随固件而异**：多数机型充电为负（电流流入电池），
 ///   也有固件充电给正——按绝对值取幅值，充电与否只信 IsCharging 标志。
 fn smart_from(
@@ -72,7 +97,7 @@ fn smart_from(
         },
         _ => None,
     };
-    SmartBattery { percent, external, charging_now: is_charging && external, watts }
+    SmartBattery { percent, external, charging_now: is_charging && external, watts, system_load: None }
 }
 
 /// IOKit 直读 IORegistry 的 `AppleSmartBattery`：无子进程、毫秒级，
@@ -97,7 +122,19 @@ fn read_smart_battery() -> Option<SmartBattery> {
         fn CFDictionaryGetValue(the_dict: *const c_void, key: *const c_void) -> *const c_void;
         fn CFNumberGetValue(number: *const c_void, the_type: isize, value_ptr: *mut c_void) -> bool;
         fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+        fn CFGetTypeID(cf: *const c_void) -> usize;
+        fn CFDictionaryGetTypeID() -> usize;
         fn CFRelease(cf: *mut c_void);
+    }
+    // 从属性字典里按 UTF-8 键取一个标量数字（SInt64）。
+    unsafe fn cf_num(dict: *const c_void, key: &[u8]) -> Option<f64> {
+        let cf_key = CFStringCreateWithCString(std::ptr::null(), CStr::from_bytes_with_nul(key).unwrap().as_ptr(), KUTF8);
+        if cf_key.is_null() { return None; }
+        let value = CFDictionaryGetValue(dict, cf_key);
+        CFRelease(cf_key.cast_mut());
+        if value.is_null() { return None; }
+        let mut out: i64 = 0;
+        (!value.is_null() && CFNumberGetValue(value, SINT64, (&mut out as *mut i64).cast())).then_some(out as f64)
     }
     const KEY: &[(&[u8], bool)] = &[
         (b"CurrentCapacity\0", true), (b"MaxCapacity\0", true),
@@ -130,13 +167,28 @@ fn read_smart_battery() -> Option<SmartBattery> {
                 booleans.push(!value.is_null() && CFBooleanGetValue(value));
             }
         }
+        // 系统实时负载：AppleSmartBattery → PowerTelemetryData（嵌套字典）→ SystemPowerIn（mW）。
+        // 系统设置电池面板头条「充电器输入」= 充入电池功率 + 系统负载，正是这一项补上
+        // 了旧版显示 68W 与面板 80W 之间约 12W 的差额。字段在部分 Intel Mac / 老固件上
+        // 不存在，读不到时 system_load 保持 None，显示退回电池端功率（不比旧版差）。
+        let mut system_load = None;
+        let tele_key = CFStringCreateWithCString(std::ptr::null(), CStr::from_bytes_with_nul(b"PowerTelemetryData\0").unwrap().as_ptr(), KUTF8);
+        if !tele_key.is_null() {
+            let tele = CFDictionaryGetValue(props, tele_key);
+            CFRelease(tele_key.cast_mut());
+            if !tele.is_null() && CFGetTypeID(tele) == CFDictionaryGetTypeID() {
+                system_load = cf_num(tele, b"SystemPowerIn\0").map(|mw| (mw / 1000.0) as f32);
+            }
+        }
         CFRelease(props);
         // KEY 顺序：CurrentCapacity, MaxCapacity, InstantAmperage, Amperage, Voltage | IsCharging, ExternalConnected
-        Some(smart_from(
+        let mut battery = smart_from(
             values[0], values[1],
             values[2].or(values[3]), values[4],
             booleans[0], booleans[1],
-        ))
+        );
+        battery.system_load = system_load;
+        Some(battery)
     }
 }
 #[cfg(not(target_os = "macos"))]
@@ -148,11 +200,12 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// 返回 (剩余电量百分比, 是否接着电源, 充电功率瓦数)。
+/// 返回 (剩余电量百分比, 是否接着电源, 充电器输入功率瓦数)。
+/// 功率口径对齐系统设置电池面板头条「充电器输入」= 充入电池 + 系统负载。
 /// 台式机无电池时返回 (None, true, None)。
 pub fn power() -> (Option<u8>, bool, Option<f32>) {
     if let Some(b) = read_smart_battery() {
-        return (b.percent, b.external, b.watts);
+        return (b.percent, b.external, charger_input_watts(b.watts, b.system_load));
     }
     let Some(out) = run("/usr/bin/pmset", &["-g", "batt"]) else { return (None, true, None) };
     let mut battery = None;
@@ -634,6 +687,31 @@ pub fn start(ctx: egui::Context) -> Receiver<Snapshot> {
 mod battery_tests {
     use super::*;
 
+    // 用户截图：充入电池 67.56W + 系统负载 12.69W = 充电器输入 80.25W。
+    // 旧版只显示电池端 67/68W，与系统设置面板头条 80W 差一截，本函数补齐系统负载。
+    #[test]
+    fn charger_input_adds_system_load() {
+        let w = charger_input_watts(Some(67.56), Some(12.69));
+        assert!(w.is_some_and(|w| (w - 80.25).abs() < 0.05), "67.56+12.69≈80.25W：{w:?}");
+        let w2 = charger_input_watts(Some(68.76), Some(14.55));
+        assert!(w2.is_some_and(|w| (w - 83.31).abs() < 0.05), "68.76+14.55≈83.31W：{w2:?}");
+    }
+
+    // 老机型读不到系统负载时退回电池端功率，不能比旧版更差。
+    #[test]
+    fn charger_input_falls_back_to_battery_power() {
+        assert_eq!(charger_input_watts(Some(67.56), None), Some(67.56));
+        assert_eq!(charger_input_watts(Some(67.56), Some(0.0)), Some(67.56));
+        assert_eq!(charger_input_watts(None, Some(12.7)), None);
+    }
+
+    // 单位错乱导致荒谬数值时钳制，退回电池端功率，绝不显示几百瓦。
+    #[test]
+    fn charger_input_clamps_absurd_values() {
+        assert_eq!(charger_input_watts(Some(67.56), Some(9999.0)), Some(67.56));
+        assert_eq!(charger_input_watts(Some(67554.0), Some(12.7)), Some(67554.0));
+    }
+
     // 96W 充电器给 MacBook 充电的典型读数：InstantAmperage 约 6200mA、Voltage 约 11600mV。
     #[test]
     fn charging_reports_watts_and_percent() {
@@ -698,7 +776,10 @@ mod battery_tests {
     #[ignore]
     fn live_smart_battery_reads_real_values() {
         let (pct, external, watts) = power();
-        println!("IOKit 直读：percent={pct:?} external={external} watts={watts:?}");
+        println!("IOKit 直读：percent={pct:?} external={external} 充电器输入 watts={watts:?}");
+        if let Some(b) = read_smart_battery() {
+            println!("  电池端功率={:?} 系统负载={:?}（两者相加≈面板「充电器输入」）", b.watts, b.system_load);
+        }
         let pmset = std::process::Command::new("/usr/bin/pmset").args(["-g", "batt"])
             .output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
         println!("pmset 对照：{}", pmset.lines().take(2).collect::<Vec<_>>().join(" | "));

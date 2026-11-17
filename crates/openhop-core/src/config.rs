@@ -25,6 +25,11 @@ pub struct Config {
     pub port: u16,
     /// Client only: connect straight to this "host:port" instead of auto-discovery.
     pub server_addr: Option<String>,
+    /// Client only: address of the server from the last successful connection.
+    /// Used as a fallback when broadcast discovery is blocked by the router AP.
+    /// Unlike `server_addr` (an explicit manual override), this never takes
+    /// priority over live discovery — it's only used when discovery yields nothing.
+    pub last_server_addr: Option<String>,
     /// Client only: only auto-connect to a server with this name.
     pub server_name: Option<String>,
     /// Server only: where each screen sits.
@@ -145,6 +150,7 @@ impl Default for Config {
             passphrase: String::new(),
             port: DEFAULT_PORT,
             server_addr: None,
+            last_server_addr: None,
             server_name: None,
             layout: Layout::default(),
             swap_cmd_ctrl: true,

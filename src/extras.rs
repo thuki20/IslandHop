@@ -1348,6 +1348,14 @@ impl App {
                         settings_card(ui,|ui|{
                             setting_row(ui,"电量","本机电量、充电状态与提醒；无电池设备自动隐藏",&mut self.settings.show_battery);
                             ui.separator();
+                            {
+                                let before=self.settings.power_saving;
+                                setting_row(ui,"电池省电","用电池时降低帧率与刷新率；通电时全速，交互手感不变",&mut self.settings.power_saving);
+                                if self.settings.power_saving!=before {
+                                    crate::power_saving::set_enabled(self.settings.power_saving);
+                                }
+                            }
+                            ui.separator();
                             setting_row(ui,"岛上歌词","收起时显示歌词，无歌词时显示封面和歌名",&mut self.settings.island_lyrics);
                         });
                         settings_label(ui,"功能页面");

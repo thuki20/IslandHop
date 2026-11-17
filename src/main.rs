@@ -145,6 +145,8 @@ impl Shell {
         let running_compat=cc.wgpu_render_state.is_some();
         diagnostics::startup("加载本地配置");
         let mut app = App::new(&cc.egui_ctx, Options::default());
+        // 电池省电开关按上次保存的设置初始化（默认开）。
+        daozai::power_saving::set_enabled(app.settings.power_saving);
         app.render_compat_running=running_compat;
         #[cfg(feature="record")] let quota_demo=std::env::var("DAOZAI_QUOTA_DEMO").is_ok();
         #[cfg(not(feature="record"))] let quota_demo=false;
@@ -668,6 +670,8 @@ impl eframe::App for Shell {
             self.mac_cursor = daozai::mac_window::cursor_local(self.app.settings.island_scale());
         }
         let env = self.env(ctx);
+        // 电池供电省电：每帧把供电状态同步给全局标志，帧率/后台采样据此自动降档。
+        daozai::power_saving::sync(env.charging, env.battery);
         // IslandHop：跨设备业务状态同步。引擎在 thread_local 里（!Send），
         // 只能在主线程的 1 秒轮询里收发；放在 app.frame 之前，保证本帧就显示新数据。
         self.sync.tick(&mut self.app, &env.today, env.t);
@@ -942,6 +946,12 @@ impl eframe::App for Shell {
         #[cfg(not(windows))] let repaint_after=if passthrough{Duration::from_millis(50)}else{out.repaint_after};
         // 双机数据同步需要无交互时也每秒醒一次；有画面流时按 20fps 刷新画面。
         let repaint_after=if daozai::cross_screen::view_active(){Duration::from_millis(50)}else{repaint_after};
+        // 电池供电省电：静置动画档降帧（媒体 30→15、宠物 20→10），交互档不降。
+        // 穿透轮询（鼠标移回立即恢复）与屏幕镜像观看必须保持原速，否则手感/画面卡顿。
+        #[cfg(windows)] let responsive_poll=false;
+        #[cfg(not(windows))] let responsive_poll=passthrough;
+        let view_active=daozai::cross_screen::view_active();
+        let repaint_after=if responsive_poll||view_active{repaint_after}else{daozai::power_saving::scale_repaint(repaint_after)};
         schedule_repaint(ctx,repaint_after.min(Duration::from_secs(1)));
     }
 }
