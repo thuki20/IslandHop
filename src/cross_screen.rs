@@ -20,8 +20,9 @@ use openhop_core::platform;
 use openhop_core::protocol::{Ext, IslandSync, DEFAULT_PORT, DISCOVERY_PORT};
 use openhop_core::{Config, Engine, Role, Status};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// UI 偏好单独存一个文件，不写进 config.toml（那个文件由引擎回写，混用会丢配置）。
 fn prefs_path() -> PathBuf {
@@ -51,6 +52,71 @@ fn open_privacy_pane(pane: &str) {
 fn is_loopback_entry(name: &str) -> bool {
     name.trim().eq_ignore_ascii_case("LoopbackClient")
 }
+
+/// 一台"记住的对端"：显示名 + 直连地址。来自 config 的 last_ips / last_server_addr。
+#[derive(Clone, Debug)]
+struct KnownPeer {
+    name: String,
+    addr: String,
+}
+
+/// 诊断自检的异步结果。自检会做 TCP connect，不能阻塞 UI 线程，
+/// 因此在后台线程执行，结果通过 channel 回到这里供界面轮询显示。
+enum Diagnostics {
+    Idle,
+    Running(std::sync::mpsc::Receiver<Vec<String>>),
+    Finished(Vec<String>),
+}
+
+/// 把 "192.168.1.16" 或 "192.168.1.16:24950" 统一成纯 IP 字符串。
+fn normalize_ip(raw: &str) -> String {
+    let s = raw.trim();
+    if let Ok(a) = s.parse::<std::net::SocketAddr>() {
+        return a.ip().to_string();
+    }
+    // 带端口但 IP 是 IPv4：按最后一个冒号拆分。纯 IP 则原样返回。
+    if let Some((host, port)) = s.rsplit_once(':') {
+        if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+            return host.trim_matches(['[', ']']).to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// 后台诊断：探测本机引擎端口是否在监听、每个已知对端的 TCP 24950 是否可达。
+/// 只做只读的 connect 探测，不改动引擎、不占用发现端口，因此可以安全地脱离 UI 线程。
+fn spawn_diagnostics(known: Vec<KnownPeer>, port: u16) -> std::sync::mpsc::Receiver<Vec<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        let local: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        let local_ok = std::net::TcpStream::connect_timeout(&local, Duration::from_millis(600)).is_ok();
+        lines.push(format!(
+            "本机引擎 TCP {port}：{}",
+            if local_ok { "正在监听（开关已打开）" } else { "未监听 —— 请打开本机开关" }
+        ));
+        if known.is_empty() {
+            lines.push("没有已记住的对端地址：先用下方「IP 直连」连一次，之后会自动记住。".into());
+        }
+        for peer in &known {
+            let target: Option<std::net::SocketAddr> =
+                format!("{}:{}", peer.addr, port).parse().ok();
+            let status = match target {
+                Some(sa) => match std::net::TcpStream::connect_timeout(&sa, Duration::from_millis(900)) {
+                    Ok(_) => "可达 —— 对端程序在运行，可直接点上方卡片连接".to_string(),
+                    Err(e) => format!("不可达（{e}）—— 对端未运行 / 防火墙拦截 TCP {port} / 不在同一网段"),
+                },
+                None => "地址格式无效".to_string(),
+            };
+            lines.push(format!("{}（{}）：{}", peer.name, peer.addr, status));
+        }
+        let _ = tx.send(lines);
+    });
+    rx
+}
+
+/// 扫描超时判定：超过此时长仍无对端，就把"正在扫描"切换成明确的结论态。
+const SCAN_SETTLE: Duration = Duration::from_secs(20);
 
 /// UI 状态挂在线程局部：所有 egui 渲染都在主线程，避免 `Engine` 的 Send 约束，
 /// 也不必改动上游 `App` 结构体（它有 600KB 的 UI 测试基线依赖）。
@@ -200,6 +266,10 @@ pub struct CrossScreen {
     hide_permission_hint: bool,
     /// 屏幕镜像（单向看对端）：管理画面流与 egui 窗口。
     pub viewer: crate::remote_view::ViewerHub,
+    /// 最近一次引擎启动的时间，用于扫描超时后切换到结论态。
+    scan_since: Option<Instant>,
+    /// 网络诊断自检的异步状态。
+    diagnostics: Diagnostics,
 }
 
 impl CrossScreen {
@@ -236,6 +306,8 @@ impl CrossScreen {
             last_notes: Vec::new(),
             hide_permission_hint: read_hide_permission_hint(),
             viewer: crate::remote_view::ViewerHub::default(),
+            scan_since: None,
+            diagnostics: Diagnostics::Idle,
             path,
             cfg,
             engine: None,
@@ -257,6 +329,8 @@ impl CrossScreen {
             Ok(engine) => {
                 self.engine = Some(engine);
                 self.error = None;
+                self.scan_since = Some(Instant::now());
+                self.diagnostics = Diagnostics::Idle;
             }
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
@@ -267,6 +341,36 @@ impl CrossScreen {
     pub fn stop(&mut self) {
         self.engine = None;
         self.error = None;
+        self.scan_since = None;
+        self.diagnostics = Diagnostics::Idle;
+    }
+
+    /// 从配置里收集"记住的对端"：last_ips（曾连过的客户端 IP）+
+    /// last_server_addr（客户端上次连的服务器）。按 IP 去重、排除本机地址。
+    fn known_peers(&self) -> Vec<KnownPeer> {
+        use std::net::IpAddr;
+        let mut out: Vec<KnownPeer> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        // 本机所有网卡地址，避免把"上次连的 127.0.0.1 / 本机 IP"当成对端。
+        let local: HashSet<String> = openhop_core::engine::local_addresses()
+            .into_iter()
+            .map(|s| s.split('%').next().unwrap_or(&s).to_string())
+            .collect();
+        let mut add = |name: String, raw: String| {
+            let ip = normalize_ip(&raw);
+            if ip.is_empty() || ip == "0.0.0.0" || local.contains(&ip) { return; }
+            if ip.parse::<IpAddr>().is_err() { return; }
+            if seen.insert(ip.clone()) {
+                out.push(KnownPeer { name, addr: ip });
+            }
+        };
+        for (name, ip) in &self.cfg.last_ips {
+            add(name.clone(), ip.clone());
+        }
+        if let Some(raw) = &self.cfg.last_server_addr {
+            add("上次连接的电脑".into(), raw.clone());
+        }
+        out
     }
 
     fn status(&self) -> Option<Status> {
@@ -375,6 +479,19 @@ impl CrossScreen {
                 if !self.last_notes.contains(&line) { self.last_notes.push(line); }
             }
             while self.last_notes.len() > 8 { self.last_notes.remove(0); }
+        }
+        // 轮询诊断后台线程：把已返回的结果从 Running 切到 Finished。
+        // 用 replace 临时拿走接收器，避免同一作用域内对 self.diagnostics 双重借用。
+        if matches!(self.diagnostics, Diagnostics::Running(_)) {
+            if let Diagnostics::Running(rx) = std::mem::replace(&mut self.diagnostics, Diagnostics::Idle) {
+                match rx.try_recv() {
+                    Ok(lines) => self.diagnostics = Diagnostics::Finished(lines),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => self.diagnostics = Diagnostics::Running(rx),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.diagnostics = Diagnostics::Finished(vec!["诊断线程异常退出，请重试。".into()]);
+                    }
+                }
+            }
         }
         let status = self.status();
         let mut actions: Vec<Action> = Vec::new();
@@ -513,8 +630,50 @@ impl CrossScreen {
             return;
         };
         if s.discovered.is_empty() && s.peers.is_empty() {
-            let dots = ".".repeat((ui.input(|i| i.time) * 2.0) as usize % 4);
-            ui.label(RichText::new(format!("◌ 正在扫描局域网{dots} · 暂未发现对端")).size(11.5).color(strong));
+            // 扫描终态：超过 SCAN_SETTLE 仍无对端，就不再无限转圈，给出明确结论。
+            let settled = self.scan_since.is_some_and(|t| t.elapsed() >= SCAN_SETTLE);
+            if settled {
+                ui.label(RichText::new("◌ 未发现在线对端（扫描已稳定）").size(11.5).color(strong));
+                ui.label(RichText::new("局域网广播可能被路由器 / 防火墙拦截。可点下方「记住的对端」直连，或先做一次诊断自检。")
+                    .size(10.5).color(ui.visuals().weak_text_color()));
+            } else {
+                let dots = ".".repeat((ui.input(|i| i.time) * 2.0) as usize % 4);
+                ui.label(RichText::new(format!("◌ 正在扫描局域网{dots} · 暂未发现对端")).size(11.5).color(strong));
+            }
+
+            // 已知对端一键直连：把 config 里记住的地址浮到前台，点击复用 pair_addr。
+            let known = self.known_peers();
+            if !known.is_empty() {
+                ui.add_space(6.0);
+                ui.label(RichText::new("记住的对端 · 点一下直接连接").size(11.5).strong().color(strong));
+                for peer in &known {
+                    let label = format!("[连接] {}  ·  {}", peer.name, peer.addr);
+                    if ui.button(RichText::new(label).size(11.0)).clicked() {
+                        actions.push(Action::PairAddr(peer.addr.clone(), self.pair_code.trim().to_string()));
+                    }
+                }
+                ui.label(RichText::new("直连一次成功后会改用单播发现，以后无需再点。")
+                    .size(10.0).color(ui.visuals().weak_text_color()));
+            }
+
+            // 诊断自检：后台 TCP 探测，结果回到界面；按钮与结果分两处借用 self，避免冲突。
+            ui.add_space(6.0);
+            let diag_clicked = ui.button("诊断自检（查端口 / 对端可达性）").clicked();
+            if diag_clicked {
+                self.diagnostics = Diagnostics::Running(spawn_diagnostics(known, self.cfg.port));
+            }
+            match &self.diagnostics {
+                Diagnostics::Running(_) => {
+                    ui.label(RichText::new("正在检测…").size(10.5).color(ui.visuals().weak_text_color()));
+                }
+                Diagnostics::Finished(lines) => {
+                    for line in lines {
+                        ui.label(RichText::new(line).size(10.5).color(ui.visuals().weak_text_color()));
+                    }
+                }
+                Diagnostics::Idle => {}
+            }
+
             // 空扫描结果几乎都是环境问题（防火墙 / 网段 / 虚拟网卡），不是口令：
             // 发现包不携带口令，口令只在后续 TCP 握手校验。给出可逐项核对的清单，
             // 并把"直连兜底"入口点明，避免用户对着"正在扫描"无限等待。
@@ -523,7 +682,7 @@ impl CrossScreen {
                 "1. 对端也要打开本机开关并保持在同一个 Wi-Fi / 网段（不能用访客网络或 AP 隔离）。".to_string(),
                 format!("2. 两台机器都放行防火墙入站：UDP {}（发现）与 TCP {}（连接）。", DISCOVERY_PORT, DEFAULT_PORT),
                 "3. 暂时退出 VPN / 加速器 / 虚拟网卡，它们会抢走广播出口。".to_string(),
-                "4. 路由器若不转发无线设备间的广播：用下方「直接输入地址连接」填对端 IP 连一次，之后会自动记住该地址、改用单播发现，无需再手动。".to_string(),
+                "4. 路由器若不转发无线设备间的广播：点上方「记住的对端」直连，或在高级设置里用「IP 直连」填对端 IP 连一次，之后会自动记住、改用单播发现。".to_string(),
             ] {
                 ui.label(RichText::new(line).size(10.5).color(ui.visuals().weak_text_color()));
             }
