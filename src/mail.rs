@@ -614,27 +614,44 @@ pub mod secrets {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 pub mod secrets {
-    /// 凭据进 macOS 钥匙串（keyring macos-native / security-framework）。
-    /// 上游岛仔只实现了 Windows 凭据管理器；IslandHop 双端可用，Mac 端补齐。
-    /// 键是邮箱地址（小写），值是授权码。
+    /// macOS / Linux：凭据进本机 0600 加密文件（不再访问钥匙串，避免自签名
+    /// App 反复弹授权窗）。键是邮箱地址（小写），值是授权码。
     pub fn save(email: &str, password: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(super::SERVICE, &email.to_ascii_lowercase())
-            .map_err(|e| format!("钥匙串不可用：{e}"))?;
-        entry.set_password(password).map_err(|e| format!("保存授权码失败：{e}"))
+        crate::local_secret::save(super::SERVICE, &email.to_ascii_lowercase(), password)
     }
 
     pub fn load(email: &str) -> Result<String, String> {
-        let entry = keyring::Entry::new(super::SERVICE, &email.to_ascii_lowercase())
-            .map_err(|e| format!("钥匙串不可用：{e}"))?;
-        entry.get_password().map_err(|_| "没有保存授权码".to_string())
+        crate::local_secret::load(super::SERVICE, &email.to_ascii_lowercase())
     }
 
     pub fn delete(email: &str) {
-        if let Ok(entry) = keyring::Entry::new(super::SERVICE, &email.to_ascii_lowercase()) {
-            let _ = entry.delete_credential();
-        }
+        crate::local_secret::delete(super::SERVICE, &email.to_ascii_lowercase());
+    }
+}
+
+#[cfg(all(not(windows), test))]
+pub mod secrets {
+    /// 测试构建用内存态，不碰用户真实凭据目录、不写文件。
+    use std::sync::Mutex;
+    static STORE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    fn key(email: &str) -> String { email.to_ascii_lowercase() }
+    pub fn save(email: &str, password: &str) -> Result<(), String> {
+        let k = key(email);
+        let mut store = STORE.lock().unwrap();
+        if let Some(entry) = store.iter_mut().find(|(name, _)| name == &k) { entry.1 = password.into(); }
+        else { store.push((k, password.into())); }
+        Ok(())
+    }
+    pub fn load(email: &str) -> Result<String, String> {
+        let k = key(email);
+        STORE.lock().unwrap().iter().find(|(name, _)| name == &k)
+            .map(|(_, value)| value.clone()).ok_or_else(|| "没有保存授权码".into())
+    }
+    pub fn delete(email: &str) {
+        let k = key(email);
+        STORE.lock().unwrap().retain(|(name, _)| name != &k);
     }
 }
 

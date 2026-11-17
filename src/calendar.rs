@@ -311,29 +311,46 @@ pub mod secrets {
     fn name(cfg: &super::Config) -> String { super::credential_key(cfg) }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(test)))]
 pub mod secrets {
-    /// 凭据进 macOS 钥匙串（keyring macos-native）；键是「平台:用户名」。
-    /// 上游岛仔只实现了 Windows；IslandHop 双端可用，Mac 端补齐。
-    pub fn save(cfg: &super::Config, password: &str) -> Result<(), String> {
-        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
-            .map_err(|e| format!("钥匙串不可用：{e}"))?;
-        entry.set_password(password).map_err(|e| format!("保存密码失败：{e}"))
+    /// macOS / Linux：凭据进本机 0600 加密文件（不再访问钥匙串，避免自签名
+    /// App 反复弹授权窗）。键是「平台:用户名」，值是密码。
+    use super::Config;
+    fn name(cfg: &Config) -> String { super::credential_key(cfg) }
+    pub fn save(cfg: &Config, password: &str) -> Result<(), String> {
+        crate::local_secret::save(super::SERVICE, &name(cfg), password)
     }
-
-    pub fn load(cfg: &super::Config) -> Result<String, String> {
-        let entry = keyring::Entry::new(super::SERVICE, &name(cfg))
-            .map_err(|e| format!("钥匙串不可用：{e}"))?;
-        entry.get_password().map_err(|_| "没有保存密码".to_string())
+    pub fn load(cfg: &Config) -> Result<String, String> {
+        crate::local_secret::load(super::SERVICE, &name(cfg))
     }
-
-    pub fn delete(cfg: &super::Config) {
-        if let Ok(entry) = keyring::Entry::new(super::SERVICE, &name(cfg)) {
-            let _ = entry.delete_credential();
-        }
+    pub fn delete(cfg: &Config) {
+        crate::local_secret::delete(super::SERVICE, &name(cfg));
     }
+}
 
-    fn name(cfg: &super::Config) -> String { super::credential_key(cfg) }
+#[cfg(all(not(windows), test))]
+pub mod secrets {
+    /// 测试构建用内存态，不碰用户真实凭据目录。
+    use super::Config;
+    use std::sync::Mutex;
+    static STORE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    fn name(cfg: &Config) -> String { super::credential_key(cfg) }
+    pub fn save(cfg: &Config, password: &str) -> Result<(), String> {
+        let k = name(cfg);
+        let mut store = STORE.lock().unwrap();
+        if let Some(entry) = store.iter_mut().find(|(key, _)| key == &k) { entry.1 = password.into(); }
+        else { store.push((k, password.into())); }
+        Ok(())
+    }
+    pub fn load(cfg: &Config) -> Result<String, String> {
+        let k = name(cfg);
+        STORE.lock().unwrap().iter().find(|(key, _)| key == &k)
+            .map(|(_, value)| value.clone()).ok_or_else(|| "没有保存密码".into())
+    }
+    pub fn delete(cfg: &Config) {
+        let k = name(cfg);
+        STORE.lock().unwrap().retain(|(key, _)| key != &k);
+    }
 }
 
 // ---------------------------------------------------------------- 粘贴拆分

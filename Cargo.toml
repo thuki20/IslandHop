@@ -7,13 +7,13 @@ exclude = ["vendor"]
 
 [workspace.package]
 # 与 [package] version 保持一致：scripts/package.ps1 用「第一个 ^version =」正则取版本号。
-version = "0.6.87"
+version = "0.6.88"
 edition = "2021"
 license = "MIT"
 
 [package]
 name = "daozai"
-version = "0.6.87"
+version = "0.6.88"
 edition = "2021"
 license = "MIT"
 description = "IslandHop：全量派生自岛仔的桌面岛，集成 OpenHop 局域网键鼠共享与剪贴板同步"
@@ -78,8 +78,8 @@ rrule = "0.14.0"
 # 窗口层级 / 刘海几何需要自己接 AppKit。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-# 邮箱授权码 / 日历密码进 macOS 钥匙串（上游只支持 Windows 凭据管理器）。
-keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# macOS 凭据改用本地 0600 加密文件（local_secret.rs），不再用钥匙串：
+# 自签名 App 无法记住钥匙串授权，每次更新都弹窗。Linux 开发构建同样走该文件。
 
 # Linux 下 winit 至少要一个后端才能编译（只用于开发/录制，正式目标是 Windows）。
 [target.'cfg(target_os = "linux")'.dependencies]

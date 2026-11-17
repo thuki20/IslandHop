@@ -497,7 +497,9 @@ fn collect_secrets() -> Vec<(String, String)> {
             out.push((format!("cal:{}",crate::calendar::credential_key(&cfg)),password));
         }
     }
-    // AI 额度 API Key：API-Key 类账号以槽位为键，与 api_quota 同一服务名。
+    // AI 额度 API Key：Windows 凭据管理器才有；macOS 端 api_quota 本就不支持
+    // 安全保存 API Key，且凭据同步已停用——这里绝不触碰 keyring（会触发授权弹窗）。
+    #[cfg(windows)]
     for account in quota.accounts.iter().filter(|a|a.provider.api_key()) {
         let Some(slot)=account.slot.as_deref() else {continue};
         if slot.is_empty() {continue}
@@ -505,6 +507,7 @@ fn collect_secrets() -> Vec<(String, String)> {
             if let Ok(key)=entry.get_password() { out.push((format!("apiq:{slot}"),key)); }
         }
     }
+    #[cfg(not(windows))] let _=&quota;
     if let Ok(mut cache)=secret_cache().lock() {
         cache.0=fingerprint;cache.1=out.clone();
     }
@@ -527,10 +530,15 @@ fn apply_secrets(secrets:&[(String,String)])->usize {
                 .map(|cfg|crate::calendar::secrets::save(&cfg,value).map(|_|()))
                 .unwrap_or(Err("本机没有对应日历账号".into()))
         } else if let Some(slot)=key.strip_prefix("apiq:") {
-            match keyring::Entry::new("Daozai.ApiQuota",slot) {
-                Ok(entry)=>entry.set_password(value).map_err(|e|format!("{e}")),
-                Err(e)=>Err(format!("{e}")),
+            // 凭据同步已停用；macOS 端 api_quota 不支持 API Key 安全保存，
+            // 绝不直接调用 keyring（会触发系统授权弹窗）。
+            #[cfg(windows)] {
+                match keyring::Entry::new("Daozai.ApiQuota",slot) {
+                    Ok(entry)=>entry.set_password(value).map_err(|e|format!("{e}")),
+                    Err(e)=>Err(format!("{e}")),
+                }
             }
+            #[cfg(not(windows))] { let _=slot; Err("当前系统不支持保存 API Key".into()) }
         } else {continue};
         if result.is_ok() {saved+=1;}
     }

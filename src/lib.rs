@@ -62,6 +62,9 @@ mod task_picker;
 pub mod model;
 pub mod renderer;
 pub mod otp;
+/// 本地凭据保险库（替代自签名 App 反复弹窗的钥匙串访问；Windows 走凭据管理器）。
+#[cfg(not(windows))]
+pub mod local_secret;
 pub mod quota;
 mod quota_ui;
 pub mod weather;
