@@ -84,20 +84,41 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
         let bytes=std::slice::from_raw_parts(output.pbData,output.cbData as usize).to_vec();let _=LocalFree(HLOCAL(output.pbData.cast()));Ok(bytes)
     }
 }
+/// macOS 会话密钥文件：不存在则生成 32 随机字节并以 0600 落盘，存在则读回。
+/// 抽成独立函数以便单测用临时目录验证权限位与幂等（ protect 里 cfg(test) 用固定密钥）。
+#[cfg(target_os = "macos")]
+fn mac_session_key(path:&std::path::Path)->Result<[u8;32],String>{
+    use std::os::unix::fs::PermissionsExt;
+    use ring::rand::SecureRandom;
+    if let Ok(bytes)=fs::read(path){
+        if bytes.len()!=32 {return Err("本机会话密钥文件损坏，请删除后重试".into());}
+        let mut key=[0u8;32];key.copy_from_slice(&bytes);return Ok(key);
+    }
+    let mut key=[0u8;32];
+    ring::rand::SystemRandom::new().fill(&mut key).map_err(|_|"无法生成会话密钥".to_string())?;
+    if let Some(parent)=path.parent(){fs::create_dir_all(parent).map_err(|_|"无法创建密钥目录".to_string())?;}
+    fs::write(path,key).map_err(|_|"无法保存会话密钥".to_string())?;
+    fs::set_permissions(path,fs::Permissions::from_mode(0o600)).map_err(|_|"无法设置会话密钥权限".to_string())?;
+    Ok(key)
+}
+
 #[cfg(target_os = "macos")]
 pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
-    // macOS：密钥存钥匙串（Daozai.SessionKey），数据用 AES-256-GCM 落盘——
-    // 与 Windows DPAPI 同级：凭据绑定本机钥匙串，文件本身不可读。
-    use base64::Engine;
+    // macOS：密钥存 0600 权限的本地文件（config_dir/credentials/session.key），
+    // 数据仍用 AES-256-GCM 落盘。
+    //
+    // 为什么不再用钥匙串：IslandHop 是自签名（OpenHopSign，TeamIdentifier=not set），
+    // macOS 不允许为未受信任签名的 App 记住钥匙串授权——授权框里「始终允许」是灰的，
+    // 于是每次更新 / 重启访问 Daozai.SessionKey 都要重新输密码，反复弹窗。改成本机
+    // 0600 文件后不再触发钥匙串 UI，安全性与「仅本用户可读」等价（同用户进程本就
+    // 能读钥匙串，两者威胁模型一致）。
     use ring::aead::{Aad,LessSafeKey,Nonce,UnboundKey,AES_256_GCM};
     use ring::rand::SecureRandom;
     use std::sync::OnceLock;
     const MAGIC:&[u8;6]=b"WBMAC1";
     static KEY:OnceLock<Result<[u8;32],String>>=OnceLock::new();
     let key=KEY.get_or_init(|| -> Result<[u8;32],String> {
-        // 测试跑在 adhoc 签名的测试二进制里，访问系统钥匙串会触发授权对话框并
-        // 长时间阻塞（实测让整个 lib test 进程挂死、被系统回收）。测试构建
-        // 用固定密钥，只验证 AES-GCM 往返与密文不可读，不触碰真实凭据。
+        // 测试构建用固定密钥，只验证 AES-GCM 往返与密文不可读，不触碰真实文件。
         #[cfg(test)]
         {
             let mut key=[0u8;32];
@@ -106,20 +127,10 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
         }
         #[cfg(not(test))]
         {
-            let entry=keyring::Entry::new("Daozai.SessionKey","v1").map_err(|e|format!("无法访问钥匙串：{e}"))?;
-            match entry.get_password(){
-                Ok(stored)=>{
-                    let bytes=base64::engine::general_purpose::STANDARD.decode(stored).map_err(|_|"钥匙串会话密钥无效".to_string())?;
-                    if bytes.len()!=32 {return Err("钥匙串会话密钥无效".into());}
-                    let mut key=[0u8;32];key.copy_from_slice(&bytes);Ok(key)
-                },
-                Err(keyring::Error::NoEntry)=>{
-                    let mut key=[0u8;32];ring::rand::SystemRandom::new().fill(&mut key).map_err(|_|"无法生成会话密钥".to_string())?;
-                    entry.set_password(&base64::engine::general_purpose::STANDARD.encode(key)).map_err(|e|format!("无法保存会话密钥：{e}"))?;
-                    Ok(key)
-                },
-                Err(e)=>Err(format!("无法读取会话密钥：{e}")),
-            }
+            // 旧钥匙串里若有历史密钥，其加密的额度会话会解密失败并提示用户
+            // 重新连接（一次性迁移成本，换来彻底不再弹钥匙串授权框）。
+            let path=crate::model::config_dir().join("credentials").join("session.key");
+            mac_session_key(&path)
         }
     }).clone()?;
     let unbound=UnboundKey::new(&AES_256_GCM,&key).map_err(|_|"会话密钥无效".to_string())?;
@@ -133,7 +144,7 @@ pub(super) fn protect(raw:&[u8],encrypt:bool)->Result<Vec<u8>,String>{
         if raw.len()<MAGIC.len()+12+16||!raw.starts_with(MAGIC){return Err("本机登录会话格式无效，请重新连接".into());}
         let mut nonce=[0u8;12];nonce.copy_from_slice(&raw[MAGIC.len()..MAGIC.len()+12]);
         let mut data=raw[MAGIC.len()+12..].to_vec();
-        let plain=LessSafeKey::new(unbound).open_in_place(Nonce::assume_unique_for_key(nonce),Aad::empty(),&mut data).map_err(|_|"无法读取本机安全保存的登录会话".to_string())?;
+        let plain=LessSafeKey::new(unbound).open_in_place(Nonce::assume_unique_for_key(nonce),Aad::empty(),&mut data).map_err(|_|"本机登录会话密钥已更新（不再使用钥匙串），请重新连接一次额度账号".to_string())?;
         Ok(plain.to_vec())
     }
 }
@@ -201,6 +212,24 @@ mod tests {
     #[test] fn gemini_account_selection_and_cookie_validation(){let e=email(" Personal@Example.COM ").unwrap();assert_eq!(e,"personal@example.com");let u=url::Url::parse(&request_url(&e)).unwrap();let pairs=u.query_pairs().collect::<std::collections::HashMap<_,_>>();assert_eq!(pairs["authuser"],e);assert_eq!(pairs["query_signature"],SIGNATURE);assert_eq!(u.host_str(),Some("gemini.google.com"));assert_ne!(slot(&e),slot("work@example.com"));for bad in ["", "test", "a@b\r\nInjected: yes"]{assert!(email(bad).is_err());}assert_eq!(cookie("Cookie: SID=test; SAPISID=other").unwrap(),"SID=test; SAPISID=other");for bad in ["", "SID=test\r\nX: bad", "foo=bar"]{assert!(cookie(bad).is_err());}assert!(session_path("../../other").is_err());}
     #[test] fn gemini_account_redirects_never_forward_cookies_to_another_site(){let url=request_url("personal@example.com");let target=redirect_target(&url,"?authuser=0").unwrap();assert_eq!(url::Url::parse(&target).unwrap().query(),Some("authuser=0"));for to in ["https://accounts.google.com/signin","https://gemini.google.com.evil.invalid/","http://gemini.google.com/","https://gemini.google.com:444/","https://user@gemini.google.com/","/app"]{assert!(redirect_target(&url,to).is_none());}}
     #[cfg(any(windows, target_os = "macos"))] #[test] fn gemini_windows_storage_is_encrypted_and_roundtrips(){let raw=b"{\"email\":\"synthetic@example.com\",\"cookie\":\"SID=synthetic-secret\"}";let sealed=protect(raw,true).unwrap();assert!(!sealed.windows(16).any(|w|w==b"synthetic-secret"));assert_eq!(protect(&sealed,false).unwrap(),raw);let mut corrupt=sealed;corrupt[24]^=1;assert!(protect(&corrupt,false).is_err());}
+    #[cfg(target_os = "macos")] #[test] fn mac_session_key_file_is_0600_and_idempotent(){
+        use std::os::unix::fs::PermissionsExt;
+        let dir=std::env::temp_dir().join(format!("islandhop-key-test-{}-{}",std::process::id(),mac_key_test_seq()));
+        let _=fs::remove_dir_all(&dir);
+        let path=dir.join("credentials").join("session.key");
+        let k1=mac_session_key(&path).unwrap();
+        // 0600：仅本用户读写
+        let mode=fs::metadata(&path).unwrap().permissions().mode()&0o777;
+        assert_eq!(mode,0o600,"密钥文件权限应为 0600，实际 {mode:o}");
+        // 幂等：再次读取得到同一把密钥，不重新生成
+        let k2=mac_session_key(&path).unwrap();
+        assert_eq!(k1,k2);
+        // 损坏检测：长度不对要报错而不是静默使用
+        fs::write(&path,b"short").unwrap();
+        assert!(mac_session_key(&path).is_err());
+        let _=fs::remove_dir_all(&dir);
+    }
+    #[cfg(target_os = "macos")] fn mac_key_test_seq()->u64{use std::sync::atomic::{AtomicU64,Ordering};static N:AtomicU64=AtomicU64::new(0);N.fetch_add(1,Ordering::Relaxed)}
     #[test] fn gemini_read_only_request_does_not_echo_private_errors(){
         use std::net::TcpListener;let server=TcpListener::bind("127.0.0.1:0").unwrap();let url=format!("http://{}/quota",server.local_addr().unwrap());
         let task=std::thread::spawn(move||{let(mut stream,_)=server.accept().unwrap();let mut bytes=[0u8;4096];let n=stream.read(&mut bytes).unwrap();let raw=String::from_utf8_lossy(&bytes[..n]);assert!(raw.starts_with("GET /quota HTTP/1.1"));assert!(raw.to_ascii_lowercase().contains("cookie: sid=synthetic"));use std::io::Write;stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 14\r\nConnection: close\r\n\r\nprivate-secret").unwrap();});
