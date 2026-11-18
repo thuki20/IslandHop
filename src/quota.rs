@@ -62,7 +62,29 @@ impl Config {
     pub fn load()->Self {
         let path=crate::model::config_dir().join("ai-quota.json");
         let Ok(raw)=fs::read(&path) else {return Self::default();};
-        serde_json::from_slice(&raw).ok().map(|v|Self::from_json(&v)).unwrap_or_default()
+        let mut config=serde_json::from_slice(&raw).ok().map(|v|Self::from_json(&v)).unwrap_or_default();
+        config.dedupe_workbuddy_sessions();
+        config
+    }
+    /// 同一官网 WorkBuddy 账号可能被旧版逻辑绑成多个条目（slot 不同），但会话文件
+    /// 只落在一个 slot 上——其余条目会永久报「重新连接」。启动时若发现多个
+    /// WorkBuddy 条目中只有一个有会话文件，就把无会话条目的 slot 指向它，让所有
+    /// 条目共享同一份有效会话，免去用户反复重连。多个都有会话（真正的多账号）不动。
+    fn dedupe_workbuddy_sessions(&mut self){
+        let creds=crate::model::config_dir().join("credentials");
+        self.dedupe_workbuddy_by(|s|s.as_ref().is_some_and(|s|s.len()==64&&s.bytes().all(|c|c.is_ascii_hexdigit())&&creds.join(format!("workbuddy-{s}.bin")).is_file()));
+    }
+    /// 纯逻辑版：has_session 判定由调用方注入，便于单测（不触碰真实凭据目录）。
+    fn dedupe_workbuddy_by(&mut self,has_session:impl Fn(&Option<String>)->bool){
+        let wb:Vec<(usize,Option<String>)>=self.accounts.iter().enumerate().filter(|(_,a)|a.provider==Provider::WorkBuddy).map(|(i,a)|(i,a.slot.clone())).collect();
+        if wb.len()<2{return;}
+        let valid:Vec<_>=wb.iter().filter(|(_,s)|has_session(s)).cloned().collect::<Vec<_>>();
+        if valid.len()!=1{return;}
+        let shared=valid[0].1.clone();
+        for (i,slot) in &wb{
+            if has_session(slot){continue;}
+            if let Some(account)=self.accounts.get_mut(*i){account.slot=shared.clone();}
+        }
     }
     fn from_json(v:&Value)->Self {
         let accounts=v["accounts"].as_array().into_iter().flatten().filter_map(|a|Some(Account{
@@ -116,10 +138,10 @@ impl Config {
     }
     /// 重连 WorkBuddy：把新的登录会话写回原账号条目，保留其 id / 别名 / 置顶设置。
     /// 官网 uid 变化时必须更新 slot，否则 fetch 仍按旧 slot 找会话文件而永远报过期。
+    /// 会话文件按 slot 命名，同一官网账号的多个条目共享 slot 即可共用会话，不再
+    /// 因「已连接到另一个条目」拒绝——否则一个官网账号绑两个条目时，后者永远
+    /// 重连失败、永久提示重新登录（用户实测：两个条目只有一个有会话文件）。
     pub(crate) fn reconnect_workbuddy(&mut self,id:&str,slot:String,alias:String)->Result<String,String>{
-        if self.accounts.iter().any(|a|a.id!=id&&a.provider==Provider::WorkBuddy&&a.slot.as_deref()==Some(&slot)){
-            return Err("这个 WorkBuddy 账号已连接到另一个条目".into());
-        }
         let account=self.accounts.iter_mut().find(|a|a.id==id&&a.provider==Provider::WorkBuddy).ok_or("原账号已移除，请重新添加")?;
         account.slot=Some(slot);if !alias.trim().is_empty(){account.alias=alias;}account.enabled=true;
         self.selected=id.into();Ok(id.into())
@@ -627,8 +649,31 @@ fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
         assert_eq!(c.accounts.len(),1,"重连不应新增账号");
         assert_eq!(c.accounts[0].slot.as_deref(),Some("newslot"));
         assert_eq!(c.accounts[0].pinned,false);assert_eq!(c.colors[&id],Accent::Gold);
-        c.connect_workbuddy("third".into(),"工作".into());
-        assert!(c.reconnect_workbuddy(&id,"third".into(),"🌈".into()).is_err(),"不能把账号重连到已占用的 slot");
+        // 同一官网账号绑两个条目时，后者重连应共享已占用的 slot（会话文件按 slot
+        // 命名，可共用），而不是报错让用户永远无法重连、一直提示重新登录。
+        let second=c.connect_workbuddy("third".into(),"工作".into());
+        assert_eq!(c.reconnect_workbuddy(&second,"newslot".into(),"工作".into()).unwrap(),second);
+        assert_eq!(c.accounts.iter().filter(|a|a.provider==Provider::WorkBuddy&&a.slot.as_deref()==Some("newslot")).count(),2,"两个条目共享同一 slot");
+    }
+    #[test] fn workbuddy_duplicate_entries_share_the_one_live_session(){
+        // 一个官网账号被旧版绑成两个条目、只有一个有会话文件时，启动时把无会话
+        // 条目指向有会话的那个，避免它永久提示「重新连接」。
+        const A:&str="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const B:&str="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut c=Config::default();
+        let id_a=c.connect_workbuddy(A.into(),"🌈".into());
+        let id_b=c.connect_workbuddy(B.into(),"工作".into());
+        c.dedupe_workbuddy_by(|s|s.as_deref()==Some(A));
+        assert_eq!(c.accounts.iter().find(|a|a.id==id_b).unwrap().slot.as_deref(),Some(A),"无会话条目应共享有效会话的 slot");
+        assert_eq!(c.accounts.iter().find(|a|a.id==id_a).unwrap().slot.as_deref(),Some(A));
+        // 两个都有会话（真正多账号）时不合并。
+        let mut c2=Config::default();c2.connect_workbuddy(A.into(),"a".into());c2.connect_workbuddy(B.into(),"b".into());
+        c2.dedupe_workbuddy_by(|_|true);
+        assert_eq!(c2.accounts[1].slot.as_deref(),Some(B));
+        // 都没有会话时也不改。
+        let mut c3=Config::default();c3.connect_workbuddy(A.into(),"a".into());c3.connect_workbuddy(B.into(),"b".into());
+        c3.dedupe_workbuddy_by(|_|false);
+        assert_eq!(c3.accounts[1].slot.as_deref(),Some(B));
     }
     #[test] fn deepseek_stays_last_and_visible_with_overflow(){
         let mut c=Config::default();c.connect_deepseek("key-reference".into(),"余额".into());

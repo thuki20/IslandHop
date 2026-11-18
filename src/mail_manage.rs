@@ -59,7 +59,15 @@ mod protocol{
                 let caps=session.capabilities().map_err(|e|fail("检查邮箱能力",e))?;
                 if caps.has_str("MOVE"){
                     session.uid_mv(uid.to_string(),destination).map_err(|e|fail("移动邮件",e))?;
-                }else{return Err("邮箱未提供 MOVE，无法安全移动邮件。可关闭同步在本机整理，或在邮箱客户端操作".into());}
+                }else if caps.has_str("UIDPLUS"){
+                    // 163 / 126 等网易邮箱不支持 MOVE，但支持 UIDPLUS。用标准组合实现
+                    // 同样的「移到回收站」：先 COPY 一份到回收站，再把原邮件标 \Deleted，
+                    // 最后用 `UID EXPUNGE <uid>` 只清掉这一封——不会碰其他人标记为已删除
+                    // 的邮件（普通 EXPUNGE 会，所以必须用 UIDPLUS 版本）。
+                    session.uid_copy(uid.to_string(),destination).map_err(|e|fail("复制到回收站",e))?;
+                    session.uid_store(uid.to_string(),"+FLAGS.SILENT (\\Deleted)").map_err(|e|fail("标记删除",e))?;
+                    session.uid_expunge(uid.to_string()).map_err(|e|fail("删除原邮件",e))?;
+                }else{return Err("邮箱未提供 MOVE 或 UIDPLUS，无法安全移动邮件。可关闭同步在本机整理，或在邮箱客户端操作".into());}
             }
         }
         Ok(())
@@ -119,17 +127,23 @@ mod protocol{
             let wire=String::from_utf8(out.lock().unwrap().clone()).unwrap();assert!(wire.contains("UID STORE 42 +FLAGS.SILENT (\\Seen)"));assert!(!wire.contains("EXPUNGE"));
         }
         #[test]fn move_never_expunges_other_deleted_messages(){
-            for supports_move in [true,false]{
-                let replies=if supports_move{"* SEARCH 42\r\na2 OK search\r\n* CAPABILITY IMAP4rev1 MOVE\r\na3 OK caps\r\na4 OK move\r\n"}else{"* SEARCH 42\r\na2 OK search\r\n* CAPABILITY IMAP4rev1 UIDPLUS\r\na3 OK caps\r\na4 OK copy\r\na5 OK store\r\na6 OK expunge\r\n"};
-                let(mut s,out)=session(replies);let result=change(&mut s,&request(Action::Move{uid:42}),Some("Trash"));
-                assert_eq!(result.is_ok(),supports_move);
-                let wire=String::from_utf8(out.lock().unwrap().clone()).unwrap();assert!(!wire.lines().any(|l|l.ends_with(" EXPUNGE")));
-                if supports_move{assert!(wire.contains("UID MOVE 42 \"Trash\""));}else{assert!(!wire.contains("COPY")&&!wire.contains("STORE")&&!wire.contains("EXPUNGE"));}
+            for caps_line in ["IMAP4rev1 MOVE","IMAP4rev1 UIDPLUS"]{
+                let replies=if caps_line.contains("MOVE"){"* SEARCH 42\r\na2 OK search\r\n* CAPABILITY IMAP4rev1 MOVE\r\na3 OK caps\r\na4 OK move\r\n"}else{"* SEARCH 42\r\na2 OK search\r\n* CAPABILITY IMAP4rev1 UIDPLUS\r\na3 OK caps\r\na4 OK copy\r\na5 OK store\r\na6 OK expunge\r\n"};
+                let(mut s,out)=session(replies);change(&mut s,&request(Action::Move{uid:42}),Some("Trash")).unwrap();
+                let wire=String::from_utf8(out.lock().unwrap().clone()).unwrap();
+                // 关键安全约束：绝不能出现裸 EXPUNGE（会清掉其他客户端标记的已删除邮件）。
+                assert!(!wire.lines().any(|l|l.ends_with(" EXPUNGE")),"只能 UID EXPUNGE 精确删除：{wire}");
+                if caps_line.contains("MOVE"){assert!(wire.contains("UID MOVE 42 \"Trash\""));}
+                else{
+                    assert!(wire.contains("UID COPY 42 Trash"),"应先复制到回收站：{wire}");
+                    assert!(wire.contains("UID STORE 42 +FLAGS.SILENT (\\Deleted)"),"应标记原邮件删除：{wire}");
+                    assert!(wire.lines().any(|l|l.trim_end().ends_with("UID EXPUNGE 42")),"应 UID EXPUNGE 精确删除：{wire}");
+                }
             }
         }
-        #[test]fn unsupported_move_does_not_copy_or_delete(){
+        #[test]fn unsupported_move_without_uidplus_still_refuses(){
             let(mut s,out)=session("* SEARCH 42\r\na2 OK search\r\n* CAPABILITY IMAP4rev1\r\na3 OK caps\r\n");assert!(change(&mut s,&request(Action::Move{uid:42}),Some("Trash")).is_err());
-            let wire=String::from_utf8(out.lock().unwrap().clone()).unwrap();assert!(!wire.contains("COPY")&&!wire.contains("STORE"));
+            let wire=String::from_utf8(out.lock().unwrap().clone()).unwrap();assert!(!wire.contains("COPY")&&!wire.contains("STORE")&&!wire.contains("EXPUNGE"));
         }
         #[test]
         #[ignore="只读检查本机邮箱整理能力；不修改任何邮件"]
