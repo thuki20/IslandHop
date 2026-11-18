@@ -392,7 +392,7 @@ impl Window {
             let (back,forth)=crate::display_layout::shift_slack(bounds,scale,if dock.is_side() {crate::side_dock::SIDE_HALF_EXTENT} else {crate::display_layout::ISLAND_HALF_EXTENT},offset,dock);
             let (dx,dy)=(shift.0.clamp(-back,forth),shift.1.clamp(-back,forth));
             let (x,y)=if dock.is_side() {(x,y+dy)} else {(x+dx,y)};
-            let (canvas_w,canvas_h)=if dock.is_side() {(crate::side_dock::SIDE_W,crate::side_dock::SIDE_H)} else {(crate::app::CANVAS_W,crate::app::WIN_H)};
+            let (canvas_w,canvas_h)=if dock.is_side() {(crate::side_dock::SIDE_W,crate::side_dock::SIDE_H)} else {(crate::app::CANVAS_W,crate::app::canvas_h())};
             let (w,h)=((canvas_w*scale).round() as i32,(canvas_h*scale).round() as i32);
             let mut current=RECT::default();
             if GetWindowRect(self.hwnd,&mut current).is_err(){return false;}

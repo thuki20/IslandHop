@@ -87,9 +87,8 @@ impl Layout {
     pub fn balance_tail(&mut self,position:usize,extra:f32){self.widen(quota_slot(position),extra);}
     pub fn widen_clock(&mut self, extra:f32) {self.widen(CLOCK,extra);}
     /// **macOS 专用**（刘海与胶囊两种岛形共用）：常驻行按固定槽位左右分列——
-    /// **左组＝电源 + 额度环 + 吉祥宠；右组＝天气(温度) + 音乐 + 专注 + 铃铛**，
-    /// 正常态左右各三个图标（额度环一个、音乐/专注按需出现），即「左三右三」。
-    /// 额度环夹在电量与宠物之间；多环时继续往左排，超宽由边距自适应兜底。
+    /// **左组＝电源（贴刘海）+ 额度环 + 吉祥宠；右组＝天气(温度)（贴刘海）+ 音乐 + 专注 + 铃铛**。
+    /// 额度环多时按两组总宽左右平分，不会全堆在电源一侧；电源与天气始终紧贴空洞边缘。
     ///
     /// 两组分别贴在空洞两侧，**正中（物理刘海死区）永不放内容**——用户看不到。
     /// 常驻行**不下挂**：`drop` 恒为 0，图标留在状态栏高度带的左右两侧；
@@ -98,8 +97,8 @@ impl Layout {
     /// 空洞宽度 `gap` 即使在检测失败时也必须给足够大的兜底值（见
     /// app.rs::NOTCH_FALLBACK_GAP），否则两组会被挤回刘海正中看不见。
     /// 胶囊机型没有物理空洞，靠固定视觉间距分隔两组。
-    /// 宽度超预算（窗口可用宽）时先收紧边距与间距（PAD 14→9、SPACE 12→8），
-    /// 仍超出的部分交给绘制层的等比缩放（shared_header 的 fit）。
+    /// 宽度按内容扩张（岛体跟着变宽），只有顶到窗口可用宽度时才收紧
+    /// 边距与间距（PAD 14→9、SPACE 12→8），再超出才交给绘制层等比缩放。
     pub fn notch_slots(&mut self, gap: f32, drop: f32) {
         // 时间交给系统菜单栏，时钟槽位撤掉；天气槽位独立保留（原与时钟成组）。
         self.x[CLOCK] = None;
@@ -108,37 +107,55 @@ impl Layout {
         const SPACE: f32 = 12.0; // 组件间距，与 Layout::new 一致
         // 胶囊模式没有物理刘海，两组之间留固定视觉间距。
         let hole = if gap > 0.0 { gap } else { 48.0 };
-        // 左＝电量 + 额度环(×N) + 宠物；右＝温度 + 音乐 + 专注 + 铃铛。
-        let mut left: Vec<usize> = Vec::new();
-        left.push(BATTERY);
-        left.extend(self.quota_slots());
-        left.push(PET);
-        left.retain(|&i| self.x[i].is_some());
-        let right: Vec<usize> = [WEATHER, MUSIC, FOCUS, BELL].iter().copied().filter(|&i| self.x[i].is_some()).collect();
-        if left.is_empty() && right.is_empty() { self.notch_y = drop; return; }
+        let (battery, pet, weather) = (self.x[BATTERY].is_some(), self.x[PET].is_some(), self.x[WEATHER].is_some());
+        let quotas: Vec<usize> = self.quota_slots().filter(|&i| self.x[i].is_some()).collect();
+        let tail: Vec<usize> = [MUSIC, FOCUS, BELL].iter().copied().filter(|&i| self.x[i].is_some()).collect();
+        if !battery && !pet && quotas.is_empty() && !weather && tail.is_empty() { self.notch_y = drop; return; }
         let group_width = |slots: &[usize], space: f32| -> f32 {
             slots.iter().map(|&i| self.widths[i]).sum::<f32>()
                 + space * slots.len().saturating_sub(1) as f32
         };
+        // 左组从外到内：[吉祥宠, 额度环…, 电源]——电源紧贴刘海左缘（最常用、最该显眼）；
+        // 右组从内到外：[天气(温度), 额度环…, 音乐/专注/铃铛]——天气紧贴刘海右缘。
+        let groups = |split: usize| -> (Vec<usize>, Vec<usize>) {
+            let mut left = Vec::with_capacity(quotas.len() + 2);
+            if pet { left.push(PET); }
+            left.extend(quotas[..split].iter().copied());
+            if battery { left.push(BATTERY); }
+            let mut right = Vec::with_capacity(quotas.len() + 4);
+            if weather { right.push(WEATHER); }
+            right.extend(quotas[split..].iter().copied());
+            right.extend(tail.iter().copied());
+            (left, right)
+        };
+        // 额度环左右平分：挑两组合计宽度最接近的切分点，避免环一多就全堆在电源那侧、
+        // 另一侧空一大截（也是「图标挤出去」的根因）。
+        let balanced = |space: f32| -> (usize, f32, f32) {
+            (0..=quotas.len()).map(|split| {
+                let (left, right) = groups(split);
+                (split, group_width(&left, space), group_width(&right, space))
+            }).min_by(|a, b| (a.1 - a.2).abs().total_cmp(&(b.1 - b.2).abs())).unwrap()
+        };
         let budget = crate::app::WIN_W - 32.0;
         let (mut pad, mut space) = (PAD, SPACE);
-        let mut left_w = group_width(&left, space);
-        let mut right_w = group_width(&right, space);
-        // 超预算时自适应收紧：边距 14→9、间距 12→8，让三四个图标也能安稳落在两侧。
+        let (mut split, mut left_w, mut right_w) = balanced(space);
+        // 真的装不下才收紧：边距 14→9、间距 12→8。岛体宽度本身按内容扩张，
+        // 不压缩图标——缩放过的图标正是「看着很奇怪」的来源。
         if hole + 2.0 * pad + left_w + right_w > budget {
             pad = 9.0;
             space = 8.0;
-            left_w = group_width(&left, space);
-            right_w = group_width(&right, space);
+            let (s, lw, rw) = balanced(space);
+            split = s; left_w = lw; right_w = rw;
         }
+        let (left, right) = groups(split);
         let half = hole / 2.0;
-        // 左组右对齐到空洞左缘，按 [电源, 额度环…, 吉祥宠] 顺序向左排。
+        // 左组右对齐到空洞左缘，按列表顺序自左向右排（电源因此紧贴刘海）。
         let mut cursor = -half - pad - left_w;
         for &i in &left {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
             cursor += self.widths[i] + space;
         }
-        // 右组左对齐到空洞右缘，按 [天气(温度), 音乐, 专注, 铃铛] 顺序向右排。
+        // 右组左对齐到空洞右缘，按 [天气(温度), …] 顺序向右排。
         let mut cursor = half + pad;
         for &i in &right {
             self.x[i] = Some(cursor + self.widths[i] / 2.0);
@@ -308,17 +325,41 @@ mod tests {
         let mut layout=Layout::new(true,2,true,false,false,true,true);
         layout.notch_slots(200.0,28.0);
         let get=|i:usize|layout.x[i].unwrap();
-        // 左组＝[电源, 额度环×2, 宠物]，整体在刘海空洞（±100）左侧；额度环夹在电量与宠物之间。
-        assert!(get(BATTERY)<get(quota_slot(0))&&get(quota_slot(0))<get(quota_slot(1)));
-        assert!(get(quota_slot(1))<get(PET)&&get(PET)< -100.0-9.0);
-        // 天气（温度）回到右组，紧贴空洞右缘。
-        assert!(get(WEATHER)>100.0+9.0);
+        // 左组最靠近刘海的是电源（不会被额度环顶到屏幕最左），宠物在更外侧。
+        let innermost_left=[BATTERY,WEATHER].into_iter().chain(layout.quota_slots())
+            .filter_map(|i|layout.x[i].map(|x|(i,x))).filter(|(_,x)|*x<0.0)
+            .max_by(|a,b|a.1.total_cmp(&b.1)).map(|(i,_)|i);
+        assert_eq!(innermost_left,Some(BATTERY),"电源应紧贴刘海左缘");
+        assert!(get(PET)<get(BATTERY));
+        // 天气（温度）紧贴空洞右缘。
+        let innermost_right=[BATTERY,WEATHER].into_iter().chain(layout.quota_slots())
+            .filter_map(|i|layout.x[i].map(|x|(i,x))).filter(|(_,x)|*x>0.0)
+            .min_by(|a,b|a.1.total_cmp(&b.1)).map(|(i,_)|i);
+        assert_eq!(innermost_right,Some(WEATHER));
         // 整行下挂到物理刘海下方，岛体高度由 base_size() 同步延长。
         assert_eq!(layout.notch_y,28.0);
         // 岛体总宽按两组实占计算，不小于空洞与边距之和。
         assert!(layout.width>=200.0+2.0*(9.0+16.0));
         // 多图标（本例 6 个）自适应收紧后仍不超窗口可用宽度预算。
         assert!(layout.width<=crate::app::WIN_W-32.0+0.01,"6 图标时收紧边距应压回预算内：{}",layout.width);
+    }
+    #[test]
+    fn quota_rings_split_evenly_between_both_sides(){
+        // 6 个额度环：两组合计宽度接近（视感左右均衡），不会全堆在电源一侧；
+        // 岛体按内容变宽，而不是把图标挤成一团。
+        let mut layout=Layout::new(true,6,false,false,false,true,false);
+        layout.notch_slots(209.0,0.0);
+        let (mut lw,mut rw)=(0.0,0.0);
+        for (i,x) in layout.x.iter().enumerate() {
+            let Some(center)=x else {continue};
+            if *center<0.0 {lw+=layout.widths[i]} else {rw+=layout.widths[i]}
+        }
+        assert!(lw>0.0&&rw>0.0,"两侧都应分到图标");
+        assert!((lw-rw).abs()<=30.0,"两侧总宽应接近：左 {lw} 右 {rw}");
+        // 所有图标都在刘海死区之外。
+        assert!(layout.x.iter().flatten().all(|x|x.abs()>104.5),"图标不能落进刘海死区：{:?}",layout.x);
+        // 仍不超窗口可用宽度预算。
+        assert!(layout.width<=crate::app::WIN_W-32.0+0.01,"{}",layout.width);
     }
     #[test]
     fn resident_row_splits_to_both_sides_without_dropping(){

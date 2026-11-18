@@ -76,7 +76,7 @@ fn weather_content_tap_switches_both_ways_with_a_short_transition(){
 #[test]
 fn weather_content_tap_keeps_other_controls_independent(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
-    for (x,y,target) in [(375.0,crate::app::WEATHER_H-7.0,8),(394.0,18.0,8),(367.0,18.0,0),(398.0,88.0,0),(20.0,88.0,7)] {
+    for (x,y,target) in [(375.0,crate::app::WEATHER_H-7.0,8),(394.0,18.0,8),(367.0,18.0,0),(398.0,68.0,0),(20.0,68.0,7)] {
         let mut h=H::new();h.app.settings.pet=false;
         h.media=crate::smtc::NowPlaying{source:"cloudmusic.exe".into(),title:"歌曲".into(),artist:"歌手".into(),playing:true,..Default::default()};
         h.app.weather.snapshot=Some(crate::weather::Snapshot{place:"杭州".into(),temp:19.0,..Default::default()});
@@ -1814,7 +1814,7 @@ fn music_lyrics_island_toggle_is_independent_and_persistent() {
     h.hover(Pos2::new(WIN_W/2.0,PH+30.0),1.0);
     assert!(!h.app.open);
     assert_eq!(h.app.island_lyric().map(|(_,line)|line),Some("当前歌词"));
-    let pet_width=if h.app.pet_enabled(){48.0}else{0.0};
+    let pet_width=if h.app.pet_enabled(){crate::app::LYRIC_PET_BLOCK}else{0.0};
     assert!((h.app.current_width()-crate::app::LYRIC_BAR_W-pet_width).abs()<2.0);
 }
 
@@ -1971,7 +1971,8 @@ fn island_lyrics_center_segments_in_a_fixed_height(){
             egui::Shape::Text(text) if !text.galley.text().is_empty() && line.contains(text.galley.text())=>Some(text),_=>None,
         }).expect("岛上应显示当前歌词的一段");
         let center=text.pos.x+text.galley.rect.center().x;
-        let offset=if h.app.pet_enabled(){24.0}else{0.0};
+        // 宠物块 78：歌词块（300）中心相对岛体中心右移 (378-300)/2 = 39。
+        let offset=if h.app.pet_enabled(){39.0}else{0.0};
         assert!((center-WIN_W/2.0-offset).abs()<1.5,"歌词应在内容区居中");
         assert!(!text.galley.elided,"显示段应完整显示");
         assert_eq!(text.galley.rows.len(),1,"每次只显示一段歌词");
@@ -2434,7 +2435,7 @@ fn wheel_handles_small_deltas_without_skipping_pages_on_bursts(){
 fn navigation_wraps_between_nine_pages_and_notification_settings_remain_accessible() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
     h.hover(Pos2::new(WIN_W/2.0,12.0),1.0);h.click(H::local(21.0,68.0));assert_eq!(h.app.page,8);
-    h.hover(H::local(300.0,60.0),0.8);h.click(H::local(398.0,88.0));assert_eq!(h.app.page,0);
+    h.hover(H::local(300.0,60.0),0.8);h.click(H::local(398.0,68.0));assert_eq!(h.app.page,0);
     h.app.open_settings_category(3);assert!(h.app.settings_open);assert_eq!(h.app.settings_tab,6);
 }
 
@@ -2871,11 +2872,11 @@ fn quota_page_navigation_tracks_the_taller_panel(){
     }).expect("分页圆点应随加高的面板下移");
     h.click(dot);assert_ne!(h.app.page,6,"新增底部区域中的分页应可点击");
     h.app.show_page(6);h.hover(H::local(300.0,60.0),0.8);
-    h.click(H::local(21.0,88.0));assert_eq!(h.app.page,5);
+    h.click(H::local(21.0,68.0));assert_eq!(h.app.page,5);
     h.hover(H::local(300.0,60.0),0.8);assert_eq!(h.app.expanded_height(),PH);
     h.click(H::local(398.0,68.0));assert_eq!(h.app.page,6);
     h.hover(H::local(300.0,60.0),0.8);
-    h.click(H::local(398.0,88.0));assert_eq!(h.app.page,crate::app::CALENDAR_PAGE);
+    h.click(H::local(398.0,68.0));assert_eq!(h.app.page,crate::app::CALENDAR_PAGE);
 }
 
 #[test]
@@ -3409,12 +3410,12 @@ fn mascot_and_album_share_the_single_line_lyric_island(){
         artwork:Some(std::sync::Arc::new(egui::ColorImage::new([32,32],egui::Color32::from_rgb(70,120,220)))),..Default::default()};
     h.app.set_lyrics("Track","Artist",120.0,crate::lyrics::parse_lrc("[00:05]晚风吹过了山岗\n[00:15]下一句"));
     for _ in 0..120 {h.frame(vec![]);}
-    assert!((h.app.current_width()-348.0).abs()<0.1,"专辑、岛仔与原有歌词宽度一起保留");
+    assert!((h.app.current_width()-(crate::app::LYRIC_BAR_W+crate::app::LYRIC_PET_BLOCK)).abs()<0.1,"专辑、岛仔与原有歌词宽度一起保留");
     let texture=h.app.music_artwork.as_ref().unwrap().1.id();
     assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.brush.as_ref().is_some_and(|b|b.fill_texture_id==texture))),"专辑封面不能被岛仔替代");
     let text=h.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Text(t) if t.galley.text()=="晚风吹过了山岗"=>Some(t),_=>None}).unwrap();
     assert_eq!(text.galley.rows.len(),1,"保留单行歌词");
-    assert!((text.pos.x+text.galley.rect.center().x-WIN_W/2.0-24.0).abs()<1.5,"歌词在封面和岛仔右侧居中");
+    assert!((text.pos.x+text.galley.rect.center().x-WIN_W/2.0-39.0).abs()<1.5,"歌词在封面和岛仔右侧居中");
     assert!(h.shapes.iter().filter(|s|matches!(&s.shape,egui::Shape::Path(p) if p.points.len()==13 && (2.79..=3.61).contains(&p.stroke.width))).count()>=2);
 }
 
@@ -3977,7 +3978,7 @@ fn starting_timer_keeps_lyrics_album_and_mascot_with_a_compact_countdown(){
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Rect(r) if r.brush.as_ref().is_some_and(|b|b.fill_texture_id==texture))));
         let secs=h.app.pomo.remaining.ceil() as u32;let countdown=format!("{:02}:{:02}",secs/60,secs%60);
         assert!(h.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Text(t) if t.galley.text()==countdown)),"歌词模式中也应显示计时");
-        assert!(h.app.current_width()<=PW+0.1);assert!((h.hit.height()-31.0).abs()<0.1);
+        assert!(h.app.current_width()<=crate::app::WIN_W-32.0+0.1);assert!((h.hit.height()-31.0).abs()<0.1);
     }
     h.app.pomo.running=false;for _ in 0..90 {h.frame(vec![]);}
     assert_eq!(h.app.island_lyric().map(|(_,line)|line),Some("晚风吹过了山岗"));
@@ -4004,7 +4005,7 @@ fn timer_keeps_the_existing_lyric_segments_and_content_bounds(){
             let timer=h.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Text(t) if t.galley.text()==countdown=>Some(t.visual_bounding_rect()),_=>None}).unwrap();
             assert!(bounds.right()+20.0<timer.left(),"歌词与倒计时之间应留出波形和图标的位置");
             assert!(timer.right()<h.hit.right() && bounds.top()>=h.hit.top() && bounds.bottom()<h.hit.bottom());
-            assert!((h.app.current_width()-if pet{418.0}else{370.0}).abs()<0.1);
+            assert!((h.app.current_width()-if pet{448.0}else{370.0}).abs()<0.1);
         }
     }
 }

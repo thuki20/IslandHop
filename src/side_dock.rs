@@ -75,7 +75,11 @@ impl App {
 
     /// 展开面板（页面内容）的左上角。
     pub(crate) fn content_origin(&self, win: Rect) -> Pos2 {
-        self.island_rect(win, PW, self.expanded_height()).min
+        let mut origin = self.island_rect(win, PW, self.expanded_height()).min;
+        // macOS 刘海机型：面板内容随展开进度整体下移，顶栏按钮不再压在物理刘海
+        // 死区里。收起态进度为 0，常驻行位置完全不变。
+        origin.y += self.notch_inset() * crate::anim::clamp01(self.progress());
+        origin
     }
 
     /// 侧边停靠的命中区域：收起时是胶囊外扩几点并一直延伸到屏幕边缘，展开时是整个面板。
