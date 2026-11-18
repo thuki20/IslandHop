@@ -67,6 +67,12 @@ pub(crate) const HUD_W: f32 = 260.0;
 /// 这段延长区里，随岛体弹簧一起延长 / 收回，而不是单独弹一个胶囊框。
 pub(crate) const HUD_SHELF: f32 = 52.0;
 pub(crate) const LYRIC_BAR_W: f32 = 300.0;
+/// 歌词条左端的「封面 + 吉祥物」块：12 左内边距 + 20 封面 + 6 间隙 + 32 宠物 + 8 呼吸。
+/// 歌词在它右边剩余的区域居中，宠物与封面之间不再空出一大截。
+pub(crate) const LYRIC_PET_BLOCK: f32 = 78.0;
+pub(crate) const LYRIC_ART_X: f32 = 12.0;
+pub(crate) const LYRIC_ART_SIZE: f32 = 20.0;
+pub(crate) const LYRIC_PET_GAP: f32 = 6.0;
 pub(crate) const HUD_TRACK_X: f32 = 48.0;
 pub(crate) const HUD_TRACK_W: f32 = 150.0;
 pub const BAR_W_MIN: f32 = 44.0; // 极简小条
@@ -77,6 +83,12 @@ pub const RAD: f32 = 33.0; // 底部圆角
 pub const WIN_W: f32 = 640.0; // 窗口（透明画布）
 pub const CANVAS_W: f32 = WIN_W + 320.0; // 保留右侧通知及阴影的完整空间，原岛仍按 WIN_W 定位。
 pub const WIN_H: f32 = 270.0;
+/// 透明画布高度：刘海机型要多留一段——展开面板整体下移到物理刘海下方之后，
+/// 最高的页面（邮件详情 236、天气 232）也要完整放得下。无刘海 / Windows 不变。
+pub fn canvas_h() -> f32 { WIN_H + notch_reserve() }
+pub(crate) fn notch_reserve() -> f32 {
+    if crate::mac_window::notch_layout().is_some() {40.0} else {0.0}
+}
 /// 胶囊皮肤与屏幕顶边的间隙。
 pub const PILL_GAP: f32 = 6.0;
 
@@ -1680,7 +1692,7 @@ impl App {
     pub(crate) fn pet_enabled(&self)->bool {self.settings.pet && !self.effective_minimal() && !self.side()}
     pub(crate) fn pet_space(&self)->f32 {if self.pet_enabled(){44.0}else{0.0}}
     fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
-    fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){LYRIC_PET_BLOCK}else{0.0}+self.lyric_focus_space()}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
         let (width,height)=if a.meeting.is_some(){(360.0,136.0)}else if a.source==crate::extras::AlertSource::Internal && a.title=="蓝牙设备"{(HUD_W,48.0)}else if a.is_hud(){(HUD_W,38.0)}else{(334.0,44.0)};
         (width,height)
@@ -1732,8 +1744,18 @@ impl App {
         (self.h.pos - bh) / (self.expanded_height() - bh)
     }
 
+    /// macOS 刘海机型展开面板内容整体下移的距离。物理刘海下方的正中是死区，
+    /// 顶栏的日期、页面右上角控件画在那里用户看不到；面板连同内容一起下移，
+    /// 死区在展开态只留一条空的黑色带。无刘海 / Windows / 左右停靠恒为 0。
+    pub(crate) fn notch_inset(&self) -> f32 {
+        if self.side() { return 0.0; }
+        let Some((_, height)) = crate::mac_window::notch_layout() else { return 0.0; };
+        // 胶囊岛本身已经离屏幕顶边 PILL_GAP，真正被刘海盖住的只剩 height - PILL_GAP。
+        if self.settings.island_shape == model::IslandShape::Pill {(height - PILL_GAP).max(0.0)} else {height}
+    }
     pub(crate) fn expanded_height(&self)->f32 {
-        if self.page==CALENDAR_PAGE {CALENDAR_H}else if self.page==WEATHER_PAGE {WEATHER_H}else if self.page==6{176.0}else if self.page==5&&self.mail.open_uid.is_some(){236.0}else{PH}
+        let base = if self.page==CALENDAR_PAGE {CALENDAR_H} else if self.page==WEATHER_PAGE {WEATHER_H} else if self.page==6 {176.0} else if self.page==5&&self.mail.open_uid.is_some() {236.0} else {PH};
+        base + self.notch_inset()
     }
 
     // ---------------------------------------------------------------
@@ -1973,7 +1995,7 @@ impl App {
         let p = self.progress();
         let (sx, sy) = self.drag_scale();
         // 拿起放大不能超出透明画布，否则两端会被切掉。
-        let (max_w, max_h) = if side {(crate::side_dock::SIDE_W, crate::side_dock::SIDE_H)} else {(WIN_W, WIN_H)};
+        let (max_w, max_h) = if side {(crate::side_dock::SIDE_W, crate::side_dock::SIDE_H)} else {(WIN_W, canvas_h())};
         let (w, h) = ((self.w.pos * sx).min((max_w - 24.0).max(self.w.pos)), (self.h.pos * sy).min((max_h - 24.0).max(self.h.pos)));
         let panel = self.island_rect(win, w, h);
         let messenger_rect=self.messenger_badge_rect(win,panel);
@@ -2182,7 +2204,15 @@ impl App {
             let fit=if self.island_lyrics_active()||self.notice.is_some(){1.0}else{((WIN_W-32.0)/self.resident.target.width).min(1.0)};
             // 吉祥物与常驻行一起下移到刘海下方，收起态才不会一半被物理刘海挡住。
             let shelf=self.resident.target.notch_y*(1.0-anim::ease_in_out(smoothstep(0.0,0.85,pc)));
-            self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y+shelf).faded(pet_alpha),cx-origin.x+self.resident.position(bar::PET),self.t,self.skin_palette());
+            // 无刘海平台的歌词条里，宠物紧贴封面右侧（旧逻辑沿用药丸布局坐标，
+            // 歌词条一拉宽宠物就飘到歌词中间）；歌词在剩余区域真正居中。
+            let pet_x=if self.island_lyrics_active() && crate::mac_window::notch_layout().is_none() {
+                let content_width=self.lyric_bar_width()-self.lyric_focus_space();
+                let width=self.w.pos.max(content_width);
+                let left=(cx-origin.x)-width/2.0;
+                left+LYRIC_ART_X+LYRIC_ART_SIZE+LYRIC_PET_GAP+self.resident.target.widths[bar::PET]/2.0
+            } else {cx-origin.x+self.resident.position(bar::PET)};
+            self.pet.draw(&base.scaled(cx-origin.x,15.0,fit).shifted(0.0,y+shelf).faded(pet_alpha),pet_x,self.t,self.skin_palette());
         }
         if reveal > 0.004 && !banner && !restoring_lyrics {
             let c = base.shifted(0.0, (1.0 - reveal) * -5.0).faded(reveal);
@@ -2827,10 +2857,10 @@ impl App {
                     let [width,height]=image.size;
                     let uv_size=if width>height {egui::vec2(height as f32/width as f32,1.0)}else{egui::vec2(1.0,width as f32/height as f32)};
                     let uv=Rect::from_center_size(Pos2::new(0.5,0.5),uv_size);
-                    c.painter.add(egui::epaint::RectShape::filled(c.rect(left+12.0,center_y-10.0,20.0,20.0),5.0*c.s,Color32::WHITE).with_texture(texture.id(),uv));
+                    c.painter.add(egui::epaint::RectShape::filled(c.rect(left+LYRIC_ART_X,center_y-LYRIC_ART_SIZE/2.0,LYRIC_ART_SIZE,LYRIC_ART_SIZE),5.0*c.s,Color32::WHITE).with_texture(texture.id(),uv));
                 } else {
-                    c.fill(left+12.0,center_y-10.0,20.0,20.0,5.0,theme::CARD);
-                    paint::note(&c,left+22.0,center_y,13.0,theme::WHITE);
+                    c.fill(left+LYRIC_ART_X,center_y-LYRIC_ART_SIZE/2.0,LYRIC_ART_SIZE,LYRIC_ART_SIZE,5.0,theme::CARD);
+                    paint::note(&c,left+LYRIC_ART_X+LYRIC_ART_SIZE/2.0,center_y,13.0,theme::WHITE);
                 }
             }
             let index=lyric.unwrap_or(0);
@@ -3077,7 +3107,10 @@ impl App {
     fn nav(&mut self, c: &Card) {
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
-        let arrow_y=if self.page==6||self.page==8{88.0}else{68.0};
+        // 翻页箭头固定在同一个高度：以前额度/天气页为了避让内容挪到 88，
+        // 切页面时左右按钮会上下跳，用户得重新找位置点。
+        const ARROW_Y: f32 = 68.0;
+        let arrow_y = ARROW_Y;
         let l = c.hit(8.0, arrow_y-13.0, 26.0, 26.0, "nav-l");
         let r = c.hit(385.0, arrow_y-13.0, 26.0, 26.0, "nav-r");
         let (lh, lp) = c.hover_t(&l);
@@ -3088,7 +3121,8 @@ impl App {
         if r.clicked() { self.navigate_page(true); }
         // 页码豆：宽度由弹簧驱动，整行实时居中；当前页是白色长条
         let gap = 4.0;
-        let dot_y=self.expanded_height()-7.2;
+        // 页码豆贴岛体下沿：expanded_height 含刘海下移量，扣掉它才是卡片内的 y。
+        let dot_y=self.expanded_height()-self.notch_inset()-7.2;
         let total: f32 = pages.iter().map(|page| self.dots[*page].pos).sum::<f32>() + gap * (pages.len()-1) as f32;
         let mut x = PW / 2.0 - total / 2.0;
         let mut clicked = None;

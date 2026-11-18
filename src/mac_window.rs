@@ -271,7 +271,7 @@ mod imp {
         unsafe {
             let frame: NSRect = msg_send![ns, frame];
             let w = (crate::app::CANVAS_W * scale) as f64;
-            let h = (crate::app::WIN_H * scale) as f64;
+            let h = (crate::app::canvas_h() * scale) as f64;
             if (frame.size.width - w).abs() < 0.5 && (frame.size.height - h).abs() < 0.5 { return; }
             let top = frame.origin.y + frame.size.height;
             let mut next = frame;
