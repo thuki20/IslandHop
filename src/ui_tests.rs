@@ -3403,6 +3403,29 @@ fn mascot_stays_beside_the_clock_and_all_resident_components(){
 }
 
 #[test]
+fn mascot_hugs_the_album_cover_in_the_single_line_lyric_island(){
+    // Windows / 无刘海平台：歌词条 = [封面][吉祥物][居中歌词][节奏条]，
+    // 宠物必须紧贴封面右侧，不能飘到歌词文字区（曾经沿用药丸坐标导致）。
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.pet=true;h.app.settings.island_lyrics=true;
+    h.media=crate::smtc::NowPlaying{title:"Track".into(),artist:"Artist".into(),playing:false,position:7.0,duration:120.0,
+        artwork:Some(std::sync::Arc::new(egui::ColorImage::new([32,32],egui::Color32::from_rgb(70,120,220)))),..Default::default()};
+    h.app.set_lyrics("Track","Artist",120.0,crate::lyrics::parse_lrc("[00:05]晚风吹过了山岗\n[00:15]下一句"));
+    for _ in 0..120 {h.frame(vec![]);}
+    let cover=h.shapes.iter().find_map(|s|match &s.shape{
+        egui::Shape::Rect(r) if r.brush.as_ref().is_some_and(|b|b.fill_texture_id==h.app.music_artwork.as_ref().unwrap().1.id())=>Some(r.rect),_=>None,
+    }).expect("应绘制封面");
+    let eyes:Vec<f32>=h.shapes.iter().filter_map(|s|match &s.shape{
+        egui::Shape::Path(p) if p.points.len()==13 && (2.4..=3.8).contains(&p.stroke.width)=>
+            Some(p.points.iter().map(|p|p.x).sum::<f32>()/13.0),_=>None,
+    }).collect();
+    assert_eq!(eyes.len(),2,"吉祥物应显示双眼");
+    let face=(eyes[0]+eyes[1])/2.0;
+    assert!(face>cover.right(),"宠物应在封面右侧：封面右缘 {}，脸中心 {face}",cover.right());
+    assert!(face-cover.right()<40.0,"宠物应紧贴封面（间隙过大：{}）",face-cover.right());
+}
+
+#[test]
 fn mascot_and_album_share_the_single_line_lyric_island(){
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
     h.app.settings.pet=true;h.app.settings.island_lyrics=true;
