@@ -114,6 +114,16 @@ impl Config {
         let id=format!("WorkBuddy-{slot}");let pinned=true;
         self.selected=id.clone();self.accounts.push(Account{id:id.clone(),provider:Provider::WorkBuddy,alias,source:PathBuf::new(),slot:Some(slot),enabled:true,pinned});id
     }
+    /// 重连 WorkBuddy：把新的登录会话写回原账号条目，保留其 id / 别名 / 置顶设置。
+    /// 官网 uid 变化时必须更新 slot，否则 fetch 仍按旧 slot 找会话文件而永远报过期。
+    pub(crate) fn reconnect_workbuddy(&mut self,id:&str,slot:String,alias:String)->Result<String,String>{
+        if self.accounts.iter().any(|a|a.id!=id&&a.provider==Provider::WorkBuddy&&a.slot.as_deref()==Some(&slot)){
+            return Err("这个 WorkBuddy 账号已连接到另一个条目".into());
+        }
+        let account=self.accounts.iter_mut().find(|a|a.id==id&&a.provider==Provider::WorkBuddy).ok_or("原账号已移除，请重新添加")?;
+        account.slot=Some(slot);if !alias.trim().is_empty(){account.alias=alias;}account.enabled=true;
+        self.selected=id.into();Ok(id.into())
+    }
     pub(crate) fn connect_gemini(&mut self,slot:String,alias:String)->String{
         if let Some(a)=self.accounts.iter_mut().find(|a|a.provider==Provider::Gemini && a.slot.as_deref()==Some(&slot)){
             a.enabled=true;if !alias.trim().is_empty(){a.alias=alias;}self.selected=a.id.clone();return a.id.clone();
@@ -607,6 +617,18 @@ fn fetch(agent:&ureq::Agent,account:&Account)->Result<Snapshot,(String,u64)>{
         let mut c=Config::default();let id=c.connect_deepseek("old".into(),"工作".into());c.accounts[0].pinned=false;c.accounts[0].enabled=false;c.colors.insert(id.clone(),Accent::Gold);
         assert_eq!(c.reconnect_deepseek(&id,"new".into(),"工作".into()).unwrap(),id);assert_eq!(c.accounts.len(),1);assert_eq!(c.accounts[0].slot.as_deref(),Some("new"));assert!(!c.accounts[0].pinned);assert!(!c.accounts[0].enabled);assert_eq!(c.colors[&id],Accent::Gold);
         c.connect_deepseek("other".into(),"个人".into());assert!(c.reconnect_deepseek(&id,"other".into(),"工作".into()).is_err());assert_eq!(c.accounts[0].slot.as_deref(),Some("new"));
+    }
+    #[test] fn workbuddy_reconnect_rewrites_slot_on_same_account(){
+        // 官网 uid 变化后重连：必须把新 slot 写回原条目，而不是新增账号，
+        // 否则旧账号仍按旧 slot 找会话文件而永远报「过期/未连接」。
+        let mut c=Config::default();let id=c.connect_workbuddy("oldslot".into(),"🌈".into());
+        c.accounts[0].pinned=false;c.colors.insert(id.clone(),Accent::Gold);
+        assert_eq!(c.reconnect_workbuddy(&id,"newslot".into(),"🌈".into()).unwrap(),id);
+        assert_eq!(c.accounts.len(),1,"重连不应新增账号");
+        assert_eq!(c.accounts[0].slot.as_deref(),Some("newslot"));
+        assert_eq!(c.accounts[0].pinned,false);assert_eq!(c.colors[&id],Accent::Gold);
+        c.connect_workbuddy("third".into(),"工作".into());
+        assert!(c.reconnect_workbuddy(&id,"third".into(),"🌈".into()).is_err(),"不能把账号重连到已占用的 slot");
     }
     #[test] fn deepseek_stays_last_and_visible_with_overflow(){
         let mut c=Config::default();c.connect_deepseek("key-reference".into(),"余额".into());

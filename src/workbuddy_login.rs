@@ -8,6 +8,10 @@ const ORIGIN:&str="https://www.codebuddy.cn";
 fn read(response:ureq::Response)->Result<Value,String>{
     serde_json::from_reader(response.into_reader().take(2*1024*1024)).map_err(|_|"官网登录响应无效".into())
 }
+/// 官网账号 uid 可能在 `uid` 或 `userId` 字段，兼容两种写法。
+fn account_uid(value:&Value)->Option<&str>{
+    value.get("uid").and_then(Value::as_str).or(value.get("userId").and_then(Value::as_str))
+}
 fn response(value:Value)->Result<Value,String>{
     if value["code"].as_i64()!=Some(0){return Err("WorkBuddy 暂时无法创建登录请求，请稍后重试".into());}
     value.get("data").cloned().ok_or_else(||"官网未返回登录请求".into())
@@ -68,12 +72,19 @@ pub(super) fn wait_for_login(agent:&ureq::Agent,state:&str,expected:Option<&str>
         if auth.access_token.is_empty(){return Err("官网登录授权为空，请重新连接".into());}
         let mut session=Session{origin:ORIGIN.into(),ua:String::new(),cookie:String::new(),auth:Some(auth)};
         let accounts=super::with_transport_retry(&agent,ORIGIN,|agent|super::api(agent,&session,"/v2/plugin/accounts")).map_err(Failure::message)?;
-        let list=accounts.pointer("/data/accounts").and_then(Value::as_array).ok_or("官网未返回账号列表")?;
-        let personal=list.iter().filter(|a|a["enterpriseId"].as_str().unwrap_or_default().is_empty()&&a["isCurrentOneIdEnterprise"]!=true);
-        let account=personal.filter(|a|a["uid"].as_str().is_some_and(|uid|expected.is_none_or(|id|slot(uid)==id))).next()
-            .ok_or("请在官网登录原来绑定的个人账号后重试")?;
-        let id=slot(account["uid"].as_str().ok_or("官网未返回账号标识")?);
-        session.auth.as_mut().unwrap().uid=account["uid"].as_str().unwrap().into();
+        let list=accounts.pointer("/data/accounts")
+            .or_else(||accounts.pointer("/data/list"))
+            .and_then(Value::as_array).ok_or("官网未返回账号列表")?;
+        let personal:Vec<&Value>=list.iter().filter(|a|a["enterpriseId"].as_str().unwrap_or_default().is_empty()&&a["isCurrentOneIdEnterprise"]!=true&&account_uid(a).is_some()).collect();
+        // 重连时优先锁定原账号；但官网 uid 可能变化、或旧会话从未落盘（密钥迁移后），
+        // 此时不要直接判失败——退回当前登录的个人账号，让重连真正能完成并落盘会话。
+        // 多个个人账号时优先原账号，否则取第一个。
+        let account=personal.iter().copied().find(|a|account_uid(a).is_some_and(|uid|expected.is_some_and(|id|slot(uid)==id)))
+            .or_else(||personal.first().copied())
+            .ok_or("官网未找到可用的个人账号，请用个人版 WorkBuddy 登录后重试")?;
+        let uid=account_uid(account).ok_or("官网未返回账号标识")?;
+        let id=slot(uid);
+        session.auth.as_mut().unwrap().uid=uid.into();
         let snapshot=query(&agent,&session,&id).map_err(Failure::message)?;
         if cancel.load(Ordering::Relaxed){return Err("已取消 WorkBuddy 登录".into());}
         save_session(&id,&session)?;

@@ -297,7 +297,13 @@ impl App {
         if let Some(result)=self.quota.workbuddy_connecting.as_ref().and_then(|c|c.poll()){
             self.quota.workbuddy_connecting=None;
             match result{Ok(connected)=>{
-                let id=self.quota.config.connect_workbuddy(connected.slot,connected.label);self.quota.stale.remove(&id);self.quota.rows.insert(id,Ok(connected.snapshot));self.quota.save_snapshots();self.quota.connect_target=None;self.quota.config.save();self.quota.note="WorkBuddy 已连接".into();self.pending.push(Cmd::QuotaConnected);
+                let old=self.quota.connect_target.as_ref().and_then(|id|self.quota.config.accounts.iter().find(|a|&a.id==id)).cloned();
+                let id=if let Some(target)=self.quota.connect_target.as_deref(){
+                    match self.quota.config.reconnect_workbuddy(target,connected.slot.clone(),connected.label){Ok(id)=>id,Err(error)=>{self.quota.note=error;return;}}
+                }else{self.quota.config.connect_workbuddy(connected.slot.clone(),connected.label)};
+                // 若 uid 变化导致 slot 更新，删掉旧 slot 的会话文件，避免残留敏感数据。
+                if let Some(old)=old.filter(|a|a.slot.as_deref()!=Some(&connected.slot)){quota::workbuddy::forget(&old);}
+                self.quota.stale.remove(&id);self.quota.rows.insert(id,Ok(connected.snapshot));self.quota.save_snapshots();self.quota.connect_target=None;self.quota.config.save();self.quota.note="WorkBuddy 已连接".into();self.pending.push(Cmd::QuotaConnected);
             },Err(error)=>self.quota.note=error}
         }
 

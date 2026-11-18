@@ -33,10 +33,11 @@ struct Session { origin:String, ua:String, cookie:String, #[serde(default)] auth
 #[derive(serde::Serialize,serde::Deserialize)]
 #[serde(rename_all="camelCase")]
 struct Auth{
-    access_token:String,
-    #[serde(default)] refresh_token:String,
+    #[serde(alias="access_token")] access_token:String,
+    #[serde(default,alias="refresh_token")] refresh_token:String,
     #[serde(default)] domain:String,
-    #[serde(default)] uid:String,
+    // 官网个别响应用 userId 而非 uid；两种写法都接受，避免重连时解析失败。
+    #[serde(default,alias="userId")] uid:String,
 }
 
 fn session_path(id:&str)->Result<std::path::PathBuf,String>{
@@ -215,6 +216,14 @@ impl Connect {
 }
 #[cfg(test)]mod tests{
     use super::*;use serde_json::json;
+    #[test]
+    fn workbuddy_auth_accepts_snake_case_and_user_id(){
+        // 官网响应偶发 snake_case 与 userId，重连时都要能解析，否则报「未返回有效授权」。
+        let a:Auth=serde_json::from_value(json!({"access_token":"tok","refresh_token":"ref","domain":"d","userId":"u"})).unwrap();
+        assert_eq!(a.access_token,"tok");assert_eq!(a.refresh_token,"ref");assert_eq!(a.uid,"u");
+        let b:Auth=serde_json::from_value(json!({"accessToken":"tok2","uid":"u2"})).unwrap();
+        assert_eq!(b.access_token,"tok2");assert_eq!(b.uid,"u2");
+    }
     #[test]
     fn workbuddy_old_cookie_sessions_remain_readable(){
         let session:Session=serde_json::from_value(json!({"origin":"https://www.codebuddy.cn","ua":"test","cookie":"session=test"})).unwrap();

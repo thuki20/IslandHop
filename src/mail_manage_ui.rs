@@ -1,6 +1,6 @@
 //! 邮件列表整理状态与服务器操作反馈。
 use crate::{app::{App,Cmd},mail::{Account,Item},mail_manage::{Action,Folder,Request,Snapshot,Completed}};
-use std::collections::{HashMap,HashSet};
+use std::collections::{HashMap,HashSet,VecDeque};
 #[derive(Clone,Default,serde::Serialize,serde::Deserialize)]
 struct LocalFlags{seen:Option<bool>,removed:bool}
 fn identity(account:&Account)->String{
@@ -12,6 +12,8 @@ fn identity(account:&Account)->String{
     pub data:HashMap<(String,Folder),Snapshot>,pub identities:HashMap<String,Account>,pub pending:HashSet<String>,
     pub next_refresh:f64,pub message:String,pub errors:Vec<String>,
     pub auto_read:Option<(String,u32)>,pub reader_trash:bool,
+    /// 忙碌时被抢占的整理操作（删除/已读等）：排队等同步完成后补发，避免静默丢失。
+    queued_ops:VecDeque<(Option<String>,Folder,Action)>,
     reader_identity:Option<(Account,u32)>,
     local:HashMap<String,LocalFlags>,local_loaded:bool,
 }
@@ -57,6 +59,7 @@ impl App{
     }
     pub(crate) fn mail_manage_mode_changed(&mut self){
         self.mail.manage.trash.clear();self.mail.manage.trash_open=false;self.mail.manage.auto_read=None;
+        self.mail.manage.queued_ops.clear();
         self.mail.open_uid=None;self.mail.reading=None;self.mail.manage.reader_identity=None;self.mail.manage.message.clear();self.mail.manage.next_refresh=0.0;
     }
     fn save_local_mail(&self)->Result<(),String>{
@@ -88,7 +91,16 @@ impl App{
     }
     pub(crate) fn mail_rows(&self)->&[Item]{if self.mail.manage.trash_open{&self.mail.manage.trash}else{&self.mail.recent}}
     pub(crate) fn mail_manage_request(&mut self,account:Option<&str>,folder:Folder,action:Action){
-        if !self.mail.manage.pending.is_empty(){return;}
+        if !self.mail.manage.pending.is_empty(){
+            // 同步占用时不要静默丢弃用户操作（例如点开未读的 auto_read 抢占后，
+            // 紧接着点删除）。排队等本次同步结束再补发。Load 是后台定时刷新，无需排队。
+            if action!=Action::Load{
+                self.mail.manage.queued_ops.push_back((account.map(str::to_owned),folder,action));
+                if self.mail.manage.queued_ops.len()>32{self.mail.manage.queued_ops.pop_front();}
+                self.mail.manage.message="操作已排队，同步完成后自动执行".into();
+            }
+            return;
+        }
         if action!=Action::Load&&!self.settings.mail_sync_operations{self.mail_local_action(account,folder,action);return;}
         let folder=self.mail_physical_folder(folder);
         let mut accounts:Vec<Account>=self.mail.accounts.iter().filter(|a|a.enabled&&account.is_none_or(|email|a.email.eq_ignore_ascii_case(email))).cloned().collect();
@@ -126,6 +138,12 @@ impl App{
             self.mail.manage.local_loaded=true;
         }
         if !self.mail.manage.pending.is_empty(){return;}
+        // 先补发上一轮被同步抢占、排队的显式操作（删除/标已读），再处理 auto_read
+        // 与定时刷新，避免删除请求被永远压在后面。
+        if let Some((account,folder,action))=self.mail.manage.queued_ops.pop_front(){
+            self.mail_manage_request(account.as_deref(),folder,action);
+            return;
+        }
         if let Some((email,uid))=self.mail.manage.auto_read.take(){
             let folder=self.mail.manage.folder();
             let item=self.mail_rows().iter().find(|m|m.uid==uid&&m.account.eq_ignore_ascii_case(&email));
@@ -214,6 +232,24 @@ impl App{
         let items=(1..=80).map(|uid|Item{html:String::new().into(),account:a.email.clone(),from:String::new(),subject:String::new(),time:String::new(),code:None,received_unix:None,summary:"".into(),links:vec![],meeting:None,uid}).collect();
         app.mail_managed(Completed{request:Request{account:a,folder:Folder::Inbox,validity:None,known:vec![],extra:(1..=60).map(|uid|(7,uid)).collect(),action:Action::Load},result:Ok(Snapshot{validity:7,entries:(1..=80).map(|uid|(uid,false)).collect(),items})});
         assert_eq!(app.mail.recent.len(),20);assert_eq!(app.mail.manage.trash.len(),60,"本机回收站不能被收件箱的显示上限截断");
+    }
+    #[test]fn delete_while_syncing_is_queued_then_replayed(){
+        // 点开未读的 auto_read 会先占用 pending；此时点删除不能被静默丢弃，
+        // 必须入队，等同步结束由 tick 补发，否则用户看到「删除点了没反应」。
+        let ctx=eframe::egui::Context::default();let mut app=App::new(&ctx,Default::default());let a=account();
+        app.mail.accounts=vec![a.clone()];app.settings.mail_sync_operations=true;
+        app.mail.manage.pending.insert("test@example.com".into());
+        app.mail_manage_request(Some(&a.email),Folder::Inbox,Action::Move{uid:42});
+        assert!(app.mail.manage.queued_ops.len()==1,"忙碌时的删除应入队");
+        assert!(app.pending.is_empty(),"入队不应立刻向服务器发请求");
+        // 同步结束
+        app.mail.manage.pending.clear();app.mail.manage.data.insert(("test@example.com".into(),Folder::Inbox),Snapshot{validity:7,entries:vec![(42,false)],items:vec![]});
+        app.mail.manage.identities.insert("test@example.com".into(),a.clone());
+        app.mail.manage.next_refresh=f64::MAX;app.mail.manage.auto_read=None;
+        app.mail_manage_tick();
+        assert!(app.mail.manage.queued_ops.is_empty(),"补发后队列应清空");
+        let replayed=app.pending.pop().and_then(|c|match c{Cmd::MailManage(r)=>Some(r),_=>None}).expect("tick 应补发删除请求");
+        assert_eq!(replayed.action,Action::Move{uid:42});
     }
     #[test]fn read_state_is_separate_for_each_folder_and_account(){
         let mut state=State::default();state.data.insert(("test@example.com".into(),Folder::Inbox),Snapshot{validity:1,entries:vec![(42,true)],items:vec![]});
