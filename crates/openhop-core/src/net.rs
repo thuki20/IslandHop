@@ -6,7 +6,7 @@
 //! eavesdropper can't brute-force the passphrase offline from a recording.
 //! There is no plaintext fallback.
 
-use crate::protocol::{decode, encode, Msg};
+use crate::protocol::{decode, encode, DriveEv, Msg};
 use anyhow::{anyhow, bail, Context, Result};
 use blake2::{Blake2s256, Digest};
 use parking_lot::Mutex;
@@ -14,7 +14,7 @@ use snow::{Builder, StatelessTransportState};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const NOISE_PARAMS: &str = "Noise_NNpsk2_25519_ChaChaPoly_BLAKE2s";
 const MAX_NOISE: usize = 65535;
@@ -25,6 +25,12 @@ pub const MAX_MSG: usize = 64 * 1024 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Bulk data is sent in pieces this big so input can slip in between.
 pub const CHUNK: usize = 64 * 1024;
+/// Mouse events arrive at 125~1000 Hz. Sending each one as its own TCP packet
+/// over Wi-Fi costs far more airtime than the 12 bytes of payload (802.11
+/// preamble + ACK + contention per frame), and one lost frame blocks every
+/// later event behind it. Collect events for one frame's worth of time and
+/// send a single merged packet instead. Keys and buttons are never delayed.
+const INPUT_BATCH: Duration = Duration::from_millis(12);
 
 /// Sent in the clear before the handshake: tells the server which secret
 /// this connection will prove knowledge of. It reveals nothing secret.
@@ -108,6 +114,23 @@ fn keep_queue_short(stream: &TcpStream) {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, IPPROTO_TCP};
+        // Winsock has no TCP_NOTSENT_LOWAT constant in the crate bindings;
+        // ws2ipdef.h defines it as 25 (Windows 8+). Keeping only 16 KiB of
+        // unsent data in the kernel stops a big frame injection from queueing
+        // dozens of mouse packets behind it on a slow Wi-Fi link. Ignore the
+        // error on old Windows where the option is unsupported.
+        const TCP_NOTSENT_LOWAT: i32 = 25;
+        let v: u32 = 16 * 1024;
+        unsafe {
+            setsockopt(
+                SOCKET(stream.as_raw_socket() as usize),
+                IPPROTO_TCP.0,
+                TCP_NOTSENT_LOWAT,
+                Some(&v.to_ne_bytes()),
+            );
+        }
         let _ = socket2::SockRef::from(stream).set_send_buffer_size(128 * 1024);
     }
 }
@@ -221,6 +244,32 @@ impl SecureReceiver {
     }
 }
 
+/// Only continuous pointer input may be merged. A key, a click, a scroll
+/// notch or a control message is an edge the receiver must see in order, so
+/// it is always written out immediately (before any pending pointer motion).
+fn coalescable(m: &Msg) -> bool {
+    matches!(m, Msg::Drive(DriveEv::Delta { .. }) | Msg::Move { .. })
+}
+
+/// Fold `m` into `out` when they are the same pointer input. Delta events sum;
+/// absolute positions keep only the newest (older ones would be overwritten
+/// on the receiver anyway). Returns false when the message must stay separate.
+fn coalesce(out: &mut Msg, m: &Msg) -> bool {
+    match (&mut *out, m) {
+        (Msg::Drive(DriveEv::Delta { dx, dy }), Msg::Drive(DriveEv::Delta { dx: mx, dy: my })) => {
+            *dx += *mx;
+            *dy += *my;
+            true
+        }
+        (Msg::Move { x, y }, Msg::Move { x: mx, y: my }) => {
+            *x = *mx;
+            *y = *my;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A connection's sending side, owned by a writer thread with two queues:
 /// input events (always first) and bulk data (clipboard, files). Callers
 /// never block on the network; a stalled peer is detected and dropped.
@@ -243,25 +292,65 @@ impl Link {
         std::thread::Builder::new()
             .name("link-writer".into())
             .spawn(move || {
-                loop {
+                'outer: loop {
                     if dead.load(Ordering::Relaxed) {
                         break;
                     }
-                    // Input first, always.
-                    let msg = match ctl_rx.try_recv() {
+                    // Input first, always. Wait for control input, servicing
+                    // bulk only while idle (never let a file delay a key).
+                    let first = match ctl_rx.try_recv() {
                         Ok(m) => m,
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                         Err(crossbeam_channel::TryRecvError::Empty) => {
                             crossbeam_channel::select! {
-                                recv(ctl_rx) -> m => match m { Ok(m) => m, Err(_) => break },
-                                recv(bulk_rx) -> m => match m { Ok(m) => m, Err(_) => continue },
+                                recv(ctl_rx) -> m => match m { Ok(m) => m, Err(_) => break 'outer },
+                                recv(bulk_rx) -> m => match m {
+                                    Ok(m) => {
+                                        if let Err(e) = sender.send(&m) {
+                                            log::debug!("link write failed: {e:#}");
+                                            break 'outer;
+                                        }
+                                        continue;
+                                    }
+                                    Err(_) => continue,
+                                },
                                 default(Duration::from_millis(500)) => continue,
                             }
                         }
                     };
-                    if let Err(e) = sender.send(&msg) {
+                    let mut pending = first;
+                    if coalescable(&pending) {
+                        // Give a burst of pointer events one frame window to
+                        // pile up, then write a single merged packet. Keys and
+                        // clicks arriving inside the window are flushed at
+                        // once, so they never wait for the whole window.
+                        let deadline = Instant::now() + INPUT_BATCH;
+                        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match ctl_rx.recv_timeout(remaining) {
+                                Ok(m) => {
+                                    if coalesce(&mut pending, &m) {
+                                        continue;
+                                    }
+                                    if let Err(e) = sender.send(&pending) {
+                                        log::debug!("link write failed: {e:#}");
+                                        break 'outer;
+                                    }
+                                    pending = m;
+                                    if !coalescable(&pending) {
+                                        break;
+                                    }
+                                }
+                                Err(crossbeam_channel::RecvTimeoutError::Timeout)
+                                | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                    }
+                    if let Err(e) = sender.send(&pending) {
                         log::debug!("link write failed: {e:#}");
-                        break;
+                        break 'outer;
                     }
                 }
                 dead.store(true, Ordering::SeqCst);
@@ -398,5 +487,44 @@ mod tests {
     fn wrong_passphrase_rejected() {
         let (a, _b) = pair("one", "two");
         assert!(a.is_err());
+    }
+
+    #[test]
+    fn pointer_events_coalesce_but_edges_stay_separate() {
+        let mut out = Msg::Drive(DriveEv::Delta { dx: 1, dy: 2 });
+        assert!(coalesce(&mut out, &Msg::Drive(DriveEv::Delta { dx: 3, dy: -1 })));
+        assert_eq!(out, Msg::Drive(DriveEv::Delta { dx: 4, dy: 1 }));
+        // A click between two moves must never be swallowed into them.
+        assert!(!coalesce(&mut out, &Msg::Drive(DriveEv::Key { key: 30, down: true })));
+        assert!(!coalesce(&mut out, &Msg::Move { x: 5, y: 6 }));
+
+        let mut pos = Msg::Move { x: 1, y: 1 };
+        assert!(coalesce(&mut pos, &Msg::Move { x: 9, y: 8 }));
+        assert!(coalesce(&mut pos, &Msg::Move { x: 7, y: 3 }));
+        assert_eq!(pos, Msg::Move { x: 7, y: 3 });
+        assert!(coalescable(&pos));
+        assert!(!coalescable(&Msg::Drive(DriveEv::Button { button: crate::protocol::MouseButton::Left, down: true })));
+    }
+
+    #[test]
+    fn burst_of_deltas_arrives_as_one_packet() {
+        let (a, b) = pair("batch", "batch");
+        let (tx, _) = a.unwrap();
+        let (_, mut rx) = b.unwrap();
+        let link = Link::new(tx, || {});
+        // 200 events in one burst: with a 12 ms window they must merge, and
+        // the trailing key press stays a separate, ordered packet.
+        for _ in 0..200 {
+            assert!(link.send(Msg::Drive(DriveEv::Delta { dx: 2, dy: 3 })));
+        }
+        assert!(link.send(Msg::Drive(DriveEv::Key { key: 30, down: true })));
+        let first = rx.recv().unwrap();
+        match first {
+            Msg::Drive(DriveEv::Delta { dx, dy }) => {
+                assert_eq!((dx, dy), (400, 600));
+            }
+            other => panic!("unexpected first message: {other:?}"),
+        }
+        assert_eq!(rx.recv().unwrap(), Msg::Drive(DriveEv::Key { key: 30, down: true }));
     }
 }

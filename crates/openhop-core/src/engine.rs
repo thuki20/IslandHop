@@ -2597,6 +2597,10 @@ struct Client {
     here: bool,
     /// Where the pointer is (desktop coordinates), when it's here.
     pos: (i32, i32),
+    /// Newest pointer position received from the server, injected on a steady
+    /// tick so Wi-Fi arrival jitter doesn't become visible pointer stutter.
+    /// Keys and clicks flush it first, keeping input in order.
+    pending_move: Option<(i32, i32)>,
     /// Last keyboard or mouse input from the server.
     last_input: Instant,
     /// When this computer last said it's in use from elsewhere.
@@ -2672,6 +2676,7 @@ impl Client {
             held_buttons: HashSet::new(),
             here: false,
             pos: (0, 0),
+            pending_move: None,
             last_input: Instant::now(),
             awake_said: Instant::now() - Duration::from_secs(60),
             capture: None,
@@ -2970,6 +2975,10 @@ impl Client {
         // every 40 ms while the keyboard and mouse are here keeps the
         // connection awake on both ends.
         let awake = tick(Duration::from_millis(40));
+        // Pointer positions accumulate here and are injected at a steady
+        // cadence. Wi-Fi delivers packets in uneven bursts; injecting each
+        // arrival immediately reproduces that jitter as a stuttering cursor.
+        let move_tick = tick(Duration::from_millis(8));
         let result = loop {
             select! {
                 recv(ev_rx) -> ev => match ev {
@@ -3041,6 +3050,11 @@ impl Client {
                     }
                 },
                 recv(self.cap_rx) -> ev => if let Ok(ev) = ev { self.on_local_input(ev, screen, &link) },
+                recv(move_tick) -> _ => {
+                    if let Some((x, y)) = self.pending_move.take() {
+                        let _ = self.injector.move_to(x, y);
+                    }
+                },
                 recv(awake) -> _ => {
                     if self.here && self.last_input.elapsed() < Duration::from_secs(30) {
                         link.send(Msg::Ping);
@@ -3097,6 +3111,14 @@ impl Client {
         if matches!(m, Msg::Enter { .. } | Msg::Move { .. } | Msg::Button { .. } | Msg::Wheel { .. } | Msg::Key { .. }) {
             self.last_input = Instant::now();
         }
+        // A click or key must act at the position the pointer has already
+        // been told to reach. Flush any queued move before such an edge event
+        // so the two never get reordered by the jitter buffer.
+        if matches!(m, Msg::Button { .. } | Msg::Wheel { .. } | Msg::Key { .. } | Msg::Leave | Msg::Enter { .. }) {
+            if let Some((x, y)) = self.pending_move.take() {
+                let _ = self.injector.move_to(x, y);
+            }
+        }
         let r = match m {
             Msg::Enter { x, y } => {
                 self.here = true;
@@ -3118,7 +3140,9 @@ impl Client {
             Msg::Move { x, y } => {
                 self.pos = (screen.x + x, screen.y + y);
                 self.placed.add(self.pos);
-                self.injector.move_to(screen.x + x, screen.y + y)
+                // Buffer, don't inject: the 8 ms tick flushes the newest one.
+                self.pending_move = Some(self.pos);
+                Ok(())
             }
             Msg::Leave => {
                 self.here = false;
