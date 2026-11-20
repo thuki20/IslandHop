@@ -1098,8 +1098,9 @@ fn read_power() -> (Option<u8>, bool, Option<f32>) {
         )
     };
     if status.is_ok() && ac && bs.Charging.as_bool() && bs.BatteryPresent.as_bool() && bs.Rate > 0 {
-        let w = bs.Rate as f32 / 1000.0;
-        watts = (w >= 0.5).then_some(w);
+        // 与 macOS 共用钳制：Rate(mW)→W 后按 0.5~300W 收口，固件错乱值退回百分比，
+        // 杜绝显示 110W 这类荒谬瓦数。
+        watts = daozai::clamp_battery_watts(bs.Rate as f32 / 1000.0);
     }
     (pct, ac, watts)
 }

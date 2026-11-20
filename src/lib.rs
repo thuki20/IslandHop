@@ -21,6 +21,14 @@ pub fn update_handoff_active() -> bool {
     UPDATE_HANDOFF.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// 电池/充电器上报功率的统一钳制（Windows `SYSTEM_BATTERY_STATE.Rate` 与
+/// macOS `SystemPowerIn` 共用）。0.5W 以下视为未充电；300W 以上（MagSafe 最高
+/// 140W 留足余量）视为单位/字段误读——两者都返回 None，UI 退回显示百分比，
+/// 绝不让固件错乱值显示成 110W 这类荒谬瓦数。
+pub fn clamp_battery_watts(raw: f32) -> Option<f32> {
+    (0.5..300.0).contains(&raw).then_some(raw)
+}
+
 pub mod display_layout;
 /// IslandHop 新增：OpenHop 跨屏引擎 + 内嵌在设置窗口的面板。
 pub mod cross_screen;
