@@ -97,17 +97,13 @@ pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -
             // ColorImage::from_rgba_unmultiplied 的 assert 会打崩 UI 线程（表现为卡死）。
             // v0.6.94 的旧实现把画布 replace 成空 Vec 再靠 try_unwrap 回收，
             // 主线程每帧持旧帧导致 unwrap 必败 → 第二帧起画布是空的 → 卡死。
+            // 画布在本线程持久累积，绝不在每批之后清空。发送端把一帧切成多条
+            // ≤64 行的 band，再拆成多条 ~48KB 消息；一批 frames 往往只是一帧的
+            // 一部分，若每批都 replace 清空，快照就只剩当前批次的几条 band，
+            // 其余全黑——表现为有内容行与纯黑行交替的横向黑条。
             let mut canvas = vec![0u8; width * height * 4];
             let mut gen = 0u64;
             while !stop_t.load(Ordering::Acquire) {
-                // 取回主线程已经替换掉的上一帧缓冲，复用其内存。
-                if let Ok(mut s) = state_t.lock() {
-                    if let Some(back) = s.recycled.take() {
-                        if back.len() == width * height * 4 {
-                            canvas = back;
-                        }
-                    }
-                }
                 let after = last_t.load(Ordering::Acquire);
                 match hub.frame(stream, after, Duration::from_millis(250)) {
                     FrameWait::Frames(frames) => {
@@ -131,28 +127,27 @@ pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -
                                 composite_patch(&mut canvas, width, height, p.x, p.y, p.w, p.h, &p.jpeg);
                             }
                         }
-                        // 画布本体 move 进 Arc：零拷贝。用完后主线程把旧缓冲放回
-                        // ViewerState::recycled，下一轮这里取回复用，稳态零分配。
-                        let shared = Arc::new(std::mem::replace(&mut canvas, Vec::new()));
                         if let Ok(mut s) = state_t.lock() {
+                            // 发布完整快照：优先复用主线程归还的旧缓冲，做一次内存拷贝。
+                            // 快照必须包含持久画布的全部像素，而不是当前这一批的增量。
+                            let mut snapshot = s.recycled.take()
+                                .filter(|b| b.len() == canvas.len())
+                                .unwrap_or_else(|| vec![0u8; canvas.len()]);
+                            snapshot.copy_from_slice(&canvas);
                             s.frames_received += 1;
                             s.paused = None;
-                            // 旧帧若已无人引用（主线程上一帧已画完），回收它的内存给下一轮用。
+                            // 上一帧若已无人引用（主线程已画完并归还），回收其内存。
                             if let Some(old) = s.picture.take() {
                                 if Arc::strong_count(&old.rgba) == 1 {
                                     if let Ok(buf) = Arc::try_unwrap(old.rgba) {
-                                        s.recycled = Some(buf);
+                                        if buf.len() == canvas.len() {
+                                            s.recycled = Some(buf);
+                                        }
                                     }
                                 }
                             }
-                            // canvas 本体已 move 给 shared，必须立即补一块，绝不发布空画布。
-                            if canvas.is_empty() {
-                                canvas = s.recycled.take()
-                                    .filter(|b| b.len() == width * height * 4)
-                                    .unwrap_or_else(|| vec![0u8; width * height * 4]);
-                            }
                             s.picture = Some(Picture {
-                                w: width, h: height, rgba: shared, generation: gen,
+                                w: width, h: height, rgba: Arc::new(snapshot), generation: gen,
                             });
                         }
                     }
@@ -684,6 +679,49 @@ mod tests {
         let mut canvas = vec![0u8; 8 * 8 * 4];
         assert!(!composite_patch(&mut canvas, 8, 8, 0, 0, 0, 0, b""), "空 patch 应忽略");
         assert!(!composite_patch(&mut canvas, 8, 8, 100, 100, 2, 2, b""), "越界 patch 应忽略");
+    }
+
+    /// 黑条回归：发送端把一帧拆成多条 ≤64 行的 band、分多批到达。每批都必须
+    /// 合成到同一张持久画布；任何「每批清空画布」的写法都会让快照只剩当前
+    /// band，其余纯黑——表现为有内容行与纯黑行交替的横向黑条。
+    #[test]
+    fn band_patches_accumulate_without_clearing_canvas() {
+        let solid = |w: u32, h: u32, rgb: [u8; 3]| -> Vec<u8> {
+            let img = image::RgbaImage::from_pixel(w, h, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            let mut buf = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new(&mut buf)
+                .encode_image(&img)
+                .unwrap();
+            buf
+        };
+        let near = |got: &[u8], want: [u8; 3]| {
+            (0..3).all(|i| (got[i] as i32 - want[i] as i32).abs() <= 14)
+        };
+
+        let top = solid(16, 8, [220, 30, 30]);
+        let bottom = solid(16, 8, [30, 200, 40]);
+        let mut canvas = vec![0u8; 16 * 16 * 4];
+
+        // 第一批：只有上半 band（其余消息还没到）。
+        assert!(composite_patch(&mut canvas, 16, 16, 0, 0, 16, 8, &top));
+        // 第二批：下半 band 合到同一张持久画布，不清空。
+        assert!(composite_patch(&mut canvas, 16, 16, 0, 8, 16, 8, &bottom));
+
+        let at = |x: usize, y: usize| -> &[u8] {
+            let o = (y * 16 + x) * 4;
+            &canvas[o..o + 3]
+        };
+        assert!(near(at(0, 0), [220, 30, 30]), "上半 band 被清空: {:?}", at(0, 0));
+        assert!(near(at(8, 4), [220, 30, 30]), "上半 band 部分丢失: {:?}", at(8, 4));
+        assert!(near(at(0, 8), [30, 200, 40]), "下半 band 丢失: {:?}", at(0, 8));
+        assert!(near(at(8, 12), [30, 200, 40]), "下半 band 部分丢失: {:?}", at(8, 12));
+
+        // 发布的快照必须是整张画布的完整拷贝，不是当前批次的增量。
+        let mut snapshot = vec![0u8; canvas.len()];
+        snapshot.copy_from_slice(&canvas);
+        assert_eq!(snapshot.len(), 16 * 16 * 4);
+        assert!(near(&snapshot[..3], [220, 30, 30]));
+        assert!(near(&snapshot[(8 * 16) * 4..(8 * 16) * 4 + 3], [30, 200, 40]));
     }
 
     #[test]
