@@ -2639,6 +2639,8 @@ struct Client {
     /// When this computer's own mouse last reported the edge / its position.
     edge_sent: Instant,
     pos_sent: Instant,
+    /// 上一次向「记得的地址」单播信标的时间（广播被过滤时的兜底）。
+    last_announce: Instant,
 }
 
 /// Where and how the client connects.
@@ -2707,6 +2709,7 @@ impl Client {
             last_move_sent: None,
             edge_sent: Instant::now(),
             pos_sent: Instant::now(),
+            last_announce: Instant::now() - Duration::from_secs(5),
         };
         // This computer's keyboard and mouse can drive the others too
         // (not on Wayland, which doesn't allow capturing them).
@@ -2729,6 +2732,12 @@ impl Client {
                 None => c.pick_server(&last_failed),
             };
             let Some(t) = target else {
+                // 广播被路由器过滤时发现列表恒为空：定期向「记得的地址」单播信标，
+                // 对端收到后回一条单播，双方设备列表即可恢复（无需先连上一次）。
+                if c.last_announce.elapsed() > Duration::from_secs(5) {
+                    c.last_announce = Instant::now();
+                    c.ctx.discovery.announce_to(&c.seed_addrs());
+                }
                 let needs = c.needs_pairing();
                 {
                     let mut st = c.ctx.status.lock();
@@ -2815,6 +2824,19 @@ impl Client {
     fn last_addr(&self) -> Option<SocketAddr> {
         let a = self.ctx.cfg.last_server_addr.as_ref()?.trim();
         parse_addr(a)
+    }
+
+    /// 兜底单播目标：上次连过的对端地址 + 手动填的地址。
+    fn seed_addrs(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = self.ctx.cfg.last_ips.values()
+            .filter_map(|ip| ip.parse::<IpAddr>().ok())
+            .map(|ip| SocketAddr::new(ip, self.ctx.cfg.port))
+            .collect();
+        if let Some(addr) = self.last_addr() { out.push(addr); }
+        if let Some((addr, _)) = self.manual_addr() { out.push(addr); }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn pick_server(&self, failed: &HashMap<SocketAddr, Instant>) -> Option<Target> {

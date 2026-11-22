@@ -67,6 +67,10 @@ pub struct Discovery {
     /// 已知对端 IPv4（上次成功连接的地址 / 手动地址）。路由器不转发客户端间
     /// 广播时，靠向这些地址单播 beacon 兜底发现。
     unicast: Arc<Mutex<Vec<Ipv4Addr>>>,
+    /// 本机信标字节：收到对端包时单播回信，让被路由器过滤的一方也能被发现。
+    payload: Arc<Vec<u8>>,
+    /// 单播发送端（v4），与广播共用 socket 但不依赖广播可达。
+    probe: UdpSocket,
 }
 
 /// 单播兜底目标是否可加入：只接受可路由的普通 IPv4，过滤掉 unspecified / 广播 / 回环 / 组播。
@@ -187,7 +191,9 @@ impl Discovery {
         };
         let id: u64 = crate::files::new_id();
         let beacon = Beacon { magic: MAGIC, version: PROTOCOL_VERSION, id, device, name, os: Os::current(), role, port };
-        let payload = bincode::serialize(&beacon).expect("beacon");
+        let payload = Arc::new(bincode::serialize(&beacon).expect("beacon"));
+        // 广播常被路由器/AP 隔离吃掉，单播回信与单播兜底共用一个发送端。
+        let probe = v4.try_clone()?;
         let peers: Arc<Mutex<HashMap<u64, Discovered>>> = Default::default();
         let stop = Arc::new(AtomicBool::new(false));
         let unicast: Arc<Mutex<Vec<Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
@@ -198,6 +204,7 @@ impl Discovery {
             let v6 = v6.as_ref().map(|s| s.try_clone()).transpose()?;
             let stop = stop.clone();
             let unicast = unicast.clone();
+            let payload = payload.clone();
             std::thread::Builder::new().name("discovery-tx".into()).spawn(move || {
                 let mut joined: HashSet<u32> = HashSet::new();
                 while !stop.load(Ordering::Relaxed) {
@@ -214,13 +221,13 @@ impl Discovery {
                                 }
                             }
                             let dest = SocketAddrV6::new(GROUP_V6, DISCOVERY_PORT, 0, idx);
-                            if let Err(e) = s6.send_to(&payload, dest) {
+                            if let Err(e) = s6.send_to(payload.as_slice(), dest) {
                                 log::debug!("beacon v6 if {idx}: {e}");
                             }
                         }
                     }
                     for t in targets {
-                        let _ = v4.send_to(&payload, SocketAddr::from((t, DISCOVERY_PORT)));
+                        let _ = v4.send_to(payload.as_slice(), SocketAddr::from((t, DISCOVERY_PORT)));
                     }
                     std::thread::sleep(INTERVAL);
                 }
@@ -231,8 +238,11 @@ impl Discovery {
         for sock in std::iter::once(v4).chain(v6) {
             let peers = peers.clone();
             let stop = stop.clone();
+            let payload = payload.clone();
             std::thread::Builder::new().name("discovery-rx".into()).spawn(move || {
                 let mut buf = [0u8; 1500];
+                // 同一 IP 5 秒内只回一次，避免两台机器互相刷单播。
+                let mut replied: HashMap<IpAddr, Instant> = HashMap::new();
                 while !stop.load(Ordering::Relaxed) {
                     let Ok((n, from)) = sock.recv_from(&mut buf) else {
                         continue;
@@ -244,10 +254,19 @@ impl Discovery {
                         continue;
                     }
                     record(&peers, b, from);
+                    // 广播被路由器过滤时，对端只能靠这条单播回信认识本机：
+                    // 只要一方发出可被收到的包，双方的设备列表都能恢复。
+                    let due = replied.get(&from.ip())
+                        .map(|t| t.elapsed() > Duration::from_secs(5))
+                        .unwrap_or(true);
+                    if due {
+                        replied.insert(from.ip(), Instant::now());
+                        let _ = sock.send_to(payload.as_slice(), SocketAddr::new(from.ip(), DISCOVERY_PORT));
+                    }
                 }
             })?;
         }
-        Ok(Discovery { peers, stop, unicast })
+        Ok(Discovery { peers, stop, unicast, payload, probe })
     }
 
     pub fn peers(&self) -> Vec<Discovered> {
@@ -270,6 +289,14 @@ impl Discovery {
 
     pub fn servers(&self) -> Vec<Discovered> {
         self.peers().into_iter().filter(|p| p.role == Role::Server).collect()
+    }
+
+    /// 向指定地址单播本机信标。路由器过滤广播 / AP 隔离时，只要还记得对端 IP，
+    /// 单播一次就能让双方重新互相认识（对端收到后会按上面的逻辑回一条单播）。
+    pub fn announce_to(&self, addrs: &[SocketAddr]) {
+        for a in addrs {
+            let _ = self.probe.send_to(self.payload.as_slice(), SocketAddr::new(a.ip(), DISCOVERY_PORT));
+        }
     }
 }
 

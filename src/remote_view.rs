@@ -13,7 +13,7 @@
 //!   而不是每帧新建，避免 1080p 下每帧 8MB 复制 + 纹理重建造成的卡顿。
 
 use eframe::egui::{
-    ColorImage, Context, Event, Id, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
+    Color32, ColorImage, Context, Event, Id, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
     RichText, TextureOptions, Vec2,
 };
 use openhop_core::extras::{FrameWait, Hub};
@@ -37,11 +37,13 @@ pub struct ViewerState {
     pub paused: Option<String>,
     pub closed: bool,
     pub frames_received: u64,
+    /// 主线程上传纹理后归还的 RGBA 缓冲，接收线程下一轮取回复用（零拷贝）。
+    pub recycled: Option<Vec<u8>>,
 }
 
 impl Default for ViewerState {
     fn default() -> Self {
-        Self { picture: None, paused: None, closed: false, frames_received: 0 }
+        Self { picture: None, paused: None, closed: false, frames_received: 0, recycled: None }
     }
 }
 
@@ -88,15 +90,20 @@ pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -
     let _ = std::thread::Builder::new()
         .name(format!("islandhop-view-{stream}"))
         .spawn(move || {
+            // 双缓冲：接收线程持有一块可写画布，主线程用完后通过 state 归还。
+            // 关键不变量：交给 egui 的 rgba 长度必须恒等于 w*h*4，否则
+            // ColorImage::from_rgba_unmultiplied 的 assert 会打崩 UI 线程（表现为卡死）。
+            // v0.6.94 的旧实现把画布 replace 成空 Vec 再靠 try_unwrap 回收，
+            // 主线程每帧持旧帧导致 unwrap 必败 → 第二帧起画布是空的 → 卡死。
             let mut canvas = vec![0u8; width * height * 4];
-            // 上一帧的共享缓冲：主线程释放后 strong_count 归 1，直接取回复用，
-            // 稳态下每帧零分配、零 memcpy（旧实现每帧 clone 整张 8MB 画布）。
-            let mut recycle: Option<Arc<Vec<u8>>> = None;
             let mut gen = 0u64;
             while !stop_t.load(Ordering::Acquire) {
-                if let Some(old) = recycle.take() {
-                    if let Ok(buf) = Arc::try_unwrap(old) {
-                        canvas = buf;
+                // 取回主线程已经替换掉的上一帧缓冲，复用其内存。
+                if let Ok(mut s) = state_t.lock() {
+                    if let Some(back) = s.recycled.take() {
+                        if back.len() == width * height * 4 {
+                            canvas = back;
+                        }
                     }
                 }
                 let after = last_t.load(Ordering::Acquire);
@@ -107,18 +114,41 @@ pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -
                             last_t.store(frame.remote, Ordering::Release);
                             // 全帧 patch（覆盖整张）时重置画布，兼容分辨率变化。
                             if frame.patches.iter().any(|p| p.x == 0 && p.y == 0 && p.w == frame.w && p.h == frame.h) {
-                                canvas.clear();
-                                canvas.resize(frame.w as usize * frame.h as usize * 4, 0);
+                                if canvas.len() != frame.w as usize * frame.h as usize * 4 {
+                                    canvas = vec![0u8; frame.w as usize * frame.h as usize * 4];
+                                } else {
+                                    canvas.fill(0);
+                                }
+                            }
+                            // 安全护栏：画布尺寸异常（patch 越界/分辨率变化丢帧）时重建，
+                            // 保证交给 egui 的 rgba 长度恒等于 w*h*4。
+                            if canvas.len() != width * height * 4 {
+                                canvas = vec![0u8; width * height * 4];
                             }
                             for p in frame.patches.iter() {
                                 composite_patch(&mut canvas, width, height, p.x, p.y, p.w, p.h, &p.jpeg);
                             }
                         }
+                        // 画布本体 move 进 Arc：零拷贝。用完后主线程把旧缓冲放回
+                        // ViewerState::recycled，下一轮这里取回复用，稳态零分配。
                         let shared = Arc::new(std::mem::replace(&mut canvas, Vec::new()));
-                        recycle = Some(shared.clone());
                         if let Ok(mut s) = state_t.lock() {
                             s.frames_received += 1;
                             s.paused = None;
+                            // 旧帧若已无人引用（主线程上一帧已画完），回收它的内存给下一轮用。
+                            if let Some(old) = s.picture.take() {
+                                if Arc::strong_count(&old.rgba) == 1 {
+                                    if let Ok(buf) = Arc::try_unwrap(old.rgba) {
+                                        s.recycled = Some(buf);
+                                    }
+                                }
+                            }
+                            // canvas 本体已 move 给 shared，必须立即补一块，绝不发布空画布。
+                            if canvas.is_empty() {
+                                canvas = s.recycled.take()
+                                    .filter(|b| b.len() == width * height * 4)
+                                    .unwrap_or_else(|| vec![0u8; width * height * 4]);
+                            }
                             s.picture = Some(Picture {
                                 w: width, h: height, rgba: shared, generation: gen,
                             });
@@ -175,7 +205,14 @@ fn composite_patch(canvas: &mut [u8], cw: usize, ch: usize, x: u32, y: u32, w: u
     placed
 }
 
+/// Picture 的像素长度必须与声明尺寸一致。egui 的 ColorImage 构造在此处有 assert，
+/// 不一致会 panic 并打崩 UI 线程——所有交给 egui 的画面都必须先过这一关。
+fn picture_valid(pic: &Picture) -> bool {
+    pic.w > 0 && pic.h > 0 && pic.rgba.len() == pic.w * pic.h * 4
+}
+
 pub fn to_color_image(pic: &Picture) -> ColorImage {
+    debug_assert!(picture_valid(pic), "Picture 像素长度与尺寸不符，交给 egui 会 panic");
     ColorImage::from_rgba_unmultiplied([pic.w, pic.h], &pic.rgba[..])
 }
 
@@ -236,8 +273,9 @@ pub struct ViewerHub {
     sessions: Vec<ViewerSession>,
     /// stream → 对端名 / 标题，供窗口标题与状态显示。
     titles: std::collections::HashMap<u64, (String, String)>,
-    /// stream → (w, h, 纹理)。尺寸不变时原地 set，避免每帧重建纹理。
-    textures: std::collections::HashMap<u64, (usize, usize, eframe::egui::TextureHandle)>,
+    /// stream → (generation, w, h, 纹理)。generation 不变时跳过上传，
+    /// 尺寸变化才重建纹理；避免每帧把同一帧 8MB 重新传给 GPU。
+    textures: std::collections::HashMap<u64, (u64, usize, usize, eframe::egui::TextureHandle)>,
     last_notice: Option<String>,
     /// 当前接受键鼠输入的画面流（点击画面取得焦点）。
     focused: Option<u64>,
@@ -362,22 +400,27 @@ impl ViewerHub {
             }
             let mut open = true;
             let tex_id = pic.as_ref().and_then(|pic| {
-                let need_new = match self.textures.get(&stream) {
-                    Some((w, h, _)) => *w != pic.w || *h != pic.h,
-                    None => true,
+                // 尺寸/像素不符绝不交给 egui：from_rgba_unmultiplied 有 assert，会让 UI 线程崩（卡死）。
+                if !picture_valid(pic) { return None; }
+                let (need_new_tex, need_upload) = match self.textures.get(&stream) {
+                    Some((gen, w, h, _)) => (*w != pic.w || *h != pic.h, *gen != pic.generation),
+                    None => (true, true),
                 };
-                if need_new {
+                if need_new_tex {
                     let tex = ctx.load_texture(
                         format!("remote-view-{stream}"),
                         to_color_image(pic),
                         TextureOptions::LINEAR,
                     );
-                    self.textures.insert(stream, (pic.w, pic.h, tex));
-                } else if let Some((_, _, tex)) = self.textures.get_mut(&stream) {
-                    // 原地更新 GPU 纹理：句柄与显存对象复用，只有像素数据上传。
-                    tex.set(to_color_image(pic), TextureOptions::LINEAR);
+                    self.textures.insert(stream, (pic.generation, pic.w, pic.h, tex));
+                } else if need_upload {
+                    // 有新帧才原地 set：复用纹理句柄与显存，只上传变化的像素。
+                    if let Some((gen, _, _, tex)) = self.textures.get_mut(&stream) {
+                        tex.set(to_color_image(pic), TextureOptions::LINEAR);
+                        *gen = pic.generation;
+                    }
                 }
-                self.textures.get(&stream).map(|(_, _, t)| t.id())
+                self.textures.get(&stream).map(|(_, _, _, t)| t.id())
             });
             let (w, h) = pic.as_ref().map(|p| (p.w, p.h)).unwrap_or((640, 400));
             let controllable = hub.is_some();
@@ -552,7 +595,21 @@ mod tests {
     #[test]
     fn viewer_state_defaults_are_empty() {
         let s = ViewerState::default();
-        assert!(s.picture.is_none() && s.paused.is_none() && !s.closed && s.frames_received == 0);
+        assert!(s.picture.is_none() && s.paused.is_none() && !s.closed && s.frames_received == 0 && s.recycled.is_none());
+    }
+
+    /// v0.6.94 卡死回归：尺寸声明正常但像素为空的 Picture 必须被判为无效，
+    /// 绝不能送进 ColorImage::from_rgba_unmultiplied（那里 assert 会打崩 UI 线程）。
+    #[test]
+    fn empty_or_mismatched_picture_is_rejected_before_egui() {
+        let empty = Picture { w: 1920, h: 1080, rgba: Arc::new(Vec::new()), generation: 1 };
+        assert!(!picture_valid(&empty), "空画布一律拒绝");
+        let short = Picture { w: 4, h: 4, rgba: Arc::new(vec![0; 4 * 4 * 3]), generation: 1 };
+        assert!(!picture_valid(&short), "像素长度不足一律拒绝");
+        let zero = Picture { w: 0, h: 0, rgba: Arc::new(Vec::new()), generation: 1 };
+        assert!(!picture_valid(&zero), "零尺寸一律拒绝");
+        let good = Picture { w: 2, h: 2, rgba: Arc::new(vec![255; 16]), generation: 1 };
+        assert!(picture_valid(&good), "正常画面必须通过");
     }
 
     #[test]
