@@ -338,13 +338,33 @@ pub struct Hub {
     stop: Arc<AtomicBool>,
 }
 
-/// Pictures per second, JPEG quality, widest picture, full colour detail.
-fn quality(q: &str) -> (u32, u8, u32, bool) {
+/// 远程画面参数：(每秒帧数, JPEG 质量, 最宽像素, 是否 4:4:4 全彩)。
+///
+/// 瓶颈是两端的 CPU（JPEG 编解码）而不是带宽——千兆局域网下盲目拉满
+/// 60fps + 4K 全彩会让编码来不及、实际帧率反而更低。三档在画质与 CPU
+/// 之间取平衡，用户可按对端机器性能与观感自行选择。
+pub fn quality(q: &str) -> (u32, u8, u32, bool) {
     match q {
-        "low" => (15, 60, 1280, false),
-        "high" => (40, 92, 3840, true),
-        _ => (30, 82, 2560, true),
+        "low" => (20, 68, 1600, false),      // 流畅：弱机 / 省电
+        "high" => (40, 88, 3840, true),      // 高清：4K + 全彩（文字最锐利）
+        _ => (30, 82, 2560, true),           // 标准：默认
     }
+}
+
+/// 画质档位的界面文案，供设置页复用，避免文案与参数脱节。
+pub fn quality_label(q: &str) -> &'static str {
+    match q {
+        "low" => "流畅（20 帧 / 更省 CPU）",
+        "high" => "高清（40 帧 / 4K 全彩）",
+        _ => "标准（30 帧 / 2.5K）",
+    }
+}
+
+/// 观看远程画面时主界面的重绘间隔。必须与发送端帧率匹配：旧版固定
+/// 50ms（20fps），即便发送端给到 40fps，画面也只按 20fps 显示。
+pub fn view_repaint_interval(q: &str) -> std::time::Duration {
+    let (fps, _, _, _) = quality(q);
+    std::time::Duration::from_millis(1000 / fps as u64)
 }
 
 impl Hub {
@@ -2395,6 +2415,25 @@ fn encode_patch(pic: &wins::Picture, (x, y, w, h): (u32, u32, u32, u32), quality
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_tiers_are_ordered_and_repaint_matches_fps() {
+        let (lf, lq, lw, _) = quality("low");
+        let (nf, nq, nw, _) = quality("standard");
+        let (hf, hq, hw, _) = quality("high");
+        // 帧率、JPEG 质量、分辨率三档单调递增，避免调档反而变差。
+        assert!(lf < nf && nf < hf, "帧率应随档位递增: {lf}/{nf}/{hf}");
+        assert!(lq < nq && nq < hq, "画质应随档位递增: {lq}/{nq}/{hq}");
+        assert!(lw < nw && nw < hw, "分辨率应随档位递增: {lw}/{nw}/{hw}");
+        // 未知档位落到标准，不能落到最低档。
+        assert_eq!(quality("unknown"), quality("standard"));
+        // UI 重绘间隔必须等于发送端帧间隔，否则高帧率被 UI 拖累。
+        for tier in ["low", "standard", "high", "unknown"] {
+            let (fps, _, _, _) = quality(tier);
+            assert_eq!(view_repaint_interval(tier), std::time::Duration::from_millis(1000 / fps as u64));
+            assert!(!quality_label(tier).is_empty());
+        }
+    }
 
     #[test]
     fn patches_cover_only_changes() {

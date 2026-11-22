@@ -239,9 +239,21 @@ pub fn paint_views(ctx: &eframe::egui::Context) {
     });
 }
 
-/// 是否有正在观看的画面流（用于提高刷新率到 20fps）。
+/// 是否有正在观看的画面流（用于把刷新率从省电档提到画质档对应帧率）。
 pub fn view_active() -> bool {
     with(|cross| !lock_viewer(&cross.viewer).is_empty())
+}
+
+/// 观看画面时的重绘间隔：跟随本机画质档位的发送帧率，避免发送端 40fps
+/// 却被 UI 固定 50ms（20fps）拖成一半。未观看时返回 None。
+pub fn view_repaint_interval() -> Option<std::time::Duration> {
+    with(|cross| {
+        if lock_viewer(&cross.viewer).is_empty() {
+            None
+        } else {
+            Some(openhop_core::extras::view_repaint_interval(&cross.cfg.stream_quality))
+        }
+    })
 }
 
 enum Action {
@@ -1098,9 +1110,22 @@ impl CrossScreen {
         ui.checkbox(&mut self.cfg.share_input, "共享本机键鼠到对端");
         ui.checkbox(&mut self.cfg.clipboard_sync, "剪贴板同步");
         ui.checkbox(&mut self.cfg.swap_cmd_ctrl, "跨 macOS / Windows 自动换算 Cmd 与 Ctrl");
+        // 远程画面画质：局域网带宽通常不是瓶颈，瓶颈是两机 CPU 的 JPEG 编解码，
+        // 所以提供档位让用户按机器性能权衡，而不是写死一个值。
+        ui.horizontal(|ui| {
+            ui.label("画面画质");
+            for (key, short) in [("low", "流畅"), ("", "标准"), ("high", "高清")] {
+                let current = if key.is_empty() { !matches!(self.cfg.stream_quality.as_str(), "low" | "high") }
+                              else { self.cfg.stream_quality == key };
+                if ui.selectable_label(current, short).clicked() {
+                    self.cfg.stream_quality = key.to_string();
+                }
+            }
+        });
+        ui.label(RichText::new(openhop_core::extras::quality_label(&self.cfg.stream_quality)).size(10.0).weak());
         ui.horizontal(|ui| {
             if ui.button("保存并重启引擎").clicked() { actions.push(Action::Apply); }
-            ui.label(RichText::new("改角色 / 口令 / 端口后必须重启引擎").size(10.5));
+            ui.label(RichText::new("改角色 / 口令 / 端口 / 画质后必须重启引擎").size(10.5));
         });
     }
 

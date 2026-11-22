@@ -944,8 +944,9 @@ impl eframe::App for Shell {
         #[cfg(windows)] let repaint_after=if self.hidden{Duration::from_secs(1)}else{out.repaint_after};
         // 穿透时主窗口收不到 mousemove，用 20fps 轮询全局坐标以保证移回岛上立即恢复。
         #[cfg(not(windows))] let repaint_after=if passthrough{Duration::from_millis(50)}else{out.repaint_after};
-        // 双机数据同步需要无交互时也每秒醒一次；有画面流时按 20fps 刷新画面。
-        let repaint_after=if daozai::cross_screen::view_active(){Duration::from_millis(50)}else{repaint_after};
+        // 双机数据同步需要无交互时也每秒醒一次；有画面流时按画质档位的帧率刷新，
+        // 避免发送端 40fps 被固定 20fps 的 UI 重绘拖成一半。
+        let repaint_after=daozai::cross_screen::view_repaint_interval().unwrap_or(repaint_after);
         // 电池供电省电：静置动画档降帧（媒体 30→15、宠物 20→10），交互档不降。
         // 穿透轮询（鼠标移回立即恢复）与屏幕镜像观看必须保持原速，否则手感/画面卡顿。
         #[cfg(windows)] let responsive_poll=false;
