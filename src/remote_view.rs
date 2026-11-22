@@ -39,11 +39,13 @@ pub struct ViewerState {
     pub frames_received: u64,
     /// 主线程上传纹理后归还的 RGBA 缓冲，接收线程下一轮取回复用（零拷贝）。
     pub recycled: Option<Vec<u8>>,
+    /// 会话创建时间：长时间无帧时给出明确提示，避免永远停在「连接中…」而不知道原因。
+    pub created: Instant,
 }
 
 impl Default for ViewerState {
     fn default() -> Self {
-        Self { picture: None, paused: None, closed: false, frames_received: 0, recycled: None }
+        Self { picture: None, paused: None, closed: false, frames_received: 0, recycled: None, created: Instant::now() }
     }
 }
 
@@ -67,9 +69,9 @@ impl ViewerSession {
         self.state.lock().ok().and_then(|s| s.picture.clone())
     }
 
-    pub fn status(&self) -> (Option<String>, bool, u64) {
-        self.state.lock().map(|s| (s.paused.clone(), s.closed, s.frames_received))
-            .unwrap_or((None, false, 0))
+    pub fn status(&self) -> (Option<String>, bool, u64, std::time::Duration) {
+        self.state.lock().map(|s| (s.paused.clone(), s.closed, s.frames_received, s.created.elapsed()))
+            .unwrap_or((None, false, 0, std::time::Duration::ZERO))
     }
 }
 
@@ -203,6 +205,65 @@ fn composite_patch(canvas: &mut [u8], cw: usize, ch: usize, x: u32, y: u32, w: u
         }
     }
     placed
+}
+
+/// 画一路画面的内容区（纹理或等待提示）。返回图片所在矩形供输入映射。
+/// 抽成独立函数供独立视口与降级 egui 窗口共用。
+fn paint_view_body(
+    ui: &mut eframe::egui::Ui,
+    tex_id: Option<eframe::egui::TextureId>,
+    w: usize,
+    h: usize,
+    paused: Option<&str>,
+    waited: Duration,
+    focused: bool,
+    mut out_rect: Option<&mut Option<Rect>>,
+) {
+    if let Some(tex) = tex_id {
+        let available = ui.available_size();
+        let scale = (available.x / w.max(1) as f32).min(available.y / h.max(1) as f32).min(1.0);
+        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+        let resp = ui.add(
+            eframe::egui::Image::new((tex, size))
+                .sense(eframe::egui::Sense::click_and_drag())
+                .fit_to_exact_size(size),
+        );
+        if let Some(slot) = out_rect.as_deref_mut() { *slot = Some(resp.rect); }
+        if focused {
+            ui.label(RichText::new("已连接键鼠 · 点画面外其他窗口即可切回本机").size(10.0).weak());
+        }
+    } else {
+        ui.centered_and_justified(|ui| {
+            if let Some(reason) = paused.filter(|r| !r.is_empty()) {
+                ui.vertical(|ui| {
+                    ui.label(format!("⏳ {reason}"));
+                    ui.label(RichText::new("在对端 IslandHop 设置里勾选「允许对端控制本机屏幕」后即可观看").size(11.0).weak());
+                });
+            } else if waited >= Duration::from_secs(5) {
+                ui.vertical(|ui| {
+                    ui.label("⏳ 连接超时，对端没有推送画面");
+                    ui.label(RichText::new("请确认：对端 IslandHop 在线 · 已勾选「允许对端控制本机屏幕」· 两端已配对").size(11.0).weak());
+                });
+            } else {
+                ui.label("正在接收对端画面…");
+            }
+        });
+    }
+}
+
+/// 连接等待提示的纯逻辑：一帧未到时按「对端暂停原因 → 超时引导授权 → 连接中」给出可操作提示。
+/// 有帧后不再显示连接提示。抽成纯函数便于确定性单测。
+fn connect_hint_text(frames: u64, paused: Option<&str>, waited: Duration) -> String {
+    if frames != 0 {
+        return String::new();
+    }
+    if let Some(reason) = paused.filter(|r| !r.is_empty()) {
+        return format!(" · {reason}");
+    }
+    if waited >= Duration::from_secs(5) {
+        return " · 连接超时 · 请在对端设置勾选「允许对端控制本机屏幕」".to_string();
+    }
+    " · 连接中…".to_string()
 }
 
 /// Picture 的像素长度必须与声明尺寸一致。egui 的 ColorImage 构造在此处有 assert，
@@ -376,112 +437,153 @@ impl ViewerHub {
         }
     }
 
-    /// 渲染所有画面窗口；窗口画面被点击后接收键鼠输入并回传对端。
-    pub fn paint(&mut self, ctx: &Context, hub: Option<&Arc<Hub>>) {
-        // 先收集本帧需要的 stream 与画面，避免同时持有 self 的可变借用。
-        let snapshots: Vec<(u64, String, Option<Picture>, (Option<String>, bool, u64), Arc<Mutex<Instant>>)> = self
+    /// 每个画面流注册为一个独立 OS 窗口（deferred viewport）。
+    /// 主视口就是灵动岛（几百像素），egui::Window 会被 clamp 在里面，画面根本没地方显示；
+    /// 独立视口才有真正的桌面窗口尺寸，且输入事件按视口隔离，不会被岛 UI 抢走。
+    pub fn paint(&mut self, ctx: &Context, hub: Option<&Arc<Hub>>, self_arc: Arc<Mutex<ViewerHub>>) {
+        use eframe::egui::{ViewportBuilder, ViewportId};
+
+        // 先收集本帧的标题/尺寸快照（不在回调里访问 self，避免重复上锁与借用）。
+        let infos: Vec<(u64, String, usize, usize)> = self
             .sessions
             .iter()
+            .filter(|s| !s.status().1)
             .map(|s| {
                 let title = self.titles.get(&s.stream())
                     .map(|(_, t)| t.clone())
                     .unwrap_or_else(|| format!("屏幕 {}", s.stream()));
-                (s.stream(), title, s.picture(), s.status(), s.input_at.clone())
+                let (w, h) = s.picture().map(|p| (p.w, p.h)).unwrap_or((1280, 800));
+                (s.stream(), title, w, h)
             })
             .collect();
 
-        let mut layouts: Vec<(u64, Rect, usize, usize, Arc<Mutex<Instant>>)> = Vec::new();
-        let mut new_focus = self.focused;
-        let mut to_close: Vec<u64> = Vec::new();
-
-        for (stream, title, pic, (_paused, closed, frames), input_at) in snapshots {
-            if closed {
-                continue;
-            }
-            let mut open = true;
-            let tex_id = pic.as_ref().and_then(|pic| {
-                // 尺寸/像素不符绝不交给 egui：from_rgba_unmultiplied 有 assert，会让 UI 线程崩（卡死）。
-                if !picture_valid(pic) { return None; }
-                let (need_new_tex, need_upload) = match self.textures.get(&stream) {
-                    Some((gen, w, h, _)) => (*w != pic.w || *h != pic.h, *gen != pic.generation),
-                    None => (true, true),
-                };
-                if need_new_tex {
-                    let tex = ctx.load_texture(
-                        format!("remote-view-{stream}"),
-                        to_color_image(pic),
-                        TextureOptions::LINEAR,
-                    );
-                    self.textures.insert(stream, (pic.generation, pic.w, pic.h, tex));
-                } else if need_upload {
-                    // 有新帧才原地 set：复用纹理句柄与显存，只上传变化的像素。
-                    if let Some((gen, _, _, tex)) = self.textures.get_mut(&stream) {
-                        tex.set(to_color_image(pic), TextureOptions::LINEAR);
-                        *gen = pic.generation;
+        let hub = hub.cloned();
+        for (stream, title, w, h) in infos {
+            let viewer = self_arc.clone();
+            let hub = hub.clone();
+            let win_w = w.min(1920).max(480) as f32;
+            let win_h = h.min(1080).max(320) as f32;
+            let builder = ViewportBuilder::default()
+                .with_title(&title)
+                .with_inner_size([win_w, win_h])
+                .with_resizable(true)
+                .with_taskbar(true);
+            let vid = ViewportId::from_hash_of(format!("islandhop-remote-{stream}"));
+            ctx.show_viewport_deferred(vid, builder, move |vp_ctx, class| {
+                if class == eframe::egui::ViewportClass::Embedded {
+                    // 后端不支持多视口时退回旧行为：在主视口内画一个 egui 窗口。
+                    if let Ok(mut v) = viewer.lock() {
+                        v.paint_embedded(vp_ctx, stream, hub.as_ref());
                     }
+                    return;
                 }
-                self.textures.get(&stream).map(|(_, _, _, t)| t.id())
+                // 用户点了窗口关闭按钮 → 关闭这一路流。
+                let close = vp_ctx.input(|i| i.viewport().close_requested());
+                let mut v = match viewer.lock() {
+                    Ok(v) => v,
+                    Err(e) => e.into_inner(),
+                };
+                if close {
+                    if let Some(hub) = hub.as_ref() { v.close(stream, hub); }
+                    else { v.drop_stream(stream); }
+                    return;
+                }
+                v.paint_one(vp_ctx, stream, hub.as_ref());
             });
-            let (w, h) = pic.as_ref().map(|p| (p.w, p.h)).unwrap_or((640, 400));
-            let controllable = hub.is_some();
-            let window_title = format!("{title}{}{}", if frames == 0 { " · 连接中…" } else { "" }, if controllable { " · 可操控" } else { "" });
-            eframe::egui::Window::new(window_title)
-                .id(Id::new(("remote-view-window", stream)))
-                .open(&mut open)
-                .resizable(true)
-                .default_size([(w.min(1024)) as f32, (h.min(720)) as f32])
-                .show(ctx, |ui| {
-                    if let Some(tex) = tex_id {
-                        let available = ui.available_size();
-                        let scale = (available.x / w as f32).min(available.y / h as f32).min(1.0);
-                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
-                        let resp = ui.add(
-                            eframe::egui::Image::new((tex, size))
-                                .sense(eframe::egui::Sense::click_and_drag())
-                                .fit_to_exact_size(size),
-                        );
-                        if resp.clicked() || resp.drag_started() {
-                            new_focus = Some(stream);
-                        }
-                        layouts.push((stream, resp.rect, w, h, input_at.clone()));
-                        if self.focused == Some(stream) {
-                            ui.label(RichText::new("已连接键鼠 · 点画面外其他窗口即可切回本机").size(10.0).weak());
-                        }
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label("正在接收对端画面…");
-                        });
-                    }
-                });
-            if !open {
-                to_close.push(stream);
-            }
         }
-        for stream in to_close {
-            if let Some(hub) = hub {
-                self.close(stream, hub);
-            } else {
-                self.sessions.retain(|s| s.stream() != stream);
-                self.textures.remove(&stream);
-                self.titles.remove(&stream);
-            }
-            if new_focus == Some(stream) { new_focus = None; }
-        }
-        // 点了任何非画面区域（本机 UI / 其他窗口）就把键鼠交还本机。
-        let clicked_elsewhere = ctx.input(|i| i.events.iter().any(|e| match e {
-            Event::PointerButton { pos, pressed: true, .. } => {
-                !layouts.iter().any(|(_, r, _, _, _)| r.contains(*pos))
-            }
-            _ => false,
-        }));
-        if clicked_elsewhere { new_focus = None; }
-        self.focused = new_focus.filter(|s| self.sessions.iter().any(|v| v.stream() == *s));
+    }
 
-        if let (Some(stream), Some(hub)) = (self.focused, hub) {
-            if let Some((_, rect, w, h, input_at)) = layouts.into_iter().find(|(s, ..)| *s == stream) {
-                self.send_input(ctx, hub, stream, rect, w, h, &input_at);
+    /// 后端不支持独立视口时的降级：在主视口内画 egui 窗口（旧行为）。
+    fn paint_embedded(&mut self, ctx: &Context, stream: u64, hub: Option<&Arc<Hub>>) {
+        let title = self.titles.get(&stream)
+            .map(|(_, t)| t.clone())
+            .unwrap_or_else(|| format!("屏幕 {stream}"));
+        let (paused, closed, frames, waited) = self.sessions.iter()
+            .find(|s| s.stream() == stream)
+            .map(|s| s.status())
+            .unwrap_or((None, true, 0, std::time::Duration::ZERO));
+        if closed { return; }
+        let pic = self.sessions.iter().find(|s| s.stream() == stream).and_then(|s| s.picture());
+        let mut open = true;
+        let tex_id = self.upload_texture(ctx, stream, pic.as_ref());
+        let (w, h) = pic.as_ref().map(|p| (p.w, p.h)).unwrap_or((1280, 800));
+        let hint = connect_hint_text(frames, paused.as_deref(), waited);
+        let controllable = hub.is_some();
+        eframe::egui::Window::new(format!("{title}{hint}{}", if controllable { " · 可操控" } else { "" }))
+            .id(Id::new(("remote-view-embedded", stream)))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([(w.min(1024)) as f32, (h.min(720)) as f32])
+            .show(ctx, |ui| {
+                paint_view_body(ui, tex_id, w, h, paused.as_deref(), waited,
+                    self.focused == Some(stream), None);
+            });
+        if !open {
+            if let Some(hub) = hub { self.close(stream, hub); }
+            else { self.drop_stream(stream); }
+        }
+    }
+
+    /// 纹理上传：尺寸变化才重建，generation 变化才 set，避免每帧重传 8MB。
+    fn upload_texture(&mut self, ctx: &Context, stream: u64, pic: Option<&Picture>) -> Option<eframe::egui::TextureId> {
+        let pic = pic?;
+        if !picture_valid(pic) { return None; }
+        let (need_new_tex, need_upload) = match self.textures.get(&stream) {
+            Some((gen, w, h, _)) => (*w != pic.w || *h != pic.h, *gen != pic.generation),
+            None => (true, true),
+        };
+        if need_new_tex {
+            let tex = ctx.load_texture(format!("remote-view-{stream}"), to_color_image(pic), TextureOptions::LINEAR);
+            self.textures.insert(stream, (pic.generation, pic.w, pic.h, tex));
+        } else if need_upload {
+            if let Some((gen, _, _, tex)) = self.textures.get_mut(&stream) {
+                tex.set(to_color_image(pic), TextureOptions::LINEAR);
+                *gen = pic.generation;
             }
         }
+        self.textures.get(&stream).map(|(_, _, _, t)| t.id())
+    }
+
+    fn drop_stream(&mut self, stream: u64) {
+        self.sessions.retain(|s| s.stream() != stream);
+        self.titles.remove(&stream);
+        self.textures.remove(&stream);
+        if self.focused == Some(stream) { self.focused = None; }
+    }
+
+    /// 在独立视口里渲染一路画面，并处理该视口的键鼠输入。
+    fn paint_one(&mut self, ctx: &Context, stream: u64, hub: Option<&Arc<Hub>>) {
+        let (paused, closed, frames, waited) = self.sessions.iter()
+            .find(|s| s.stream() == stream)
+            .map(|s| s.status())
+            .unwrap_or((None, true, 0, std::time::Duration::ZERO));
+        if closed { return; }
+        let pic = self.sessions.iter().find(|s| s.stream() == stream).and_then(|s| s.picture());
+        let (w, h) = pic.as_ref().map(|p| (p.w, p.h)).unwrap_or((1280, 800));
+        let tex_id = self.upload_texture(ctx, stream, pic.as_ref());
+        let mut focus = self.focused;
+
+        eframe::egui::CentralPanel::default().show(ctx, |ui| {
+            let mut input_rect = None;
+            paint_view_body(ui, tex_id, w, h, paused.as_deref(), waited,
+                focus == Some(stream), Some(&mut input_rect));
+
+            // 用本视口自己的输入（ctx.input 在 deferred 回调里读到的是当前视口），
+            // 因此岛 UI 的点击不会混进来，无需再判断「点在其他窗口」。
+            let clicked_image = input_rect.map(|r| {
+                ui.input(|i| i.pointer.button_down(eframe::egui::PointerButton::Primary)
+                    && i.pointer.latest_pos().is_some_and(|p| r.contains(p)))
+            }).unwrap_or(false);
+            if clicked_image { focus = Some(stream); }
+
+            if let (Some(rect), Some(hub)) = (input_rect, hub) {
+                let input_at = self.sessions.iter().find(|s| s.stream() == stream).map(|s| s.input_at.clone());
+                if let Some(input_at) = input_at {
+                    self.send_input(ctx, hub, stream, rect, w, h, &input_at);
+                }
+            }
+        });
+        self.focused = focus.filter(|s| self.sessions.iter().any(|v| v.stream() == *s));
     }
 
     /// 把本机键鼠事件送到对端。只处理聚焦的那一路画面。
@@ -596,6 +698,22 @@ mod tests {
     fn viewer_state_defaults_are_empty() {
         let s = ViewerState::default();
         assert!(s.picture.is_none() && s.paused.is_none() && !s.closed && s.frames_received == 0 && s.recycled.is_none());
+    }
+
+    /// 授权/超时提示回归：连不上时必须给出可操作指引，不能永远只显示「连接中…」。
+    #[test]
+    fn connect_hint_explains_why_no_frames_arrive() {
+        // 已有帧：不显示任何连接提示。
+        assert_eq!(connect_hint_text(3, Some("正在等待接受"), Duration::from_secs(60)), "");
+        // 对端回了暂停原因：原样显示（如等待授权）。
+        assert_eq!(connect_hint_text(0, Some("正在等待 MacBook-Pro 接受"), Duration::from_secs(1)),
+                   " · 正在等待 MacBook-Pro 接受");
+        // 空原因不当作暂停提示，按时间长短走连接中/超时。
+        assert_eq!(connect_hint_text(0, Some(""), Duration::from_secs(1)), " · 连接中…");
+        assert_eq!(connect_hint_text(0, None, Duration::from_secs(4)), " · 连接中…");
+        let timeout = connect_hint_text(0, None, Duration::from_secs(5));
+        assert!(timeout.contains("连接超时") && timeout.contains("允许对端控制本机屏幕"),
+                "超时应引导去对端勾选授权，实际: {timeout}");
     }
 
     /// v0.6.94 卡死回归：尺寸声明正常但像素为空的 Picture 必须被判为无效，

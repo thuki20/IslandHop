@@ -197,7 +197,7 @@ pub fn open_view(peer: &str) -> Result<(), String> {
         let Some(engine) = &cross.engine else {
             return Err("跨屏引擎未启动，请先在设置里启动".into());
         };
-        cross.viewer.open_screen(&engine.hub(), peer)
+        lock_viewer(&cross.viewer).open_screen(&engine.hub(), peer)
     })
 }
 
@@ -215,22 +215,33 @@ pub fn poll_view_events() -> Option<String> {
     with(|cross| {
         let Some(engine) = &cross.engine else { return None; };
         let allow = cross.cfg.allow_control;
-        cross.viewer.poll_events(&engine.hub(), allow);
-        cross.viewer.take_notice()
+        let mut viewer = lock_viewer(&cross.viewer);
+        viewer.poll_events(&engine.hub(), allow);
+        viewer.take_notice()
     })
 }
 
-/// 每帧调用：渲染所有画面窗口。
+/// 拿 viewer 锁；锁中毒时直接恢复内部状态，避免一个视口 panic 让所有画面永久失效。
+fn lock_viewer(v: &std::sync::Arc<std::sync::Mutex<crate::remote_view::ViewerHub>>)
+    -> std::sync::MutexGuard<'_, crate::remote_view::ViewerHub>
+{
+    v.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 每帧调用：为每个画面流注册独立 OS 视口（真正的桌面窗口），不再挤在灵动岛里。
 pub fn paint_views(ctx: &eframe::egui::Context) {
     with(|cross| {
         let hub = cross.engine.as_ref().map(|e| e.hub());
-        cross.viewer.paint(ctx, hub.as_ref());
+        let viewer = cross.viewer.clone();
+        // 一次性备好本帧渲染所需的数据快照，回调里绝不再访问 thread_local（避免 RefCell 重入 panic）。
+        let mut v = lock_viewer(&viewer);
+        v.paint(ctx, hub.as_ref(), viewer.clone());
     });
 }
 
 /// 是否有正在观看的画面流（用于提高刷新率到 20fps）。
 pub fn view_active() -> bool {
-    with(|cross| !cross.viewer.is_empty())
+    with(|cross| !lock_viewer(&cross.viewer).is_empty())
 }
 
 enum Action {
@@ -277,7 +288,8 @@ pub struct CrossScreen {
     /// 用户勾选「不再显示权限相关提示」后，不再每次启动刷一屏授权指引。
     hide_permission_hint: bool,
     /// 远程桌面：管理画面流、egui 窗口与键鼠焦点。
-    pub viewer: crate::remote_view::ViewerHub,
+    /// 用 Arc<Mutex> 包装，供独立 OS 视口的 deferred 回调（'static + Send）捕获。
+    pub viewer: std::sync::Arc<std::sync::Mutex<crate::remote_view::ViewerHub>>,
     /// 最近一次引擎启动的时间，用于扫描超时后切换到结论态。
     scan_since: Option<Instant>,
     /// 网络诊断自检的异步状态。
@@ -317,7 +329,7 @@ impl CrossScreen {
             rename_buf: String::new(),
             last_notes: Vec::new(),
             hide_permission_hint: read_hide_permission_hint(),
-            viewer: crate::remote_view::ViewerHub::default(),
+            viewer: std::sync::Arc::new(std::sync::Mutex::new(crate::remote_view::ViewerHub::default())),
             scan_since: None,
             diagnostics: Diagnostics::Idle,
             path,
@@ -451,7 +463,7 @@ impl CrossScreen {
             }
             Action::ViewScreen(peer) => {
                 let result = match self.engine.as_ref() {
-                    Some(e) => self.viewer.open_screen(&e.hub(), &peer),
+                    Some(e) => lock_viewer(&self.viewer).open_screen(&e.hub(), &peer),
                     None => Err("跨屏引擎未启动，请先启动".to_string()),
                 };
                 match result {
@@ -465,7 +477,7 @@ impl CrossScreen {
                         let hub = e.hub();
                         match hub.open(&peer, id, None, false) {
                             Some(stream) => {
-                                self.viewer.open_stream(&hub, stream, &peer, title, w, h);
+                                lock_viewer(&self.viewer).open_stream(&hub, stream, &peer, title, w, h);
                                 Ok(())
                             }
                             None => Err("窗口已关闭或不在对端窗口列表里".to_string()),
