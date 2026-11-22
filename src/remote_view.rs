@@ -1,27 +1,33 @@
-//! IslandHop 屏幕镜像（最小原型）：把对端整屏画面拉到本机显示。
+//! IslandHop 远程桌面：把对端整屏拉到本机显示，并直接键鼠操控。
 //!
 //! OpenHop 引擎（openhop-core::extras::Hub）里已有完整的远程画面链路：
-//! SCREEN 整屏采集、WinFrame/WinAck 帧协议、JPEG 增量 patch、48KB bulk 通道。
-//! 本模块只补上应用层缺的那一半：后台收帧解码 + 画面合成 + 供 UI 渲染。
+//! SCREEN 整屏采集、WinFrame/WinAck 帧协议、JPEG 增量 patch、48KB bulk 通道，
+//! 以及 WinInput → 对端注入。本模块补齐应用层：后台收帧解码、画面合成、
+//! egui 渲染与输入回传。
 //!
 //! 设计约束：
 //! - Hub 是 Arc<Hub>（内部全 Mutex/Condvar，Send+Sync），可安全 clone 到后台线程；
 //!   Engine 本身 !Send，留在 cross_screen 的 thread_local 里，不跨线程。
 //! - frame() 是阻塞等待，必须在后台线程调用，绝不能阻塞 egui 主线程。
-//! - 只做"单向看对端"：本机发起 open(对端, SCREEN)，不共享本机画面。
+//! - 性能：画面用 Arc<Vec<u8>> 共享，后台回收上一帧缓冲；GPU 纹理原地 set()
+//!   而不是每帧新建，避免 1080p 下每帧 8MB 复制 + 纹理重建造成的卡顿。
 
-use eframe::egui::ColorImage;
+use eframe::egui::{
+    ColorImage, Context, Event, Id, Modifiers, MouseWheelUnit, PointerButton, Pos2, Rect,
+    RichText, TextureOptions, Vec2,
+};
 use openhop_core::extras::{FrameWait, Hub};
+use openhop_core::protocol::{MouseButton, WinEvent};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// 一帧画面合成后的 RGBA 画布。主线程据此生成 egui 纹理。
+/// 一帧画面合成后的 RGBA 画布。共享引用，避免每帧 8MB 拷贝。
 #[derive(Clone)]
 pub struct Picture {
     pub w: usize,
     pub h: usize,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
     pub generation: u64,
 }
 
@@ -45,6 +51,8 @@ pub struct ViewerSession {
     stop: Arc<AtomicBool>,
     state: Arc<Mutex<ViewerState>>,
     last_remote: Arc<AtomicU64>,
+    /// 主线程侧的指针移动节流（对端 core 里还有一层 50ms 注入节流）。
+    input_at: Arc<Mutex<Instant>>,
 }
 
 impl ViewerSession {
@@ -52,7 +60,7 @@ impl ViewerSession {
         self.stream
     }
 
-    /// 主线程取走当前画面（克隆）。有新帧才 generation 变化。
+    /// 主线程取走当前画面。Arc 克隆是浅拷贝。
     pub fn picture(&self) -> Option<Picture> {
         self.state.lock().ok().and_then(|s| s.picture.clone())
     }
@@ -70,38 +78,49 @@ impl Drop for ViewerSession {
 }
 
 /// 启动一个画面流的后台接收：阻塞取帧 → 解码 JPEG patch → 合成 RGBA。
-/// 调用前 hub.open() 已发出 WinOpen 并建立了 viewer 流。
 pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -> ViewerSession {
     let stop = Arc::new(AtomicBool::new(false));
     let state = Arc::new(Mutex::new(ViewerState::default()));
     let last_remote = Arc::new(AtomicU64::new(0));
+    let input_at = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
     let (stop_t, state_t, last_t) = (stop.clone(), state.clone(), last_remote.clone());
 
     let _ = std::thread::Builder::new()
         .name(format!("islandhop-view-{stream}"))
         .spawn(move || {
             let mut canvas = vec![0u8; width * height * 4];
+            // 上一帧的共享缓冲：主线程释放后 strong_count 归 1，直接取回复用，
+            // 稳态下每帧零分配、零 memcpy（旧实现每帧 clone 整张 8MB 画布）。
+            let mut recycle: Option<Arc<Vec<u8>>> = None;
             let mut gen = 0u64;
             while !stop_t.load(Ordering::Acquire) {
+                if let Some(old) = recycle.take() {
+                    if let Ok(buf) = Arc::try_unwrap(old) {
+                        canvas = buf;
+                    }
+                }
                 let after = last_t.load(Ordering::Acquire);
                 match hub.frame(stream, after, Duration::from_millis(250)) {
                     FrameWait::Frames(frames) => {
                         for frame in frames {
                             gen += 1;
                             last_t.store(frame.remote, Ordering::Release);
-                            // 全帧 patch（覆盖整张）时重新分配画布，兼容分辨率变化。
+                            // 全帧 patch（覆盖整张）时重置画布，兼容分辨率变化。
                             if frame.patches.iter().any(|p| p.x == 0 && p.y == 0 && p.w == frame.w && p.h == frame.h) {
-                                canvas = vec![0u8; frame.w as usize * frame.h as usize * 4];
+                                canvas.clear();
+                                canvas.resize(frame.w as usize * frame.h as usize * 4, 0);
                             }
                             for p in frame.patches.iter() {
                                 composite_patch(&mut canvas, width, height, p.x, p.y, p.w, p.h, &p.jpeg);
                             }
                         }
+                        let shared = Arc::new(std::mem::replace(&mut canvas, Vec::new()));
+                        recycle = Some(shared.clone());
                         if let Ok(mut s) = state_t.lock() {
                             s.frames_received += 1;
                             s.paused = None;
                             s.picture = Some(Picture {
-                                w: width, h: height, rgba: canvas.clone(), generation: gen,
+                                w: width, h: height, rgba: shared, generation: gen,
                             });
                         }
                     }
@@ -119,11 +138,10 @@ pub fn spawn_receiver(hub: Arc<Hub>, stream: u64, width: usize, height: usize) -
             hub.close(stream);
         });
 
-    ViewerSession { stream, stop, state, last_remote }
+    ViewerSession { stream, stop, state, last_remote, input_at }
 }
 
 /// 把一个 JPEG patch 解码后合成到 RGBA 画布的 (x,y,w,h) 区域。
-/// 解码失败或越界坐标会被安全忽略，不会污染已有画面。
 fn composite_patch(canvas: &mut [u8], cw: usize, ch: usize, x: u32, y: u32, w: u32, h: u32, jpeg: &[u8]) -> bool {
     if w == 0 || h == 0 {
         return false;
@@ -157,21 +175,73 @@ fn composite_patch(canvas: &mut [u8], cw: usize, ch: usize, x: u32, y: u32, w: u
     placed
 }
 
-/// 把 Picture 转成 egui 纹理用的 ColorImage。
 pub fn to_color_image(pic: &Picture) -> ColorImage {
-    ColorImage::from_rgba_unmultiplied([pic.w, pic.h], &pic.rgba)
+    ColorImage::from_rgba_unmultiplied([pic.w, pic.h], &pic.rgba[..])
 }
 
-/// 管理本机正在看的画面流 + egui 窗口。放在 cross_screen 的 thread_local 里
-/// （ViewerSession 含线程句柄，不跨线程），由主线程驱动 poll / paint。
+/// 修饰键（HID page 0x07）按下/释放变化。egui 的 Key 枚举没有 Shift/Ctrl 本身，
+/// 只能从 Modifiers 差分得到；漏发会导致大写/快捷键失效。
+fn modifier_changes(old: Modifiers, new: Modifiers) -> Vec<(u16, bool)> {
+    let mut out = Vec::new();
+    if old.ctrl != new.ctrl { out.push((0xE0, new.ctrl)); }
+    if old.shift != new.shift { out.push((0xE1, new.shift)); }
+    if old.alt != new.alt { out.push((0xE2, new.alt)); }
+    if old.command != new.command { out.push((0xE3, new.command)); }
+    out
+}
+
+/// egui 逻辑键 → USB HID usage id（与 openhop-core::keys 的线格式一致）。
+/// 带 Shift 的符号落在基础键上，修饰键由 modifier_changes 负责。
+fn key_hid(key: eframe::egui::Key) -> Option<u16> {
+    use eframe::egui::Key as K;
+    let k = key as u16;
+    // egui::Key 没有 repr，不能做模式区间；用判别值区间覆盖连续的三段。
+    if (K::A as u16..=K::Z as u16).contains(&k) { return Some(0x04 + k - K::A as u16); }
+    if (K::Num1 as u16..=K::Num9 as u16).contains(&k) { return Some(0x1E + k - K::Num1 as u16); }
+    if (K::F1 as u16..=K::F24 as u16).contains(&k) { return Some(0x3A + k - K::F1 as u16); }
+    let hid = match key {
+        K::Num0 => 0x27,
+        K::Enter => 0x28, K::Escape => 0x29, K::Backspace => 0x2A, K::Tab => 0x2B,
+        K::Space => 0x2C,
+        K::Minus => 0x2D, K::Equals | K::Plus => 0x2E,
+        K::OpenBracket | K::OpenCurlyBracket => 0x2F,
+        K::CloseBracket | K::CloseCurlyBracket => 0x30,
+        K::Backslash | K::Pipe => 0x31,
+        K::Semicolon | K::Colon => 0x33,
+        K::Quote => 0x34, K::Backtick => 0x35,
+        K::Comma => 0x36, K::Period => 0x37,
+        K::Slash | K::Questionmark => 0x38,
+        K::Exclamationmark => 0x1E,
+        K::Insert => 0x49, K::Home => 0x4A, K::PageUp => 0x4B, K::Delete => 0x4C,
+        K::End => 0x4D, K::PageDown => 0x4E,
+        K::ArrowRight => 0x4F, K::ArrowLeft => 0x50, K::ArrowDown => 0x51, K::ArrowUp => 0x52,
+        // Copy/Cut/Paste 是编辑命令而非物理键，输入法层已处理，不往对端发。
+        _ => return None,
+    };
+    Some(hid)
+}
+
+fn mouse_hid(button: PointerButton) -> Option<MouseButton> {
+    match button {
+        PointerButton::Primary => Some(MouseButton::Left),
+        PointerButton::Secondary => Some(MouseButton::Right),
+        PointerButton::Middle => Some(MouseButton::Middle),
+        PointerButton::Extra1 => Some(MouseButton::Back),
+        PointerButton::Extra2 => Some(MouseButton::Forward),
+    }
+}
+
+/// 管理本机正在看的画面流 + egui 窗口。放在 cross_screen 的 thread_local 里。
 pub struct ViewerHub {
     sessions: Vec<ViewerSession>,
     /// stream → 对端名 / 标题，供窗口标题与状态显示。
     titles: std::collections::HashMap<u64, (String, String)>,
-    /// stream → 纹理，按 generation 增量更新，避免每帧重建 GPU 纹理。
-    textures: std::collections::HashMap<u64, (u64, eframe::egui::TextureHandle)>,
-    /// 用户对"对端请求看本机屏幕"的统一处置（单向原型：默认拒绝并提示）。
+    /// stream → (w, h, 纹理)。尺寸不变时原地 set，避免每帧重建纹理。
+    textures: std::collections::HashMap<u64, (usize, usize, eframe::egui::TextureHandle)>,
     last_notice: Option<String>,
+    /// 当前接受键鼠输入的画面流（点击画面取得焦点）。
+    focused: Option<u64>,
+    mods: Modifiers,
 }
 
 impl Default for ViewerHub {
@@ -181,6 +251,8 @@ impl Default for ViewerHub {
             titles: std::collections::HashMap::new(),
             textures: std::collections::HashMap::new(),
             last_notice: None,
+            focused: None,
+            mods: Modifiers::NONE,
         }
     }
 }
@@ -207,16 +279,22 @@ impl ViewerHub {
                 match (x2, y2) { (Some(x), Some(y)) if x > 0 && y > 0 => Some((x as usize, y as usize)), _ => None }
             })
             .unwrap_or((1280, 800));
-        // 限制原型画布上限，避免超大桌面分配过多内存。
         let w = w.min(3840);
         let h = h.min(2160);
         let Some(stream) = hub.open(peer, openhop_core::wins::SCREEN, None, false) else {
             return Err(format!("无法连接 {peer} 的屏幕（可能未在线或未授权）"));
         };
-        let session = spawn_receiver(hub.clone(), stream, w, h);
-        self.titles.insert(stream, (peer.to_string(), format!("{peer} 的屏幕")));
-        self.sessions.push(session);
+        self.open_stream(hub, stream, peer, format!("{peer} 的屏幕"), w, h);
         Ok(())
+    }
+
+    /// 接入一个已经由 hub.open() 建好的流（应用列表里打开某个窗口也走这里）。
+    pub fn open_stream(&mut self, hub: &Arc<Hub>, stream: u64, peer: &str, title: String, w: usize, h: usize) {
+        let (w, h) = (w.clamp(1, 3840), h.clamp(1, 2160));
+        let session = spawn_receiver(hub.clone(), stream, w, h);
+        self.titles.insert(stream, (peer.to_string(), title));
+        self.sessions.push(session);
+        self.focused = Some(stream);
     }
 
     /// 关闭一个画面流。
@@ -224,26 +302,33 @@ impl ViewerHub {
         self.sessions.retain(|s| s.stream() != stream);
         self.titles.remove(&stream);
         self.textures.remove(&stream);
+        if self.focused == Some(stream) { self.focused = None; }
         hub.close(stream);
     }
 
-    /// 处理引擎推来的 UI 事件：请求看本机屏幕（单向原型拒绝）、关闭画面、文本通知。
-    pub fn poll_events(&mut self, hub: &Arc<Hub>) {
+    /// 处理引擎推来的 UI 事件：对端请求看本机屏幕、关闭画面、文本通知。
+    pub fn poll_events(&mut self, hub: &Arc<Hub>, allow_control: bool) {
         let events = hub.take_ui();
         for ev in events {
             match ev {
                 openhop_core::extras::UiEvent::HelpAsk { id, from, screen } => {
-                    hub.help_answer(id, false);
-                    self.last_notice = Some(if screen {
-                        format!("{from} 请求查看本机屏幕，已拒绝（当前仅支持单向观看对端）")
+                    // 本机勾选了「允许对端控制本机屏幕」才接受，避免被静默观看。
+                    hub.help_answer(id, allow_control);
+                    if !allow_control {
+                        self.last_notice = Some(if screen {
+                            format!("{from} 请求查看本机屏幕，已拒绝（设置里可开启「允许对端控制本机屏幕」）")
+                        } else {
+                            format!("{from} 请求查看本机窗口，已拒绝")
+                        });
                     } else {
-                        format!("{from} 请求查看本机窗口，已拒绝")
-                    });
+                        self.last_notice = Some(format!("{from} 正在查看本机{}", if screen { "屏幕" } else { "窗口" }));
+                    }
                 }
                 openhop_core::extras::UiEvent::CloseViewer { stream } => {
                     self.sessions.retain(|s| s.stream() != stream);
                     self.titles.remove(&stream);
                     self.textures.remove(&stream);
+                    if self.focused == Some(stream) { self.focused = None; }
                 }
                 openhop_core::extras::UiEvent::Notice { title, body, .. } => {
                     self.last_notice = Some(format!("{title}：{body}"));
@@ -253,42 +338,52 @@ impl ViewerHub {
         }
     }
 
-    /// 渲染所有画面窗口。每个窗口从共享状态取最新画面，按 generation 更新纹理。
-    pub fn paint(&mut self, ctx: &eframe::egui::Context) {
+    /// 渲染所有画面窗口；窗口画面被点击后接收键鼠输入并回传对端。
+    pub fn paint(&mut self, ctx: &Context, hub: Option<&Arc<Hub>>) {
         // 先收集本帧需要的 stream 与画面，避免同时持有 self 的可变借用。
-        let snapshots: Vec<(u64, String, Option<Picture>, (Option<String>, bool, u64))> = self
+        let snapshots: Vec<(u64, String, Option<Picture>, (Option<String>, bool, u64), Arc<Mutex<Instant>>)> = self
             .sessions
             .iter()
             .map(|s| {
                 let title = self.titles.get(&s.stream())
                     .map(|(_, t)| t.clone())
                     .unwrap_or_else(|| format!("屏幕 {}", s.stream()));
-                (s.stream(), title, s.picture(), s.status())
+                (s.stream(), title, s.picture(), s.status(), s.input_at.clone())
             })
             .collect();
 
-        for (stream, title, pic, (_paused, closed, frames)) in snapshots {
+        let mut layouts: Vec<(u64, Rect, usize, usize, Arc<Mutex<Instant>>)> = Vec::new();
+        let mut new_focus = self.focused;
+        let mut to_close: Vec<u64> = Vec::new();
+
+        for (stream, title, pic, (_paused, closed, frames), input_at) in snapshots {
             if closed {
                 continue;
             }
             let mut open = true;
             let tex_id = pic.as_ref().and_then(|pic| {
-                let need_new = self.textures.get(&stream)
-                    .is_none_or(|(gen, _)| *gen != pic.generation);
+                let need_new = match self.textures.get(&stream) {
+                    Some((w, h, _)) => *w != pic.w || *h != pic.h,
+                    None => true,
+                };
                 if need_new {
                     let tex = ctx.load_texture(
                         format!("remote-view-{stream}"),
                         to_color_image(pic),
-                        eframe::egui::TextureOptions::LINEAR,
+                        TextureOptions::LINEAR,
                     );
-                    self.textures.insert(stream, (pic.generation, tex));
+                    self.textures.insert(stream, (pic.w, pic.h, tex));
+                } else if let Some((_, _, tex)) = self.textures.get_mut(&stream) {
+                    // 原地更新 GPU 纹理：句柄与显存对象复用，只有像素数据上传。
+                    tex.set(to_color_image(pic), TextureOptions::LINEAR);
                 }
-                self.textures.get(&stream).map(|(_, t)| t.id())
+                self.textures.get(&stream).map(|(_, _, t)| t.id())
             });
             let (w, h) = pic.as_ref().map(|p| (p.w, p.h)).unwrap_or((640, 400));
-            let window_title = format!("{title}{}", if frames == 0 { " · 连接中…" } else { "" });
+            let controllable = hub.is_some();
+            let window_title = format!("{title}{}{}", if frames == 0 { " · 连接中…" } else { "" }, if controllable { " · 可操控" } else { "" });
             eframe::egui::Window::new(window_title)
-                .id(eframe::egui::Id::new(("remote-view-window", stream)))
+                .id(Id::new(("remote-view-window", stream)))
                 .open(&mut open)
                 .resizable(true)
                 .default_size([(w.min(1024)) as f32, (h.min(720)) as f32])
@@ -296,10 +391,19 @@ impl ViewerHub {
                     if let Some(tex) = tex_id {
                         let available = ui.available_size();
                         let scale = (available.x / w as f32).min(available.y / h as f32).min(1.0);
-                        let size = eframe::egui::vec2(w as f32 * scale, h as f32 * scale);
-                        ui.centered_and_justified(|ui| {
-                            ui.add(eframe::egui::Image::new((tex, size)));
-                        });
+                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+                        let resp = ui.add(
+                            eframe::egui::Image::new((tex, size))
+                                .sense(eframe::egui::Sense::click_and_drag())
+                                .fit_to_exact_size(size),
+                        );
+                        if resp.clicked() || resp.drag_started() {
+                            new_focus = Some(stream);
+                        }
+                        layouts.push((stream, resp.rect, w, h, input_at.clone()));
+                        if self.focused == Some(stream) {
+                            ui.label(RichText::new("已连接键鼠 · 点画面外其他窗口即可切回本机").size(10.0).weak());
+                        }
                     } else {
                         ui.centered_and_justified(|ui| {
                             ui.label("正在接收对端画面…");
@@ -307,17 +411,113 @@ impl ViewerHub {
                     }
                 });
             if !open {
-                // 用户点了窗口关闭按钮：这里只从 self 移除，实际 hub.close 需要 Arc<Hub>，
-                // 由 close_closed_streams 在持有 hub 的地方完成。
+                to_close.push(stream);
+            }
+        }
+        for stream in to_close {
+            if let Some(hub) = hub {
+                self.close(stream, hub);
+            } else {
                 self.sessions.retain(|s| s.stream() != stream);
                 self.textures.remove(&stream);
                 self.titles.remove(&stream);
+            }
+            if new_focus == Some(stream) { new_focus = None; }
+        }
+        // 点了任何非画面区域（本机 UI / 其他窗口）就把键鼠交还本机。
+        let clicked_elsewhere = ctx.input(|i| i.events.iter().any(|e| match e {
+            Event::PointerButton { pos, pressed: true, .. } => {
+                !layouts.iter().any(|(_, r, _, _, _)| r.contains(*pos))
+            }
+            _ => false,
+        }));
+        if clicked_elsewhere { new_focus = None; }
+        self.focused = new_focus.filter(|s| self.sessions.iter().any(|v| v.stream() == *s));
+
+        if let (Some(stream), Some(hub)) = (self.focused, hub) {
+            if let Some((_, rect, w, h, input_at)) = layouts.into_iter().find(|(s, ..)| *s == stream) {
+                self.send_input(ctx, hub, stream, rect, w, h, &input_at);
+            }
+        }
+    }
+
+    /// 把本机键鼠事件送到对端。只处理聚焦的那一路画面。
+    fn send_input(&mut self, ctx: &Context, hub: &Arc<Hub>, stream: u64, rect: Rect, w: usize, h: usize, input_at: &Arc<Mutex<Instant>>) {
+        let (mods, events, pointer) = ctx.input(|i| (
+            i.modifiers,
+            i.events.clone(),
+            i.pointer.latest_pos(),
+        ));
+        // egui 的 Key 枚举不含 Shift/Ctrl 本身，必须靠 Modifiers 差分补发。
+        for (key, down) in modifier_changes(self.mods, mods) {
+            hub.input(stream, WinEvent::Key { key, down });
+        }
+        self.mods = mods;
+
+        let to_stream = |pos: Pos2| -> (i32, i32) {
+            let x = ((pos.x - rect.min.x) / rect.width().max(1.0) * w as f32).round() as i32;
+            let y = ((pos.y - rect.min.y) / rect.height().max(1.0) * h as f32).round() as i32;
+            (x.clamp(0, w as i32 - 1), y.clamp(0, h as i32 - 1))
+        };
+        let inside = |pos: Pos2| rect.contains(pos);
+        let mut consumed_key = false;
+        let mut release_focus = false;
+
+        for ev in &events {
+            match ev {
+                Event::PointerButton { pos, button, pressed, .. } if inside(*pos) => {
+                    if let Some(b) = mouse_hid(*button) {
+                        let (x, y) = to_stream(*pos);
+                        hub.input(stream, WinEvent::Button { button: b, down: *pressed, x, y });
+                    }
+                }
+                Event::MouseWheel { delta, unit, .. } if pointer.is_some_and(inside) => {
+                    // core 侧按像素注入；行/页单位粗换算，方向保持一致。
+                    let k = match unit { MouseWheelUnit::Line => 32.0, MouseWheelUnit::Page => 600.0, _ => 1.0 };
+                    let (x, y) = to_stream(pointer.unwrap());
+                    let dx = (delta.x * k).round() as i32;
+                    let dy = (delta.y * k).round() as i32;
+                    if dx != 0 || dy != 0 {
+                        hub.input(stream, WinEvent::Wheel { dx, dy, x, y });
+                    }
+                }
+                Event::Key { key, physical_key, pressed, repeat, .. } => {
+                    // Esc 仍送给对端（很多应用用它退出全屏），同时把控制交还本机。
+                    if *pressed && *key == eframe::egui::Key::Escape { release_focus = true; }
+                    if !*repeat {
+                        if let Some(hid) = key_hid(physical_key.unwrap_or(*key)) {
+                            hub.input(stream, WinEvent::Key { key: hid, down: *pressed });
+                        }
+                    }
+                    consumed_key = true;
+                }
+                // 文本事件给对端用途有限（物理键已发），别让 egui 输入框抢走。
+                Event::Text(_) | Event::Ime(_) => consumed_key = true,
+                _ => {}
+            }
+        }
+        if consumed_key {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Key { .. } | Event::Text(_) | Event::Ime(_))));
+        }
+        if release_focus { self.focused = None; }
+
+        // 指针移动：24ms 节流；拖动时也不放宽——对端 core 已有 50ms 注入节流，
+        // 这里再密只会堆网络包，反而让按键/点击排队。
+        if let Some(pos) = pointer {
+            if inside(pos) || ctx.input(|i| i.pointer.button_down(PointerButton::Primary)
+                || i.pointer.button_down(PointerButton::Secondary)) {
+                let mut at = input_at.lock().unwrap_or_else(|e| e.into_inner());
+                if at.elapsed() >= Duration::from_millis(24) {
+                    let (x, y) = to_stream(pos);
+                    hub.input(stream, WinEvent::Move { x, y });
+                    *at = Instant::now();
+                }
             }
         }
     }
 }
 
-/// macOS 屏幕录制权限引导文案。只读检测在 macos_sys 里做，这里给跨平台 UI 用。
+/// macOS 屏幕录制权限引导文案。
 pub fn screen_record_permission_hint() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -343,10 +543,9 @@ mod tests {
 
     #[test]
     fn color_image_from_picture_keeps_dimensions() {
-        let pic = Picture { w: 3, h: 2, rgba: vec![255; 3 * 2 * 4], generation: 1 };
+        let pic = Picture { w: 3, h: 2, rgba: Arc::new(vec![255; 3 * 2 * 4]), generation: 1 };
         let img = to_color_image(&pic);
         assert_eq!(img.size, [3, 2]);
-        // egui 0.31 的 ColorImage::pixels 是 Color32 数组（每像素一个），3×2=6。
         assert_eq!(img.pixels.len(), 6);
     }
 
@@ -354,5 +553,27 @@ mod tests {
     fn viewer_state_defaults_are_empty() {
         let s = ViewerState::default();
         assert!(s.picture.is_none() && s.paused.is_none() && !s.closed && s.frames_received == 0);
+    }
+
+    #[test]
+    fn modifier_changes_follow_the_modifier_state() {
+        let a = modifier_changes(Modifiers::NONE, Modifiers::SHIFT);
+        assert_eq!(a, vec![(0xE1, true)]);
+        let b = modifier_changes(Modifiers::SHIFT, Modifiers::NONE);
+        assert_eq!(b, vec![(0xE1, false)]);
+        let c = modifier_changes(Modifiers::NONE, Modifiers::NONE);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn egui_keys_map_to_hid_usages() {
+        assert_eq!(key_hid(eframe::egui::Key::A), Some(0x04));
+        assert_eq!(key_hid(eframe::egui::Key::Z), Some(0x1D));
+        assert_eq!(key_hid(eframe::egui::Key::Num1), Some(0x1E));
+        assert_eq!(key_hid(eframe::egui::Key::Num0), Some(0x27));
+        assert_eq!(key_hid(eframe::egui::Key::Enter), Some(0x28));
+        assert_eq!(key_hid(eframe::egui::Key::ArrowUp), Some(0x52));
+        assert_eq!(key_hid(eframe::egui::Key::F12), Some(0x45));
+        assert_eq!(key_hid(eframe::egui::Key::Copy), None);
     }
 }

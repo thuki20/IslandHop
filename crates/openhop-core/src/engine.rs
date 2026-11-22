@@ -677,6 +677,16 @@ fn should_swap(cfg: &Config, a: Os, b: Os) -> bool {
     cfg.swap_cmd_ctrl && ((a == Os::MacOs) != (b == Os::MacOs))
 }
 
+/// 指针位置去重：位置没变的移动包不上网络。触控板/高轮询率鼠标常产生
+/// dx=dy=0 或重复绝对位置，原样转发会在慢链路上堆包，让按键和点击排队。
+fn should_send_move(last: &mut Option<(u64, i32, i32)>, to: u64, x: i32, y: i32) -> bool {
+    if *last == Some((to, x, y)) {
+        return false;
+    }
+    *last = Some((to, x, y));
+    true
+}
+
 fn is_link(t: &str) -> bool {
     let t = t.trim();
     (t.starts_with("https://") || t.starts_with("http://")) && t.len() < 4096 && !t.contains(char::is_whitespace)
@@ -1030,6 +1040,9 @@ struct Server {
     /// How far the pointer has pushed past another screen's edge.
     push: i32,
     last_local: (i32, i32),
+    /// 最近一次真正发出去的指针位置：触控板常产生 dx=dy=0 的事件，
+    /// 原样转发只会往慢链路上堆包，这里直接去重。
+    last_move_sent: Option<(u64, i32, i32)>,
     /// Arranging the screens by moving the mouse toward each of these in turn.
     learning: Vec<String>,
 }
@@ -1118,6 +1131,7 @@ impl Server {
             edge_wait: None,
             push: 0,
             last_local: (0, 0),
+            last_move_sent: None,
             learning: vec![],
         };
         s.update_status();
@@ -1568,7 +1582,9 @@ impl Server {
                     Ok((nx, ny)) => {
                         self.push = 0;
                         self.active = Some((id, nx, ny));
-                        self.send(id, Msg::Move { x: nx, y: ny });
+                        if should_send_move(&mut self.last_move_sent, id, nx, ny) {
+                            self.send(id, Msg::Move { x: nx, y: ny });
+                        }
                     }
                     Err((side, frac)) => {
                         // Hop only after pushing a little past the edge, never
@@ -1601,7 +1617,7 @@ impl Server {
                                 }
                                 let nx = (x + dx).clamp(0, w - 1);
                                 let ny = (y + dy).clamp(0, h - 1);
-                                if (nx, ny) != (x, y) {
+                                if (nx, ny) != (x, y) && should_send_move(&mut self.last_move_sent, id, nx, ny) {
                                     self.active = Some((id, nx, ny));
                                     self.send(id, Msg::Move { x: nx, y: ny });
                                 }
@@ -2126,7 +2142,7 @@ impl Server {
                         self.active = Some((a, nx, ny));
                         if a == THIS {
                             self.local_move(nx, ny);
-                        } else {
+                        } else if should_send_move(&mut self.last_move_sent, a, nx, ny) {
                             self.send(a, Msg::Move { x: nx, y: ny });
                         }
                     }
@@ -2144,7 +2160,7 @@ impl Server {
                             self.active = Some((a, nx, ny));
                             if a == THIS {
                                 self.local_move(nx, ny);
-                            } else {
+                            } else if should_send_move(&mut self.last_move_sent, a, nx, ny) {
                                 self.send(a, Msg::Move { x: nx, y: ny });
                             }
                         }
@@ -2618,6 +2634,8 @@ struct Client {
     /// Resting against the screen edge since.
     edge_wait: Option<(Side, Instant)>,
     last_local: (i32, i32),
+    /// 转发指针位置时去重，避免慢链路堆积重复包。
+    last_move_sent: Option<(u64, i32, i32)>,
     /// When this computer's own mouse last reported the edge / its position.
     edge_sent: Instant,
     pos_sent: Instant,
@@ -2686,6 +2704,7 @@ impl Client {
             pinned: false,
             edge_wait: None,
             last_local: (0, 0),
+            last_move_sent: None,
             edge_sent: Instant::now(),
             pos_sent: Instant::now(),
         };
@@ -3408,6 +3427,15 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_pointer_positions_are_dropped() {
+        let mut last = None;
+        assert!(should_send_move(&mut last, 7, 100, 200));
+        assert!(!should_send_move(&mut last, 7, 100, 200), "同位置不重复发包");
+        assert!(should_send_move(&mut last, 7, 101, 200));
+        assert!(should_send_move(&mut last, 8, 101, 200), "换目标必须重新发");
+    }
 
     #[test]
     fn own_pointer_moves_are_recognised() {

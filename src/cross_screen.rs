@@ -16,12 +16,14 @@
 //! 抢端口、抢组播发现组，也不会回写污染旧版配置。
 
 use eframe::egui::{self, Color32, RichText, Ui};
+use openhop_core::extras::Hub;
 use openhop_core::platform;
 use openhop_core::protocol::{Ext, IslandSync, DEFAULT_PORT, DISCOVERY_PORT};
 use openhop_core::{Config, Engine, Role, Status};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// UI 偏好单独存一个文件，不写进 config.toml（那个文件由引擎回写，混用会丢配置）。
@@ -212,14 +214,18 @@ pub fn connected_peers() -> Vec<String> {
 pub fn poll_view_events() -> Option<String> {
     with(|cross| {
         let Some(engine) = &cross.engine else { return None; };
-        cross.viewer.poll_events(&engine.hub());
+        let allow = cross.cfg.allow_control;
+        cross.viewer.poll_events(&engine.hub(), allow);
         cross.viewer.take_notice()
     })
 }
 
 /// 每帧调用：渲染所有画面窗口。
 pub fn paint_views(ctx: &eframe::egui::Context) {
-    with(|cross| cross.viewer.paint(ctx));
+    with(|cross| {
+        let hub = cross.engine.as_ref().map(|e| e.hub());
+        cross.viewer.paint(ctx, hub.as_ref());
+    });
 }
 
 /// 是否有正在观看的画面流（用于提高刷新率到 20fps）。
@@ -239,8 +245,14 @@ enum Action {
     RemoveScreen(String),
     /// 重命名一条对端屏幕名：保留位置，只改显示名（如 MacBook → MacBook-Pro）。
     RenameScreen(String, String),
-    /// 看对端整屏画面（单向屏幕镜像最小原型）。
+    /// 看对端整屏画面（可键鼠操控）。
     ViewScreen(String),
+    /// 从应用列表直接打开对端某个窗口为可操控画面。
+    OpenWindow { peer: String, id: u64, title: String, w: usize, h: usize },
+    /// 把对端某个窗口置前。
+    RaiseWindow { peer: String, id: u64 },
+    /// 退出对端的一个应用（先友好关闭）。
+    QuitApp { peer: String, pids: Vec<u32> },
 }
 
 pub struct CrossScreen {
@@ -264,7 +276,7 @@ pub struct CrossScreen {
     last_notes: Vec<String>,
     /// 用户勾选「不再显示权限相关提示」后，不再每次启动刷一屏授权指引。
     hide_permission_hint: bool,
-    /// 屏幕镜像（单向看对端）：管理画面流与 egui 窗口。
+    /// 远程桌面：管理画面流、egui 窗口与键鼠焦点。
     pub viewer: crate::remote_view::ViewerHub,
     /// 最近一次引擎启动的时间，用于扫描超时后切换到结论态。
     scan_since: Option<Instant>,
@@ -443,9 +455,34 @@ impl CrossScreen {
                     None => Err("跨屏引擎未启动，请先启动".to_string()),
                 };
                 match result {
-                    Ok(()) => self.last_notes.push(format!("正在连接 {peer} 的屏幕…")),
+                    Ok(()) => self.last_notes.push(format!("正在连接 {peer} 的屏幕…点击画面即可操控")),
                     Err(msg) => self.last_notes.push(format!("看屏幕失败：{msg}")),
                 }
+            }
+            Action::OpenWindow { peer, id, title, w, h } => {
+                let result = match self.engine.as_ref() {
+                    Some(e) => {
+                        let hub = e.hub();
+                        match hub.open(&peer, id, None, false) {
+                            Some(stream) => {
+                                self.viewer.open_stream(&hub, stream, &peer, title, w, h);
+                                Ok(())
+                            }
+                            None => Err("窗口已关闭或不在对端窗口列表里".to_string()),
+                        }
+                    }
+                    None => Err("跨屏引擎未启动，请先启动".to_string()),
+                };
+                match result {
+                    Ok(()) => self.last_notes.push(format!("正在打开 {peer} 的窗口，点击画面即可操控")),
+                    Err(msg) => self.last_notes.push(format!("打开窗口失败：{msg}")),
+                }
+            }
+            Action::RaiseWindow { peer, id } => {
+                if let Some(e) = &self.engine { e.hub().raise(&peer, id); }
+            }
+            Action::QuitApp { peer, pids } => {
+                if let Some(e) = &self.engine { e.hub().quit(&peer, pids, false); }
             }
             Action::RenameScreen(from, to) => {
                 let to = to.trim().to_string();
@@ -501,6 +538,9 @@ impl CrossScreen {
         self.view_steps(ui, status.as_ref());
         ui.add_space(10.0);
         self.view_devices(ui, status.as_ref(), &mut actions);
+        ui.add_space(10.0);
+        let remote_hub = self.engine.as_ref().map(|e| e.hub());
+        self.view_remote_apps(ui, remote_hub.as_ref(), &mut actions);
         ui.add_space(10.0);
         self.view_pair_mode(ui, status.as_ref());
         ui.add_space(10.0);
@@ -903,6 +943,59 @@ impl CrossScreen {
         if !self.hide_permission_hint && !(accessibility && input_monitoring) {
             ui.label(RichText::new("键鼠跨屏需要「辅助功能 + 输入监控」两项都授权；授权后彻底退出 IslandHop 再重开。").size(10.5).color(bad));
         }
+    }
+
+    /// 对端正在运行的应用 / 窗口：置前、直接打开为可操控画面、退出应用。
+    fn view_remote_apps(&mut self, ui: &mut Ui, hub: Option<&Arc<Hub>>, actions: &mut Vec<Action>) {
+        ui.label(RichText::new("远程应用 · 看画面并直接操控").size(13.0).strong());
+        let Some(hub) = hub else {
+            ui.label(RichText::new("启动跨屏引擎后，这里会列出对端正在运行的应用").size(10.5).weak());
+            return;
+        };
+        let me = hub.me().to_string();
+        let tasks = hub.tasks();
+        let windows = hub.windows();
+        let remotes: Vec<_> = tasks.iter().filter(|(name, _)| name != &me && !name.is_empty()).collect();
+        if remotes.is_empty() {
+            ui.label(RichText::new("尚未收到对端应用列表：两端需都启动引擎并连上（最多 30 秒同步一次）。").size(10.5).weak());
+            return;
+        }
+        for (name, apps) in remotes {
+            if apps.is_empty() { continue; }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("▸ {} · {} 个应用", name, apps.len())).size(11.5).strong());
+                if ui.small_button("看整屏并操控").clicked() {
+                    actions.push(Action::ViewScreen(name.clone()));
+                }
+            });
+            let peer_windows = windows.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+            for app in apps {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("   {}", app.name)).size(10.5));
+                    ui.label(RichText::new(format!("{:.0} MB", app.memory as f64 / (1024.0 * 1024.0))).size(9.5).weak());
+                    if ui.small_button("置前").clicked() {
+                        if let Some(id) = app.windows.first().copied() {
+                            actions.push(Action::RaiseWindow { peer: name.clone(), id });
+                        }
+                    }
+                    if ui.small_button("看窗口").clicked() {
+                        let info = app.windows.first().and_then(|id| peer_windows.and_then(|v| v.iter().find(|w| w.id == *id)));
+                        match info {
+                            Some(w) => actions.push(Action::OpenWindow {
+                                peer: name.clone(), id: w.id, title: w.title.clone(),
+                                w: w.w.max(320) as usize, h: w.h.max(240) as usize,
+                            }),
+                            // 拿不到具体窗口句柄时退回整屏，避免用无效 id 建流。
+                            None => actions.push(Action::ViewScreen(name.clone())),
+                        }
+                    }
+                    if ui.small_button("关闭").clicked() {
+                        actions.push(Action::QuitApp { peer: name.clone(), pids: app.pids.clone() });
+                    }
+                });
+            }
+        }
+        ui.label(RichText::new("点「看窗口 / 看整屏」后会弹出画面窗口，点击画面取得键鼠焦点；按 Esc 或点本机窗口即可交还控制。").size(10.0).weak());
     }
 
     fn view_status(&self, ui: &mut Ui, status: Option<&Status>, actions: &mut Vec<Action>) {
